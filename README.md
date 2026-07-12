@@ -4,6 +4,8 @@
 
 KANT IDE is a desktop environment for understanding, directing, and reviewing software—not only editing its text.
 
+**KANT** stands for **Knowledge Annotation & Navigation Taxonomy**: a convention for annotating what code means and turning those annotations into paths through a software system.
+
 It adds explicit structure to ordinary source files and turns that structure into a navigable outline, focused editing views, dependency lenses, and an interactive project map.
 
 ```text
