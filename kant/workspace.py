@@ -9,7 +9,6 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 
 from kant import theme
-from kant.dialogs import AiReviewDialog
 from kant.fileio import file_fingerprint, is_safe_child_name, write_bytes_atomic, write_file_atomic
 from kant.model import KantParseError, parse_kant
 
@@ -334,7 +333,6 @@ class WorkspaceMixin:
         self.settings.setValue('ai/pendingSnapshotProject', self.project_root_path)
         self.settings.sync()
         self.tabs.setEnabled(False)
-        self.claude_pane.write_info('# snapshot progetto creato')
         return True
 
     def _clear_ai_snapshot_marker(self):
@@ -376,24 +374,26 @@ class WorkspaceMixin:
             return
         summary = '\n'.join(f"- {item['status']}: {item['path']}" for item in review)
         self.claude_pane.write_info(f'\nModifiche AI pronte per il controllo:\n{summary}')
-        dialog = AiReviewDialog(self, review, render_review_text)
-        dialog.exec()
-        try:
-            if dialog.action == 'apply':
-                apply_ai_review(self.project_root_path, review, dialog.accepted(), dialog.manual_text)
-                result_message = 'Modifiche AI revisionate e applicate'
-            else:
-                rollback_snapshot(self.project_root_path, snapshot, ignored)
-                result_message = 'Modifiche AI annullate e snapshot ripristinato'
-        except OSError as error:
-            self._ide_message('Revisione AI', f'Operazione incompleta: {error}\nSnapshot conservato in {snapshot}')
-            return
-        discard_snapshot(snapshot)
-        self._ai_snapshot = None
-        self._clear_ai_snapshot_marker()
-        for tab in list(self.open_tabs.values()):
-            self._on_fs_file_changed(tab.path)
-        self.claude_pane.write_info(result_message)
+
+        def resolved(action, accepted, manual_text):
+            try:
+                if action == 'apply':
+                    apply_ai_review(self.project_root_path, review, accepted, manual_text)
+                    result_message = 'Modifiche AI revisionate e applicate'
+                else:
+                    rollback_snapshot(self.project_root_path, snapshot, ignored)
+                    result_message = 'Modifiche AI annullate e snapshot ripristinato'
+            except OSError as error:
+                self._ide_message('Revisione AI', f'Operazione incompleta: {error}\nSnapshot conservato in {snapshot}')
+                return
+            discard_snapshot(snapshot)
+            self._ai_snapshot = None
+            self._clear_ai_snapshot_marker()
+            for tab in list(self.open_tabs.values()):
+                self._on_fs_file_changed(tab.path)
+            self.claude_pane.write_info(result_message)
+
+        self.claude_pane.show_ai_review(review, render_review_text, resolved)
 
     def _create_new_file(self, target_dir):
         if not target_dir:

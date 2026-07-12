@@ -22,7 +22,7 @@ from kant.theme import set_theme
 from kant.model import Run, Node, parse_kant, serialize_kant, read_top_level_label, read_top_level_label_result, KantParseError
 from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending
 from kant.syntax import check_file_syntax, run_command_for_path
-from kant.xref import build_xref
+from kant.xref import build_xref, _walk_nodes
 from kant.lsp import LSP_SERVERS_BY_EXT, file_uri, path_from_file_uri, lsp_server_for_path, LspClient
 from kant.gitutil import find_git_root, git_status_map
 from kant.dialogs import IdeDialogsMixin
@@ -34,6 +34,7 @@ from kant.workspace import ROLE_PATH, WorkspaceMixin, discard_snapshot, rollback
 from kant.widgets import (
     CodeEdit, TerminalPane, ClaudePane, CollapsibleSection, LeafSection,
     ProjectTree, make_star_icon, TitleBar, FileTab, XrefMapDialog,
+    MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS,
 )
 
 
@@ -152,6 +153,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         # entirely" action) — the more familiar meaning once more than one file can be open.
         QShortcut(QKeySequence('Ctrl+W'), self, self._close_active_tab)
         QShortcut(QKeySequence('Ctrl+R'), self, self._run_current_file)
+        QShortcut(QKeySequence('F5'), self, self._debug_current_file)
         QShortcut(QKeySequence('Ctrl+Shift+F'), self, self._search_project)
         QShortcut(QKeySequence('Ctrl+Shift+H'), self, self._replace_project)
         QShortcut(QKeySequence.Undo, self, self._undo_file)
@@ -266,6 +268,28 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         if hasattr(self, 'size_grip'):
             self.size_grip.move(self.width() - 22, self.height() - 22)
             self.size_grip.raise_()
+        self._position_map_tab()
+        self._position_claude_tab()
+
+    def _position_claude_tab(self):
+        if not hasattr(self, 'claude_tab_btn'):
+            return
+        self.claude_tab_btn.move(
+            self.shell.width() - self.claude_tab_btn.width(),
+            (self.shell.height() - self.claude_tab_btn.height()) // 2,
+        )
+        self.claude_tab_btn.raise_()
+
+    def _position_map_tab(self):
+        if not hasattr(self, 'map_tab_btn'):
+            return
+        # positions relative to whichever widget currently owns it: the shell while closed, the map
+        # dialog itself while open — reparenting there is what keeps it clickable (see _open_xref_window)
+        parent = self.map_tab_btn.parentWidget()
+        if parent is None:
+            return
+        self.map_tab_btn.move((parent.width() - self.map_tab_btn.width()) // 2, parent.height() - self.map_tab_btn.height())
+        self.map_tab_btn.raise_()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -392,12 +416,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self.tree.setHeaderHidden(True)
         self.tree.setFont(QFont('Consolas', theme.TREE_FONT_PT))
         self.tree.setMinimumWidth(160)
-        self.tree.setIndentation(22)
+        self.tree.setIndentation(14)
         self.tree.setUniformRowHeights(False)  # rows can grow taller once labels wrap
+        # boxed like the code panels (CODE_BG + border), not flat against the white app background
         self.tree.setStyleSheet(
-            f'QTreeWidget {{ background:{theme.PANEL}; color:{theme.TEXT}; border:none; border-right:1px solid {theme.BORDER}; padding:14px 10px; }} '
-            f'QTreeWidget::item {{ padding:3px 0; }} '
-            f'QTreeWidget::item:selected {{ background:#eef4ff; color:{theme.ACCENT}; border-radius:6px; }}'
+            f'QTreeWidget {{ background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:8px; padding:6px 4px; }} '
+            f'QTreeWidget::item {{ padding:0px; }} '
+            f'QTreeWidget::item:selected {{ background:#eef4ff; color:{theme.ACCENT}; border-radius:4px; }}'
         )
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -406,17 +432,30 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
 
         tree_panel = QWidget()
         tree_panel_layout = QVBoxLayout(tree_panel)
-        tree_panel_layout.setContentsMargins(0, 0, 0, 0)
-        tree_panel_layout.setSpacing(0)
+        tree_panel_layout.setContentsMargins(6, 6, 6, 6)
+        tree_panel_layout.setSpacing(6)
         tree_panel_layout.addWidget(self._build_view_mode_bar())
-        self.map_label_btn = QPushButton('MAPPA')
-        self.map_label_btn.clicked.connect(self._open_xref_window)
-        tree_panel_layout.addWidget(self.map_label_btn)
         tree_panel_layout.addWidget(self.tree, 1)
-        self.kant_map_label = QLabel('')
-        self.kant_map_label.setWordWrap(True)
-        self.kant_map_label.setFont(QFont('Consolas', theme.TREE_FONT_PT - 2))
-        tree_panel_layout.addWidget(self.kant_map_label)
+
+        # MAPPA opens from a small tab stuck to the bottom-center edge of the window (like a
+        # drawer handle) rather than a button buried in the tree panel; clicking it again while
+        # the map is open closes it back down. Parented directly to the shell (not the stack) so
+        # it stays put and clickable regardless of which page/tab is showing underneath.
+        self.map_tab_btn = QPushButton('▲ MAPPA', self.shell)
+        self.map_tab_btn.setFixedSize(96, 22)
+        self.map_tab_btn.setCursor(Qt.PointingHandCursor)
+        self.map_tab_btn.clicked.connect(self._toggle_xref_window)
+        self.map_tab_btn.hide()  # only relevant once a project is open
+
+        # same tab-on-the-edge pattern as MAPPA's, but on the right edge for the AI terminal pane:
+        # one button whose arrow flips between flattening the pane to zero width and restoring it
+        self._claude_pane_width = None
+        self.claude_tab_btn = QPushButton('◀', self.shell)
+        self.claude_tab_btn.setFixedSize(22, 90)
+        self.claude_tab_btn.setCursor(Qt.PointingHandCursor)
+        self.claude_tab_btn.setToolTip('Comprimi/espandi il terminale AI')
+        self.claude_tab_btn.clicked.connect(self._toggle_claude_pane)
+        self.claude_tab_btn.hide()  # only relevant once a project is open
 
         # each open file is a tab (FileTab) with its own scroll area/view/dirty state; switching
         # tabs is just switching the QTabWidget's current index, nothing to rebuild
@@ -438,6 +477,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
 
         self.claude_pane = ClaudePane(os.getcwd())
         self.claude_pane.before_run = self._prepare_ai_snapshot
+        self.claude_pane.context_hint = self._build_ai_context_hint
         self.claude_pane.finished.connect(self._finish_ai_review)
         self.claude_pane.finished.connect(self._refresh_and_validate_after_ai)
 
@@ -495,6 +535,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
     # [FN OPEN] _build_status_bar
     def _build_status_bar(self):
         bar = self.statusBar()
+        self.kant_map_label = QLabel('')
+        self.kant_map_label.setFont(QFont('Consolas', theme.TREE_FONT_PT - 2))
+        bar.addWidget(self.kant_map_label)  # addWidget (not addPermanentWidget): left-aligned
         self.cursor_pos_label = QLabel('')
         self.encoding_label = QLabel('')
         bar.addPermanentWidget(self.cursor_pos_label)
@@ -558,6 +601,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         layout.addWidget(self.code_view_btn)
         layout.addWidget(self.file_view_btn)
         layout.addStretch(1)
+        self.global_mode_btn = QPushButton('GLOBAL')
+        self.global_mode_btn.setCheckable(True)
+        self.global_mode_btn.setToolTip(
+            "Se disattivo (default), i messaggi in chat AI includono un riferimento nascosto al file/elemento "
+            "attualmente aperto nella plancia di coding, cosi le modifiche restano mirate a quel punto. "
+            "Attiva GLOBAL per far considerare all'AI l'intero progetto invece di un file/elemento specifico."
+        )
+        layout.addWidget(self.global_mode_btn)
         self._style_view_mode_bar()
         self._update_action_buttons()
         return bar
@@ -569,7 +620,38 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
         )
         for btn in self.view_mode_bar.findChildren(QPushButton):
-            btn.setStyleSheet(checked_style if btn in (self.code_view_btn, self.file_view_btn) else theme.BUTTON_STYLE)
+            highlight = btn in (self.code_view_btn, self.file_view_btn, self.global_mode_btn)
+            btn.setStyleSheet(checked_style if highlight else theme.BUTTON_STYLE)
+
+    # [FN CATEGORY] _build_ai_context_hint — a hidden (never shown in the chat bubble) instruction
+    # scoping the AI's changes to whatever the coding panel is currently showing: the isolated
+    # element if one is filtered in, otherwise the whole open file. Delivered through the same
+    # --append-system-prompt channel ClaudePane already uses for the KANT comment standard, so it
+    # reaches the model without polluting the visible conversation. GLOBAL suppresses it entirely —
+    # nothing extra is added, the prompt goes exactly as typed, project-wide.
+    # [FN] _build_ai_context_hint — ClaudePane.context_hint callback
+    # [FN OPEN] _build_ai_context_hint
+    def _build_ai_context_hint(self):
+        if self.global_mode_btn.isChecked():
+            return None
+        tab = self.active_tab
+        if tab is None:
+            return None
+        if tab.filter_uid:
+            node = self._find_node_by_uid(tab.tree, tab.filter_uid)
+            if node is not None:
+                label = node.desc or node.name
+                return (
+                    f'Contesto implicito (non menzionarlo esplicitamente all\'utente): applica le '
+                    f'modifiche richieste specificamente all\'elemento [{node.tag}] "{label}" nel file '
+                    f'{tab.path}, non all\'intero progetto, salvo diversa indicazione esplicita nel messaggio.'
+                )
+        return (
+            f'Contesto implicito (non menzionarlo esplicitamente all\'utente): applica le modifiche '
+            f'richieste specificamente al file {tab.path}, non all\'intero progetto, salvo diversa '
+            f'indicazione esplicita nel messaggio.'
+        )
+    # [FN CLOSED] _build_ai_context_hint
 
     def _update_action_buttons(self):
         if not hasattr(self, 'title_bar') or not hasattr(self, 'tabs'):
@@ -919,8 +1001,23 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self.results_view.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:6px;')
         self.info_popup.setStyleSheet(f'background:{theme.CODE_BG}; border-top:1px solid {theme.BORDER}; border-bottom:1px solid {theme.BORDER};')
         self.io_tabs.setStyleSheet(f'background:{theme.PANEL}; border-top:1px solid {theme.BORDER};')
-        for btn in (self.incoming_label_btn, self.outgoing_label_btn, self.map_label_btn):
+        for btn in (self.incoming_label_btn, self.outgoing_label_btn):
             btn.setStyleSheet(theme.BUTTON_STYLE + 'QPushButton { padding:4px 12px; }')
+        # rounded top corners only, flat bottom — reads as a tab sticking up out of the window edge
+        self.map_tab_btn.setStyleSheet(
+            f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; '
+            f'border:1px solid {theme.BORDER}; border-bottom:none; '
+            f'border-top-left-radius:8px; border-top-right-radius:8px; font-weight:700; }} '
+            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
+        )
+        # same idea, rotated a quarter turn: rounded left corners only, flat right — sticks out of
+        # the window's right edge instead of its bottom edge
+        self.claude_tab_btn.setStyleSheet(
+            f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; '
+            f'border:1px solid {theme.BORDER}; border-right:none; '
+            f'border-top-left-radius:8px; border-bottom-left-radius:8px; font-weight:700; }} '
+            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
+        )
         if self.map_dialog is not None:
             self.map_dialog.apply_style()
 
@@ -937,20 +1034,61 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
     # the IDE (parented to the main window, floating over the editor — not a strip in the coding pane
     # nor a separate OS window), kept as a single reused instance and raised if already open. Rebuilds
     # the graph from the (cache-backed) xref on every open so it reflects the current code, and wires
-    # double-click-a-node back to _navigate_to_element so the map doubles as a jump-to launcher.
+    # double-click-a-node back to _navigate_to_element so the map doubles as a jump-to launcher. The
+    # close-tab is reparented onto the dialog itself while it's open: the dialog is a separate
+    # top-level window that would otherwise render fully over the shell's own copy of the tab,
+    # making it unclickable until the map was closed some other way.
     # [FN] _open_xref_window — opens/raises the internal cross-reference map dialog
     # [FN OPEN] _open_xref_window
     def _open_xref_window(self):
         if self.map_dialog is None:
             self.map_dialog = XrefMapDialog(self)
             self.map_dialog.nodeActivated.connect(self._navigate_to_element)
+            self.map_dialog.resized.connect(self._position_map_tab)
         self.map_dialog.apply_style()
         project_name = os.path.basename(self.project_root_path) if self.project_root_path else ''
         self.map_dialog.set_graph(self._get_xref(), project_name, self.project_root_path or '')
         self.map_dialog.show()
         self.map_dialog.raise_()
         self.map_dialog.activateWindow()
+        self.map_tab_btn.setParent(self.map_dialog)
+        self.map_tab_btn.setText('▼ MAPPA')
+        self.map_tab_btn.show()
+        self._position_map_tab()
     # [FN CLOSED] _open_xref_window
+
+    def _toggle_xref_window(self):
+        if self.map_dialog is not None and self.map_dialog.isVisible():
+            key = self.map_dialog.selected_key()
+            self.map_dialog.hide()
+            self.map_tab_btn.setParent(self.shell)
+            self.map_tab_btn.setText('▲ MAPPA')
+            self.map_tab_btn.show()
+            self._position_map_tab()
+            if key:
+                self._navigate_to_element(key)
+            return
+        self._open_xref_window()
+
+    # [FN CATEGORY] _toggle_claude_pane — flattens the AI terminal pane to zero width via the outer
+    # splitter (not hiding the widget) so its running process/state is untouched, and remembers the
+    # width it had so restoring gives back the same size instead of an arbitrary default.
+    # [FN] _toggle_claude_pane — collapses/restores the AI terminal pane
+    # [FN OPEN] _toggle_claude_pane
+    def _toggle_claude_pane(self):
+        sizes = self.splitter.sizes()
+        if len(sizes) < 2:
+            return
+        if sizes[1] > 0:
+            self._claude_pane_width = sizes[1]
+            self.splitter.setSizes([sizes[0] + sizes[1], 0])
+            self.claude_tab_btn.setText('▶')
+        else:
+            restore = self._claude_pane_width or 360
+            total = sum(sizes)
+            self.splitter.setSizes([max(200, total - restore), restore])
+            self.claude_tab_btn.setText('◀')
+    # [FN CLOSED] _toggle_claude_pane
 
     # [FN CATEGORY] _navigate_to_element — jumps the editor to a cross-reference element by its key
     # ('<rel_path>::<uid>'): opens the file if needed, shows the full file view, then scrolls the
@@ -1076,10 +1214,25 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
     # drift from the code.
     # [FN] _update_io_tabs — refreshes the Incoming/Outgoing lists for the selected section
     # [FN OPEN] _update_io_tabs
+    # [FN CATEGORY] _update_io_tabs — a module (or any element with nested KANT children) has its
+    # own direct incoming/outgoing plus whatever its children reference; the panel shows the union
+    # so selecting a module surfaces everything crossing its boundary, not just its own top-level
+    # code. References between two children of the same selected element are internal to it and
+    # excluded from both lists — they're not "coming from" or "going to" anywhere outside it.
+    # [FN] _update_io_tabs — fills the Incoming/Outgoing lists for the selected element
+    # [FN OPEN] _update_io_tabs
     def _update_io_tabs(self, uid):
         self._last_io_uid = uid
         tab = self.active_tab
-        node = self._find_node_by_uid(tab.tree, uid) if (uid is not None and tab is not None) else None
+        if tab is None:
+            node = None
+        elif uid is not None:
+            node = self._find_node_by_uid(tab.tree, uid)
+        else:
+            # uid is None for the whole-file view (file tree item, or a tab with no section
+            # filter) — that view's own element is the file's top-level tagged node, not "nothing
+            # selected", so it should aggregate incoming/outgoing the same as any other module.
+            node = next((item for item in tab.tree.body if isinstance(item, Node)), None)
         self.incoming_view.clear()
         self.outgoing_view.clear()
         if node is None or not self.project_root_path:
@@ -1089,6 +1242,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         element = xref.get(f'{rel}::{node.uid}')
         if element is None:
             return
+        subtree_keys = {element.key} | {f'{rel}::{child.uid}' for child in _walk_nodes(node)}
+        incoming = {k for key in subtree_keys if key in xref for k in xref[key].incoming} - subtree_keys
+        outgoing = {k for key in subtree_keys if key in xref for k in xref[key].outgoing} - subtree_keys
 
         def fill(view, keys, arrow):
             if not keys:
@@ -1106,8 +1262,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                 item.setToolTip(el.category_desc or 'Doppio clic per aprire')
                 view.addItem(item)
 
-        fill(self.incoming_view, element.incoming, '←')   # ← comes from
-        fill(self.outgoing_view, element.outgoing, '→')   # → goes to
+        fill(self.incoming_view, incoming, '←')   # ← comes from
+        fill(self.outgoing_view, outgoing, '→')   # → goes to
     # [FN CLOSED] _update_io_tabs
 
 
@@ -1155,14 +1311,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             return
         self._refresh_recent_folders()
         self.stack.setCurrentIndex(0)
+        self.map_tab_btn.setParent(self.shell)
+        self.map_tab_btn.setText('▲ MAPPA')
+        self.map_tab_btn.hide()
+        self.claude_tab_btn.hide()
+        if self.map_dialog is not None:
+            self.map_dialog.hide()
     # [FN CLOSED] _go_back_to_welcome
 
     def _choose_ai_agent(self):
-        return self._ide_choice(
-            'Motore AI',
-            'Con quale agente vuoi applicare /kant-code-map su tutto il progetto?',
-            [('Annulla', None), ('Claude Code', 'claude'), ('Codex', 'codex')],
-        )
+        return self._ide_agent_choice_form(CLAUDE_MODELS, CODEX_MODELS, MODEL_DEFAULT)
 
     def _open_project_folder(self, path):
         path = os.path.abspath(path)
@@ -1198,11 +1356,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                     'Questo progetto non usa ancora la convenzione KANT.\n'
                     'Lanciare /kant-code-map per taggare il codice e generare la mappa?',
                 ):
-                    agent = self._choose_ai_agent()
-                    if agent:
-                        self._launch_kant_code_map(agent)
+                    choice = self._choose_ai_agent()
+                    if choice:
+                        self._launch_kant_code_map(choice['agent'], choice['model'], choice['effort'])
         self._watch_project_tree()
         self.stack.setCurrentIndex(1)
+        self.map_tab_btn.show()
+        self._position_map_tab()
+        self.claude_tab_btn.show()
+        self._position_claude_tab()
 
     def _refresh_git_status(self):
         if self._git_refresh_pending or not self.project_root_path:
@@ -1256,10 +1418,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
     def _update_kant_map_label(self):
         if self.kant_map_path:
             self.kant_map_label.setText(f'✓ {os.path.basename(self.kant_map_path)}')
-            self.kant_map_label.setStyleSheet(f'color:{theme.OK}; background:{theme.PANEL}; padding:6px 10px;')
+            self.kant_map_label.setStyleSheet(f'color:{theme.OK}; padding:0 8px;')
         else:
             self.kant_map_label.setText('✗ Nessuna KANT_*.md — genera con /kant-code-map')
-            self.kant_map_label.setStyleSheet(f'color:{theme.DIM}; background:{theme.PANEL}; padding:6px 10px;')
+            self.kant_map_label.setStyleSheet(f'color:{theme.DIM}; padding:0 8px;')
 
     # [FN CATEGORY] _sync_kant_map — the IDE owns KANT_<project>.md as generated output, not a side
     # artifact a person hand-edits: every successful save resyncs it (via FileTab.saved), and
@@ -1343,7 +1505,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
     # where it reads as text, not as a command.
     # [FN] _launch_kant_code_map — asks Claude to run the KANT code map over the whole project
     # [FN OPEN] _launch_kant_code_map
-    def _launch_kant_code_map(self, agent):
+    def _launch_kant_code_map(self, agent, model=None, effort=None):
+        if model:
+            self.claude_pane.set_agent(agent)  # refreshes the model combo's list for this agent first
+            self.claude_pane.model_select.setCurrentText(model)
         self.claude_pane.run_prompt(
             'Applica la convenzione KANT all\'intero progetto, come il comando /kant-code-map: '
             'aggiungi i commenti tag KANT sopra ogni elemento del codice sorgente e crea o aggiorna '
@@ -1351,6 +1516,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             extra_skills=('kant-code-map',),
             agent=agent,
             auto_permissions_once=True,
+            effort=effort,
         )
     # [FN CLOSED] _launch_kant_code_map
 
@@ -1402,12 +1568,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         detail_html = f'<br><span style="color:{theme.DIM}">{html_escape(detail)}</span>' if detail else ''
         lbl = QLabel(
             f'<span style="color:{color}; background-color:{bg}; font-weight:700; '
-            f'padding:2px 6px; border-radius:5px">[{tag}]</span> '
+            f'padding:0px 4px; border-radius:4px">[{tag}]</span> '
             f'<span style="font-weight:{weight}">{html_escape(text)}</span>{git_html}{detail_html}'
         )
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
-        lbl.setMargin(6)
-        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:4px 8px;')
+        lbl.setMargin(2)
+        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:1px 4px;')
         lbl.setWordWrap(True)  # long labels wrap instead of overflowing the column
         lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         return lbl
@@ -1444,7 +1610,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             f'{html_escape(name)} <span style="color:{theme.DIM}">{html_escape(str(error))}</span>'
         )
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
-        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:4px 8px;')
+        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:1px 4px;')
         lbl.setWordWrap(True)
         lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         return lbl
@@ -1456,7 +1622,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         )
         lbl = QLabel(html_escape(name) + git_html)
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
-        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:4px 8px;')
+        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:1px 4px;')
         lbl.setWordWrap(True)
         lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         return lbl
@@ -1659,6 +1825,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             lambda result, error: self._apply_syntax_status(path, text, result, error),
         )
 
+    # [FN CATEGORY] _apply_syntax_status — the local checker (check_file_syntax) covers most
+    # languages with a real compiler/interpreter's syntax-only pass, but for anything it can't run
+    # (tool missing from PATH) it falls back to a shallow bracket-balance check that can say "OK"
+    # on code an LSP server would flag. When a language server is running and has real errors, its
+    # diagnostics override a merely-shallow "OK" instead of just being appended as trailing text.
+    # [FN] _apply_syntax_status — combines the local checker with LSP diagnostics, LSP taking
+    # priority when the two disagree
+    # [FN OPEN] _apply_syntax_status
     def _apply_syntax_status(self, path, text, result, error):
         tab = self.active_tab
         if tab is None or tab.path != path or serialize_kant(tab.tree) != text:
@@ -1667,12 +1841,26 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             result = {'ok': False, 'line': 1, 'message': str(error)}
         lsp = lsp_server_for_path(path)
         lsp_text = self._lsp_status_text(tab.path, lsp)
-        if result['ok']:
+        lsp_error_diag = self._lsp_first_error(path) if lsp else None
+        if result['ok'] and lsp_error_diag is not None:
+            line = lsp_error_diag.get('range', {}).get('start', {}).get('line', 0) + 1
+            message = lsp_error_diag.get('message', '').splitlines()[0]
+            self.syntax_label.setText(f"ERR riga {line}: {message}{lsp_text}")
+            self.syntax_label.setStyleSheet(f'color:{theme.TAG_COLORS["TST"]}; font-weight:700;')
+        elif result['ok']:
             self.syntax_label.setText(f"OK {result.get('message', 'Sintassi OK')}{lsp_text}")
             self.syntax_label.setStyleSheet(f'color:{theme.OK}; font-weight:700;')
         else:
             self.syntax_label.setText(f"ERR riga {result.get('line', 1)}: {result['message']}{lsp_text}")
             self.syntax_label.setStyleSheet(f'color:{theme.TAG_COLORS["TST"]}; font-weight:700;')
+    # [FN CLOSED] _apply_syntax_status
+
+    def _lsp_first_error(self, path):
+        """First Error-severity (LSP severity 1, or unspecified) diagnostic for path, or None."""
+        for diag in self.lsp_diagnostics.get(os.path.abspath(path), []):
+            if diag.get('severity', 1) == 1:
+                return diag
+        return None
 
     def _lsp_status_text(self, path, server):
         if not server:
@@ -2039,6 +2227,34 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             return
         self.terminal.run_command(command, os.path.dirname(tab.path) or None)
 
+    # [FN CATEGORY] _debug_current_file — F5: Python only (the only language this IDE can start a
+    # real debugger for without bundling one per language). Gutter breakpoints are stored per
+    # CodeEdit as block numbers relative to that block's own Run text, so they're converted to
+    # absolute file line numbers via the same _line_count_before_run used for LSP cursor mapping,
+    # then handed to the terminal as `break file:line` pdb commands issued before `continue`.
+    # [FN] _debug_current_file — launches the active Python file under pdb with its breakpoints set
+    # [FN OPEN] _debug_current_file
+    def _debug_current_file(self):
+        tab = self.active_tab
+        if tab is None:
+            return
+        if Path(tab.path).suffix.lower() != '.py':
+            self._ide_message('Debug', 'Il debug e disponibile solo per file Python in questa versione.')
+            return
+        if tab.dirty:
+            if not tab.save():
+                return
+            self._update_tab_title(tab)
+        lines = []
+        for edit in tab.view_container.findChildren(CodeEdit):
+            item = getattr(edit, 'kant_item', None)
+            if not edit.breakpoints or item is None:
+                continue
+            offset = self._line_count_before_run(tab.tree, item) or 0
+            lines.extend(offset + number + 1 for number in edit.breakpoints)
+        self.terminal.run_debug_python(tab.path, lines, os.path.dirname(tab.path) or None)
+    # [FN CLOSED] _debug_current_file
+
     # ---- section view ---------------------------------------------------
 
     def _render_view(self, tab, only_uid=None):
@@ -2152,8 +2368,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             f'border-radius:10px; padding:0; }}'
         )
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(12, 10, 12, 10)
-        panel_layout.setSpacing(6)
+        panel_layout.setContentsMargins(5, 3, 5, 3)
+        panel_layout.setSpacing(1)
         for node in nodes:
             leaf = LeafSection(node, compact=True)
             panel_layout.addWidget(leaf)
@@ -2181,16 +2397,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         return f'{raw[:start]}{marker} {payload}{suffix}'
 
     def _edit_kant_metadata(self, tab, node):
-        tag, ok = self._ide_text('KANT metadata', 'Tag:', text=node.tag)
-        if not ok:
+        result = self._ide_metadata_form(node.tag, node.name, node.desc or node.name)
+        if result is None:
             return
+        tag, name, desc = result
         tag = tag.strip().upper()
-        name, ok = self._ide_text('KANT metadata', 'Nome tecnico:', text=node.name)
-        if not ok:
-            return
         name = name.strip()
-        desc, ok = self._ide_text('KANT metadata', 'Descrizione breve:', text=node.desc or node.name)
-        if not ok or not tag or not name:
+        if not tag or not name:
             return
         desc = desc.strip() or name
         tab.remember_undo_state()

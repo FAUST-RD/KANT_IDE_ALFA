@@ -1,4 +1,5 @@
 """KANT parse/serialize model: Run, Node, parse_kant, serialize_kant."""
+import os
 import re
 import secrets
 from dataclasses import dataclass, field
@@ -284,29 +285,52 @@ def serialize_kant(node: Node) -> str:
 # [FN CLOSED] serialize_kant
 
 
+# [CST] _label_cache — abspath -> ((mtime_ns, size), result) for read_top_level_label_result.
+# Every caller (project tree rebuild, xref rebuild, has_any_kant_tags, the KANT map) re-scans every
+# project file on its own schedule; without this, a large project re-reads and re-parses every
+# unchanged file's full text on each of those, repeatedly. Keyed on mtime+size so an edited file is
+# always re-read, never on content hash (a stat() is one syscall; hashing still means reading the
+# whole file, which is exactly the cost this exists to avoid).
+_label_cache = {}
+
+
 # [FN CATEGORY] read_top_level_label — reads a file and parses it just to find its first top-level
 # KANT node (the file's MOD/CFG/TST), so the project tree can label the file by convention instead
 # of by filename. Returns None for files with no KANT tags, that fail to decode as text, or whose
 # markers are malformed (KantParseError) — those are left out of the tree entirely rather than
-# crashing the whole project scan over one bad file.
-# ponytail: reads full file contents for every listed file just to build its label — fine for the
-# KANT-tagged codebases this tool targets; add caching if directories get huge.
+# crashing the whole project scan over one bad file. Skips the read+reparse entirely when the
+# file's (mtime, size) matches what was last cached for it.
 # [FN] read_top_level_label — extracts a file's top-level tag+desc and its parsed tree
 # [FN OPEN] read_top_level_label
 def read_top_level_label_result(path):
+    abspath = os.path.abspath(path)
+    try:
+        stat = os.stat(path)
+    except OSError:
+        _label_cache.pop(abspath, None)
+        return None, None
+    stat_key = (stat.st_mtime_ns, stat.st_size)
+    cached = _label_cache.get(abspath)
+    if cached is not None and cached[0] == stat_key:
+        return cached[1]
+
     try:
         with open(path, 'r', encoding='utf-8', newline='') as f:
             text = f.read()
     except (UnicodeDecodeError, OSError):
-        return None, None
+        result = (None, None)
+        _label_cache[abspath] = (stat_key, result)
+        return result
     try:
         tree = parse_kant(text)
     except KantParseError as e:
-        return None, e
+        result = (None, e)
+        _label_cache[abspath] = (stat_key, result)
+        return result
     top = next((c for c in tree.body if isinstance(c, Node)), None)
-    if top is None:
-        return None, None
-    return (top.tag, (top.desc or top.name), tree, top), None
+    result = (None, None) if top is None else ((top.tag, (top.desc or top.name), tree, top), None)
+    _label_cache[abspath] = (stat_key, result)
+    return result
 
 
 def read_top_level_label(path):

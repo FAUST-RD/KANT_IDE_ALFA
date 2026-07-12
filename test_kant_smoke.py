@@ -10,18 +10,17 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QGraphicsItem, QToolButton, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QGraphicsItem, QListWidget, QToolButton, QTreeWidgetItem
 
 from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH
 from kant.lsp import file_uri, LspClient
-from kant.model import Run, parse_kant, serialize_kant, read_top_level_label_result
+from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
 from kant.xref import build_xref, XrefElement
-from kant.widgets import FileTab, XrefMapDialog, XrefMapView, _agent_command, _force_layout_positions
+from kant.widgets import FileTab, XrefMapDialog, XrefMapView, _AiReviewCard, _agent_command, _force_layout_positions
 from kant.workspace import (
     apply_ai_review, build_ai_review, create_snapshot, discard_snapshot, rollback_snapshot,
     render_review_text, safe_project_path,
 )
-from kant.dialogs import AiReviewDialog
 from kant.permission_mcp import handle_message
 
 
@@ -45,8 +44,9 @@ def main():
     assert window.main_splitter.orientation() == Qt.Vertical
     assert window.main_splitter.widget(0) is window.workspace_splitter
     assert window.main_splitter.widget(1) is window.terminal
-    assert window.workspace_splitter.widget(0).layout().indexOf(window.map_label_btn) == 1
-    assert window.workspace_splitter.widget(0).layout().indexOf(window.kant_map_label) == 3
+    assert window.kant_map_label.parent() is window.statusBar()
+    assert window.map_tab_btn.parent() is window.shell
+    assert window.map_tab_btn.isHidden()  # only shown once a project is open
     window.claude_pane._add_message('domanda', 'user')
     window.claude_pane._append_stream('risposta')
     assert window.claude_pane._messages[-2][0] == 'user'
@@ -95,11 +95,55 @@ def main():
     assert len(window.claude_pane._permission_cards) == cards_before
     window.claude_pane._auto_permissions_once = False
     launch_args = []
+    set_agent_calls, model_select_calls = [], []
     launch_window = MainWindow.__new__(MainWindow)
-    launch_window.claude_pane = type('Pane', (), {'run_prompt': lambda _self, *args, **kwargs: launch_args.append((args, kwargs))})()
+    launch_window.claude_pane = type('Pane', (), {
+        'run_prompt': lambda _self, *args, **kwargs: launch_args.append((args, kwargs)),
+        'set_agent': lambda _self, agent: set_agent_calls.append(agent),
+        'model_select': type('Combo', (), {'setCurrentText': lambda _self, text: model_select_calls.append(text)})(),
+    })()
     MainWindow._launch_kant_code_map(launch_window, 'claude')
     assert launch_args[0][1]['auto_permissions_once'] is True
+    assert launch_args[0][1]['effort'] is None
+    assert not set_agent_calls  # no model given -> the combo is left alone
+    MainWindow._launch_kant_code_map(launch_window, 'claude', 'claude-opus-4-8', 'high')
+    assert set_agent_calls == ['claude'] and model_select_calls == ['claude-opus-4-8']
+    assert launch_args[1][1]['effort'] == 'high'
     assert '--full-auto' in _agent_command('codex', 'tagga', True)[1]
+    # --model must precede the trailing prompt positional for both agents, or the CLI would
+    # consume the flag/value as the prompt itself instead of the actual prompt text
+    claude_args = _agent_command('claude', 'ciao', model='claude-opus-4-8')[1]
+    assert claude_args == ['--model', 'claude-opus-4-8', '-p', 'ciao']
+    codex_args = _agent_command('codex', 'ciao', True, 'gpt-5.1-codex')[1]
+    assert codex_args == ['exec', '--full-auto', '--model', 'gpt-5.1-codex', 'ciao']
+    assert _agent_command('claude', 'ciao')[1] == ['-p', 'ciao']  # no --model when unset
+    # effort: a real flag for claude, a config override for codex — both come after --model,
+    # before the trailing prompt positional
+    assert _agent_command('claude', 'ciao', effort='high')[1] == ['--effort', 'high', '-p', 'ciao']
+    codex_effort_args = _agent_command('codex', 'ciao', effort='medium')[1]
+    assert codex_effort_args == ['exec', '-c', 'model_reasoning_effort="medium"', 'ciao']
+    assert _agent_command('claude', 'ciao')[1] == ['-p', 'ciao']  # no --effort when unset
+
+    hint_tree = parse_kant('\n'.join([
+        '# [MOD OPEN #hm1] hint.py',
+        '# [FN OPEN #hf1] alpha', 'def alpha(): pass', '# [FN CLOSED #hf1] alpha',
+        '# [MOD CLOSED #hm1] hint.py',
+    ]))
+    hint_tab = type('Tab', (), {'tree': hint_tree, 'path': 'hint.py', 'filter_uid': None})()
+    hint_window = MainWindow.__new__(MainWindow)
+    hint_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: hint_tab})()
+    hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: False})()
+    whole_file_hint = MainWindow._build_ai_context_hint(hint_window)
+    assert 'hint.py' in whole_file_hint and 'non menzionarlo' in whole_file_hint
+    hint_tab.filter_uid = 'hf1'
+    element_hint = MainWindow._build_ai_context_hint(hint_window)
+    assert 'alpha' in element_hint and 'FN' in element_hint
+    hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: True})()
+    assert MainWindow._build_ai_context_hint(hint_window) is None  # GLOBAL suppresses the hint entirely
+    hint_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: None})()
+    hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: False})()
+    assert MainWindow._build_ai_context_hint(hint_window) is None  # no open tab -> nothing to scope to
+
     assert not hasattr(window, 'results_label_btn')
     assert window._tree_label('MOD', 'short').testAttribute(Qt.WA_TransparentForMouseEvents)
     assert window.title_bar.file_menu_btn.menu() is not None
@@ -212,6 +256,40 @@ def main():
         xref = build_xref({'sample.py': xref_tree})
         alpha = next(element for element in xref.values() if element.name == 'alpha')
         assert alpha.outgoing == []
+
+        io_dir = root / 'io-project'
+        io_dir.mkdir()
+        module_tree = parse_kant('\n'.join([
+            '# [MOD OPEN #m1] module.py',
+            '# [FN OPEN #f1] alpha', 'def alpha():', '    helper()', '# [FN CLOSED #f1] alpha',
+            '# [FN OPEN #f2] beta', 'def beta(): pass', '# [FN CLOSED #f2] beta',
+            '# [MOD CLOSED #m1] module.py',
+        ]))
+        external_tree = parse_kant('\n'.join([
+            '# [FN OPEN #f3] helper', 'def helper():', '    alpha()', '# [FN CLOSED #f3] helper',
+        ]))
+        io_xref = build_xref({'module.py': module_tree, 'external.py': external_tree})
+        io_window = MainWindow.__new__(MainWindow)
+        io_window.project_root_path = str(io_dir)
+        io_fake_tab = type('Tab', (), {'path': str(io_dir / 'module.py'), 'tree': module_tree})()
+        io_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: io_fake_tab})()
+        io_window._get_xref = lambda: io_xref
+        io_window.incoming_view = QListWidget()
+        io_window.outgoing_view = QListWidget()
+        module_uid = next(item.uid for item in module_tree.body if isinstance(item, Node))
+        MainWindow._update_io_tabs(io_window, module_uid)
+        # selecting the module aggregates its children's (alpha's) references, not just the
+        # module's own empty direct incoming/outgoing
+        assert io_window.incoming_view.count() == 1 and 'helper' in io_window.incoming_view.item(0).text()
+        assert io_window.outgoing_view.count() == 1 and 'helper' in io_window.outgoing_view.item(0).text()
+        # the whole-file view (uid=None — file tree item, or a tab with no section filter) is the
+        # same module element, not "nothing selected"; it must aggregate the same way
+        io_window.incoming_view.clear()
+        io_window.outgoing_view.clear()
+        MainWindow._update_io_tabs(io_window, None)
+        assert io_window.incoming_view.count() == 1 and 'helper' in io_window.incoming_view.item(0).text()
+        assert io_window.outgoing_view.count() == 1 and 'helper' in io_window.outgoing_view.item(0).text()
+
         graph = {
             'a': XrefElement('a', 'a', 'FN', 'a', 'A', 'a.py', 0, outgoing=['b']),
             'b': XrefElement('b', 'b', 'FN', 'b', 'B', 'b.py', 0, incoming=['a']),
@@ -255,7 +333,14 @@ def main():
         app.processEvents()
         edge_scene_point = map_dialog.view._edges[0][2].path().pointAtPercent(0.5)
         map_dialog._on_edge_hovered('a', 'b', edge_scene_point, True)
+        assert map_dialog._pending_hover == ('edge', ('a', 'b', edge_scene_point))  # shows only after a delay
+        map_dialog._show_pending_hover()  # simulate the delay timer firing
         assert 'INCOMING' in map_dialog.edge_popup.incoming.text()
+        assert 'OUTGOING' in map_dialog.edge_popup.outgoing.text()
+        # hovering a node shows that element's own incoming/outgoing, same popup mechanism
+        node_scene_point = map_dialog.view._node_items['a'].sceneBoundingRect().center()
+        map_dialog._on_node_hovered('a', node_scene_point, True)
+        map_dialog._show_pending_hover()
         assert 'OUTGOING' in map_dialog.edge_popup.outgoing.text()
         map_dialog._on_edge_pinned('a', 'b', edge_scene_point)
         assert map_dialog._pinned_edge == ('a', 'b')
@@ -279,19 +364,51 @@ def main():
         expand_dialog.set_graph(module_graph, 'expand', str(root / 'expand-project'))
         expand_dialog.show()
         app.processEvents()
-        assert len(expand_dialog._display) == 1
+        assert len(expand_dialog._display) == 2  # every open starts fully expanded
         node = expand_dialog.view._node_items['module']
         click = expand_dialog.view.mapFromScene(node.sceneBoundingRect().center())
         scale_before = expand_dialog.view.transform().m11()
         center_before = expand_dialog.view.mapToScene(expand_dialog.view.viewport().rect().center())
         QTest.mouseDClick(expand_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, click)
         app.processEvents()
-        assert len(expand_dialog._display) == 2
+        assert len(expand_dialog._display) == 1  # double-click on an expanded module collapses it
         assert abs(expand_dialog.view.transform().m11() - scale_before) < 0.001
         center_after = expand_dialog.view.mapToScene(expand_dialog.view.viewport().rect().center())
         assert abs(center_after.x() - center_before.x()) < 2 and abs(center_after.y() - center_before.y()) < 2
+        node = expand_dialog.view._node_items['module']
+        click = expand_dialog.view.mapFromScene(node.sceneBoundingRect().center())
+        QTest.mouseDClick(expand_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, click)
+        app.processEvents()
+        assert len(expand_dialog._display) == 2  # double-click again re-expands it
         expand_dialog.close()
         QSettings('KANT', 'KANT Editor').remove(expand_dialog._position_key)
+
+        # drill-down: a class with 2 methods that call each other is drillable; a lone leaf isn't
+        drill_graph = {
+            'cls': XrefElement('cls', 'cls', 'CLS', 'Foo', 'classe', 'd.py', 0),
+            'm1': XrefElement('m1', 'm1', 'FN', 'bar', 'metodo bar', 'd.py', 1, outgoing=['m2'], parent='cls'),
+            'm2': XrefElement('m2', 'm2', 'FN', 'baz', 'metodo baz', 'd.py', 2, incoming=['m1'], parent='cls'),
+            'lone': XrefElement('lone', 'lone', 'FN', 'solo', 'funzione sola', 'd.py', 3),
+        }
+        drill_dialog = XrefMapDialog()
+        drill_dialog.resize(900, 650)
+        drill_dialog.set_graph(drill_graph, 'drill', str(root / 'drill-project'))
+        drill_dialog.show()
+        app.processEvents()
+        assert drill_dialog._is_drillable('cls') is True
+        assert drill_dialog._is_drillable('lone') is False
+        drill_dialog._enter_drill_mode('cls')
+        app.processEvents()
+        assert set(drill_dialog._display) == {'cls', 'm1', 'm2'}  # lone excluded — not a descendant
+        assert drill_dialog._display['m1'].outgoing == ['m2']
+        assert drill_dialog.view._node_items['cls'].pos().x() == 0 and drill_dialog.view._node_items['cls'].pos().y() == 0
+        assert drill_dialog.drill_back_btn.isVisible()
+        drill_dialog._exit_drill_mode()
+        app.processEvents()
+        assert set(drill_dialog._display) == {'cls', 'm1', 'm2', 'lone'}
+        assert not drill_dialog.drill_back_btn.isVisible()
+        drill_dialog.close()
+        QSettings('KANT', 'KANT Editor').remove(drill_dialog._position_key)
 
         replace_target = source_dir / 'replace.txt'
         replace_target.write_text('old needle', encoding='utf-8')
@@ -388,12 +505,30 @@ def main():
         review_file.write_text(''.join(changed_lines), encoding='utf-8')
         review = build_ai_review(str(review_root), review_snapshot)
         assert len(review) == 1 and len(review[0]['hunks']) == 2
-        review_dialog = AiReviewDialog(window, review, render_review_text)
-        assert review_dialog.details.objectName() == 'aiReviewDetails'
-        assert review_dialog.accepted_hunks('sample.txt') == {0, 1}
-        review_dialog.file_items['sample.txt'].child(1).setCheckState(0, Qt.Unchecked)
-        assert review_dialog.accepted_hunks('sample.txt') == {0}
-        review_dialog.close()
+        review_card = _AiReviewCard(review, render_review_text)
+        assert review_card.details.objectName() == 'aiReviewDetails'
+        assert review_card.accepted_hunks('sample.txt') == {0, 1}
+        review_card.file_items['sample.txt'].child(1).setCheckState(0, Qt.Unchecked)
+        assert review_card.accepted_hunks('sample.txt') == {0}
+        resolved = []
+        review_card.resolved.connect(resolved.append)
+        review_card._show_details('sample.txt')
+        review_card.resolved.emit('cancel')
+        assert resolved == ['cancel']
+        review_card.set_resolved()
+        assert all(not button.isEnabled() for button in review_card._action_buttons)
+        review_card.close()
+
+        rows_before = window.claude_pane.chat_layout.count()
+        review_outcomes = []
+        window.claude_pane.show_ai_review(review, render_review_text, lambda *args: review_outcomes.append(args))
+        assert window.claude_pane.chat_layout.count() == rows_before + 1  # inserted inline, not a popup
+        inserted_row = window.claude_pane.chat_layout.itemAt(window.claude_pane.chat_layout.count() - 2).widget()
+        inline_card = inserted_row.findChild(_AiReviewCard)
+        assert inline_card is not None
+        inline_card.resolved.emit('apply')
+        assert review_outcomes and review_outcomes[0][0] == 'apply'
+        assert all(not button.isEnabled() for button in inline_card._action_buttons)  # locks after resolving
         apply_ai_review(str(review_root), review, {'sample.txt': {0}})
         partial = review_file.read_text(encoding='utf-8')
         assert 'first change' in partial and 'line 18' in partial and 'second change' not in partial

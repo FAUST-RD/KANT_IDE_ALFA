@@ -37,6 +37,7 @@ class XrefElement:
     category_desc: str = ''  # long [TAG CATEGORY] explanation, shown as the map node's hover tooltip
     outgoing: list = field(default_factory=list)  # keys of elements this one references
     incoming: list = field(default_factory=list)  # keys of elements that reference this one
+    parent: str = None  # key of the immediate containing element (module/class), or None at the top
 # [TYP CLOSED] XrefElement
 
 
@@ -45,6 +46,16 @@ def _walk_nodes(node):
         if isinstance(item, Node):
             yield item
             yield from _walk_nodes(item)
+
+
+def _walk_nodes_with_parent(node, parent=None):
+    """Like _walk_nodes but also yields each node's immediate containing Node (or None at the
+    top) — used only to stamp XrefElement.parent for the map's containment edges; the reference
+    pass below doesn't need it, so _walk_nodes itself stays untouched for its other callers."""
+    for item in node.body:
+        if isinstance(item, Node):
+            yield item, parent
+            yield from _walk_nodes_with_parent(item, item)
 
 
 def _own_code(node):
@@ -69,12 +80,13 @@ def build_xref(trees):
     name_index = {}  # identifier -> [element keys]
 
     for rel_path, root in trees.items():
-        for order, node in enumerate(_walk_nodes(root)):
+        for order, (node, parent) in enumerate(_walk_nodes_with_parent(root)):
             key = f'{rel_path}::{node.uid}'
             elements[key] = XrefElement(
                 key=key, uid=node.uid, tag=node.tag, name=node.name,
                 desc=node.desc or node.name, file=rel_path, order=order,
                 category_desc=node.category_desc or '',
+                parent=f'{rel_path}::{parent.uid}' if parent is not None else None,
             )
             if node.tag not in _FILE_LEVEL_TAGS:
                 # node.name may inline "Name — description" on the OPEN line itself; strip that
