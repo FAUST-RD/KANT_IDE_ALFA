@@ -1,18 +1,48 @@
 # KANT IDE
 
-KANT IDE is a lightweight desktop editor that turns structured comments into a visual outline of a codebase.
+> **Code already has a structure. KANT makes it visible.**
 
-Instead of replacing your language or build tools, it adds a navigable layer on top of ordinary source files: edit code by section, inspect incoming and outgoing references, and explore the project through an interactive map.
+KANT IDE is a desktop editor that turns structured comments into an explorable map of your codebase. Open a project and move between modules, classes, functions, constants, and tests without losing sight of how they fit together.
 
-## What it offers
+It works on ordinary source files and stays out of your runtime:
 
-- A project tree built from KANT markers such as `[FN OPEN]` and `[CLS CLOSED]`.
-- Focused editing of individual functions, classes, constants, and other tagged sections.
-- Automatic saving with atomic file replacement and external-change detection.
-- Deterministic Incoming/Outgoing references and an interactive project map.
-- Lightweight syntax checks, optional language-server integration, Git actions, terminal, and Python debugging.
-- Built-in Claude Code and Codex terminals with permission prompts, snapshots, change review, and rollback.
-- Day and night themes.
+```text
+structured comments  ->  navigable outline  ->  focused editor  ->  project map
+```
+
+No custom file format. No generated runtime code. No lock-in.
+
+## Why KANT?
+
+Large files are easy to write and hard to understand. Traditional file trees show where code is stored, but not what is inside each file or how those pieces relate.
+
+KANT adds a small amount of explicit structure where it matters. The IDE uses it to provide:
+
+| Need | KANT IDE |
+| --- | --- |
+| Understand a large file | Browse its named sections instead of scrolling |
+| Work on one responsibility | Open only the relevant function, class, or block |
+| Follow dependencies | Inspect deterministic Incoming and Outgoing references |
+| See the bigger picture | Explore the codebase in the interactive **MAPPA** view |
+| Let an AI edit safely | Review file and hunk changes, then apply or roll back |
+
+## Highlights
+
+### Navigate by meaning
+
+The **Codice** tree is built from KANT markers such as `[FN OPEN]` and `[CLS CLOSED]`. Switch back to **File** whenever you want a conventional folder view.
+
+### Edit without losing context
+
+Open a single tagged section in a focused editor. Changes update the original source file through atomic autosaves, with undo/redo and external-change detection.
+
+### Explore relationships
+
+Incoming/Outgoing panels show what crosses a section's boundary. **MAPPA** turns the same deterministic reference graph into a filterable, draggable view with module clustering and drill-down.
+
+### Bring your existing tools
+
+KANT IDE includes Git actions, a terminal, lightweight syntax checks, optional LSP integration, and Python debugging. Claude Code and Codex can run inside the IDE with permission prompts, snapshots, change review, and rollback.
 
 ## How the KANT convention works
 
@@ -72,14 +102,15 @@ On Linux or macOS, `./install.sh` installs the Python dependency and prints the 
 
 Language-server features are enabled only when a compatible server is already available on `PATH`. The editor itself works without one.
 
-## Using the editor
+## A first five-minute tour
 
 1. Launch `kant_editor.py` and open a project folder.
-2. Select **Codice** to browse KANT sections or **File** for a conventional file tree.
-3. Open a section and edit its code block; changes are autosaved.
-4. Use **INCOMING**, **OUTGOING**, or **MAPPA** to explore relationships.
+2. Open any source file. Untagged files remain editable as normal.
+3. Add `OPEN` and `CLOSED` markers around one useful function or class.
+4. Select **Codice** and open the new section directly from the project tree.
+5. Use **INCOMING**, **OUTGOING**, and **MAPPA** to explore its relationships.
 
-Files without KANT markers can still be opened and edited. The legacy `index.html` prototype is kept for reference; current development targets the Python application.
+Start small: KANT does not require tagging an entire project before it becomes useful. The legacy `index.html` prototype is kept for reference; current development targets the Python application.
 
 ## Development
 
