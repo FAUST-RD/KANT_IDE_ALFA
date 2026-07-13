@@ -1,5 +1,21 @@
 KANT IDE changelog
 
+2026-07-13 (20)
+- Added a global crash handler (kant_editor._install_crash_handler): an uncaught exception anywhere in the app now writes a timestamped log to ~/.kant_ide/crash_logs and shows an error dialog, instead of vanishing silently on a windowed (no console) launch.
+- Split test_kant_smoke.py's single ~950-line test into 26 focused test_* methods, one per feature area, so a failing assertion names what broke and individual tests are runnable in isolation (pytest -k). Also fixed a Windows-only flake where a MainWindow's QFileSystemWatcher could keep its temp directory locked past the test's own cleanup.
+- Extracted Git actions (diff/stage/commit/branch/status refresh) out of mainwindow.py into a new GitOpsMixin (kant/gitops.py), mirroring the existing IdeDialogsMixin/WorkspaceMixin pattern.
+- Extracted the MAPPA subsystem (layout algorithm, graph graphics items, XrefMapView, XrefMapDialog) out of widgets.py into a new kant/mappa.py — it alone was roughly half that file's line count.
+- Moved the legacy index.html prototype into legacy/ to declutter the repo root.
+
+2026-07-13 (19)
+- Added a command palette (Aspetto menu / Ctrl+Shift+P): fuzzy-filtered list of every enabled action across the File/Cerca/Aspetto/LSP/Git menus, built by introspecting the menus themselves rather than a separately hand-maintained list, so new menu actions are automatically included. Arrow keys move the selection, Enter/double-click runs it.
+- Added direct black/ruff formatting (LSP menu -> "Formatta con black/ruff"), independent of any LSP server: runs whichever of black or ruff is on PATH over the active Python file's text and applies the result through the same KANT-marker safety check LSP-based formatting already uses.
+
+2026-07-13 (18)
+- Added Git commit: a "Commit..." action in the Git menu shows the currently staged files (git diff --cached --name-only) and a message box, with a "Stage tutto" shortcut (git add -A) for when nothing was staged file-by-file first.
+- Added Git branch switching: a "Cambia branch..." action lists local branches and checks out the pick.
+- Added an integrated test runner: "Esegui test" (File menu / Ctrl+Shift+T) runs `python -m pytest` over the project without needing an external terminal, and parses FAILED lines from the output into the existing clickable search-results panel — clicking a failure opens the file and jumps straight to that test function.
+
 2026-07-13 (17)
 - Fixed a performance bug: mark_dirty() fired dirtyChanged on every keystroke, not just the first one after a save, cascading into a full tab-title HTML rebuild and QTabBar relayout on every single keystroke while a file stayed dirty. Now only emits on the clean-to-dirty edge.
 - Fixed tab drag-to-reorder: the rich-HTML tab label (added in round 12) covered the tab's whole clickable area and swallowed every mouse press, silently breaking the tab strip's native drag-to-reorder. The label now forwards press/move/release to the underlying QTabBar after handling its own click-to-select.

@@ -1,6 +1,9 @@
+import contextlib
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,18 +15,21 @@ from PySide6.QtCore import Qt, QEvent, QPointF, QSettings
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
-    QApplication, QGraphicsItem, QLabel, QListWidget, QTabBar, QToolButton, QToolTip, QTreeWidgetItem,
+    QApplication, QGraphicsItem, QLabel, QListWidget, QMenu, QMessageBox, QTabBar, QToolButton,
+    QToolTip, QTreeWidget, QTreeWidgetItem,
 )
 
+import kant_editor
 from kant import theme
-from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID
+from kant import mainwindow as kant_mainwindow_module
+from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT
 from kant.lsp import file_uri, LspClient
 from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
 from kant.xref import build_xref, XrefElement
 from kant.widgets import (
-    CollapsibleSection, FileTab, LeafSection, XrefMapDialog, XrefMapView,
-    _AiReviewCard, _agent_command, _force_layout_positions, CodeEdit,
+    CollapsibleSection, FileTab, LeafSection, _AiReviewCard, _agent_command, CodeEdit,
 )
+from kant.mappa import XrefMapDialog, XrefMapView, _force_layout_positions
 from kant.workspace import (
     apply_ai_review, build_ai_review, create_snapshot, discard_snapshot, rollback_snapshot,
     render_review_text, safe_project_path,
@@ -42,417 +48,484 @@ class LabelStub:
         pass
 
 
-def main():
-    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-    app = QApplication.instance() or QApplication(sys.argv)
-    window = MainWindow()
-    assert window.splitter.orientation() == Qt.Horizontal
-    assert window.splitter.widget(1) is window.claude_pane
-    assert window.main_splitter.orientation() == Qt.Vertical
-    assert window.main_splitter.widget(0) is window.workspace_splitter
-    assert window.main_splitter.widget(1) is window.terminal
-    assert window.kant_map_label.parent() is window.statusBar()
-    assert window.map_tab_btn.parent() is window.shell
-    assert window.map_tab_btn.isHidden()  # only shown once a project is open
-    window.claude_pane._add_message('domanda', 'user')
-    window.claude_pane._append_stream('risposta')
-    assert window.claude_pane._messages[-2][0] == 'user'
-    assert window.claude_pane._messages[-1][0] == 'assistant'
-    mcp_reply = handle_message(
-        {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
-            'name': 'approve', 'arguments': {'tool_name': 'Write', 'input': {'file_path': 'sample.py'}},
-        }},
-        lambda arguments: {'behavior': 'allow', 'updatedInput': arguments['input']},
-    )
-    assert '"behavior": "allow"' in mcp_reply['result']['content'][0]['text']
-    bridge_result = []
-    window.claude_pane.auto_permissions.setChecked(True)
+# [FN CATEGORY] _temp_dir — a MainWindow constructed against this path may still hold its
+# QFileSystemWatcher open on it after .close() (Qt hides on close, it doesn't tear down child
+# objects), which on Windows can make the OS refuse to delete the directory for a moment.
+# tempfile.TemporaryDirectory()'s own cleanup raises on that; this swallows it instead — a few
+# leftover temp dirs in the OS temp folder is a fine trade for tests that don't flake on Windows.
+# [FN] _temp_dir — like tempfile.TemporaryDirectory() but ignores Windows cleanup races
+# [FN OPEN] _temp_dir
+@contextlib.contextmanager
+def _temp_dir():
+    path = tempfile.mkdtemp()
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+# [FN CLOSED] _temp_dir
 
-    def ask_permission():
-        bridge = window.claude_pane.permission_bridge
-        with socket.create_connection(('127.0.0.1', bridge.port), timeout=2) as connection:
-            request = {'token': bridge.token, 'tool_name': 'Write', 'input': {'file_path': 'sample.py'}}
-            connection.sendall((json.dumps(request) + '\n').encode('utf-8'))
-            bridge_result.append(json.loads(connection.makefile('rb').readline().decode('utf-8')))
 
-    permission_thread = threading.Thread(target=ask_permission, daemon=True)
-    permission_thread.start()
-    deadline = time.monotonic() + 3
-    while permission_thread.is_alive() and time.monotonic() < deadline:
-        app.processEvents()
-        time.sleep(0.01)
-    permission_thread.join(timeout=0.1)
-    assert bridge_result and bridge_result[0]['behavior'] == 'allow'
-    window.claude_pane.auto_permissions.setChecked(False)
-    manual_request = {
-        'tool_name': 'Edit', 'input': {'file_path': 'sample.py'},
-        'event': threading.Event(), 'response': None,
-    }
-    window.claude_pane._permission_requested(manual_request)
-    window.claude_pane._permission_cards[-1][2][1].click()
-    assert manual_request['response']['behavior'] == 'allow'
-    cards_before = len(window.claude_pane._permission_cards)
-    window.claude_pane._auto_permissions_once = True
-    one_shot_request = {
-        'tool_name': 'Write', 'input': {'file_path': 'first_kant.py'},
-        'event': threading.Event(), 'response': None,
-    }
-    window.claude_pane._permission_requested(one_shot_request)
-    assert one_shot_request['response']['behavior'] == 'allow'
-    assert len(window.claude_pane._permission_cards) == cards_before
-    window.claude_pane._auto_permissions_once = False
-    launch_args = []
-    set_agent_calls, model_select_calls = [], []
-    launch_window = MainWindow.__new__(MainWindow)
-    launch_window.claude_pane = type('Pane', (), {
-        'run_prompt': lambda _self, *args, **kwargs: launch_args.append((args, kwargs)),
-        'set_agent': lambda _self, agent: set_agent_calls.append(agent),
-        'model_select': type('Combo', (), {'setCurrentText': lambda _self, text: model_select_calls.append(text)})(),
-    })()
-    MainWindow._launch_kant_code_map(launch_window, 'claude')
-    assert launch_args[0][1]['auto_permissions_once'] is True
-    assert launch_args[0][1]['effort'] is None
-    assert not set_agent_calls  # no model given -> the combo is left alone
-    MainWindow._launch_kant_code_map(launch_window, 'claude', 'claude-opus-4-8', 'high')
-    assert set_agent_calls == ['claude'] and model_select_calls == ['claude-opus-4-8']
-    assert launch_args[1][1]['effort'] == 'high'
-    assert '--full-auto' in _agent_command('codex', 'tagga', True)[1]
-    # --model must precede the trailing prompt positional for both agents, or the CLI would
-    # consume the flag/value as the prompt itself instead of the actual prompt text
-    claude_args = _agent_command('claude', 'ciao', model='claude-opus-4-8')[1]
-    assert claude_args == ['--model', 'claude-opus-4-8', '-p', 'ciao']
-    codex_args = _agent_command('codex', 'ciao', True, 'gpt-5.1-codex')[1]
-    assert codex_args == ['exec', '--full-auto', '--model', 'gpt-5.1-codex', 'ciao']
-    assert _agent_command('claude', 'ciao')[1] == ['-p', 'ciao']  # no --model when unset
-    # effort: a real flag for claude, a config override for codex — both come after --model,
-    # before the trailing prompt positional
-    assert _agent_command('claude', 'ciao', effort='high')[1] == ['--effort', 'high', '-p', 'ciao']
-    codex_effort_args = _agent_command('codex', 'ciao', effort='medium')[1]
-    assert codex_effort_args == ['exec', '-c', 'model_reasoning_effort="medium"', 'ciao']
-    assert _agent_command('claude', 'ciao')[1] == ['-p', 'ciao']  # no --effort when unset
+def _write_app_py(source_dir):
+    source = source_dir / 'app.py'
+    source.write_text('\n'.join([
+        '# [MOD CATEGORY] shop/__init__.py — exposes the server module from the package namespace',
+        '# [MOD shop/__init__.py] — package exports',
+        '# [MOD OPEN #abc12345] shop/__init__.py',
+        'print(1)',
+        '# [MOD CLOSED #abc12345] shop/__init__.py',
+    ]), encoding='utf-8')
+    return source
 
-    hint_tree = parse_kant('\n'.join([
-        '# [MOD OPEN #hm1] hint.py',
-        '# [FN OPEN #hf1] alpha', 'def alpha(): pass', '# [FN CLOSED #hf1] alpha',
-        '# [MOD CLOSED #hm1] hint.py',
-    ]))
-    hint_tab = type('Tab', (), {'tree': hint_tree, 'path': 'hint.py', 'filter_uid': None})()
-    hint_window = MainWindow.__new__(MainWindow)
-    hint_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: hint_tab})()
-    hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: False})()
-    whole_file_hint = MainWindow._build_ai_context_hint(hint_window)
-    assert 'hint.py' in whole_file_hint and 'non menzionarlo' in whole_file_hint
-    hint_tab.filter_uid = 'hf1'
-    element_hint = MainWindow._build_ai_context_hint(hint_window)
-    assert 'alpha' in element_hint and 'FN' in element_hint
-    hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: True})()
-    assert MainWindow._build_ai_context_hint(hint_window) is None  # GLOBAL suppresses the hint entirely
-    hint_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: None})()
-    hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: False})()
-    assert MainWindow._build_ai_context_hint(hint_window) is None  # no open tab -> nothing to scope to
 
-    assert not hasattr(window, 'results_label_btn')
-    # tree rows use a rich-HTML label via setItemWidget; it must forward its own clicks to the
-    # owning item directly (WA_TransparentForMouseEvents pass-through proved unreliable for this)
-    dummy_item = QTreeWidgetItem(window.tree)
-    label_clicks, label_dclicks = [], []
-    window.tree.itemClicked.connect(lambda it, col: label_clicks.append(it))
-    window.tree.itemDoubleClicked.connect(lambda it, col: label_dclicks.append(it))
-    tree_label = window._tree_label(dummy_item, 'MOD', 'short')
-    tree_label.resize(100, 20)
-    QTest.mouseClick(tree_label, Qt.LeftButton)
-    assert label_clicks == [dummy_item]
-    QTest.mouseDClick(tree_label, Qt.LeftButton)
-    assert label_dclicks == [dummy_item]
-    assert window.title_bar.file_menu_btn.menu() is not None
-    assert window.title_bar.file_menu_btn.popupMode() == QToolButton.DelayedPopup
-    window.close()
+# [TST CATEGORY] KantSmokeTest — one offscreen regression check per feature area rather than a
+# single mega-test: a failing assertion now names the feature that broke and pytest -k can run
+# just it. setUpClass builds the one QApplication instance the whole process needs; individual
+# tests each own their own temp directory/window instead of sharing state across the file, so
+# they can run (and fail) independently of each other.
+# [TST] KantSmokeTest — the project's regression suite, run offscreen (QT_QPA_PLATFORM=offscreen)
+# [TST OPEN] KantSmokeTest
+class KantSmokeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+        cls.app = QApplication.instance() or QApplication(sys.argv)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        source_dir = root / 'src'
-        source_dir.mkdir()
-        source = source_dir / 'app.py'
-        source.write_text('\n'.join([
-            '# [MOD CATEGORY] shop/__init__.py — exposes the server module from the package namespace',
-            '# [MOD shop/__init__.py] — package exports',
-            '# [MOD OPEN #abc12345] shop/__init__.py',
-            'print(1)',
-            '# [MOD CLOSED #abc12345] shop/__init__.py',
-        ]), encoding='utf-8')
-        label, error = read_top_level_label_result(str(source))
-        assert error is None and label[:2] == ('MOD', 'package exports')
-        assert label[3].category_desc == 'exposes the server module from the package namespace'
-        bad = source_dir / 'bad.py'
-        bad.write_text('# [FN OPEN #deadbeef] broken\n', encoding='utf-8')
-        label, error = read_top_level_label_result(str(bad))
-        assert label is None and error is not None
-
-        tree_window = MainWindow()
-        tree_window.project_root_path = str(root)
-        tree_window.git_root = None
-        tree_window.git_status = {}
-        tree_window.tree.clear()
-        tree_window._build_project_tree(tree_window.tree.invisibleRootItem(), str(root))
-        top_kinds = [tree_window.tree.topLevelItem(i).data(0, ROLE_KIND) for i in range(tree_window.tree.topLevelItemCount())]
-        assert 'dir' not in top_kinds and 'file' in top_kinds and 'invalidfile' in top_kinds
-        # a file item starts collapsed — compact by default, expand on demand
-        file_item = next(
-            tree_window.tree.topLevelItem(i) for i in range(tree_window.tree.topLevelItemCount())
-            if tree_window.tree.topLevelItem(i).data(0, ROLE_KIND) == 'file'
+    def test_main_window_shell_claude_pane_and_agent_launch(self):
+        window = MainWindow()
+        assert window.splitter.orientation() == Qt.Horizontal
+        assert window.splitter.widget(1) is window.claude_pane
+        assert window.main_splitter.orientation() == Qt.Vertical
+        assert window.main_splitter.widget(0) is window.workspace_splitter
+        assert window.main_splitter.widget(1) is window.terminal
+        assert window.kant_map_label.parent() is window.statusBar()
+        assert window.map_tab_btn.parent() is window.shell
+        assert window.map_tab_btn.isHidden()  # only shown once a project is open
+        window.claude_pane._add_message('domanda', 'user')
+        window.claude_pane._append_stream('risposta')
+        assert window.claude_pane._messages[-2][0] == 'user'
+        assert window.claude_pane._messages[-1][0] == 'assistant'
+        mcp_reply = handle_message(
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
+                'name': 'approve', 'arguments': {'tool_name': 'Write', 'input': {'file_path': 'sample.py'}},
+            }},
+            lambda arguments: {'behavior': 'allow', 'updatedInput': arguments['input']},
         )
-        assert not file_item.isExpanded()
-        assert 'ERRORI' in tree_window._validate_kant_project()
-        assert tree_window.results_view.topLevelItemCount() == 1
-        assert tree_window._open_file(str(source))
-        opened_tab = tree_window.open_tabs[str(source)]
-        source.write_text(source.read_text(encoding='utf-8').replace('print(1)', 'print(9)'), encoding='utf-8')
-        tree_window._on_fs_file_changed(str(source))
-        assert 'print(9)' in serialize_kant(opened_tab.tree)
-        source.write_text(source.read_text(encoding='utf-8').replace('print(9)', 'print(1)'), encoding='utf-8')
-        tree_window._on_fs_file_changed(str(source))
-        tree_window._update_action_buttons()
-        assert tree_window.title_bar.lsp_hover_menu_action.isEnabled()
-        assert tree_window._lsp_status_text(str(source), None) == ' | LSP locale'
-        assert 'pyright-langserver' in tree_window._lsp_missing_server_message(str(source))
-        plain = source_dir / 'plain.py'
-        plain.write_text('def helper():\n    return helper()\n', encoding='utf-8')
-        assert tree_window._local_definition_locations('helper')[0][2] == 1
-        assert len(tree_window._local_reference_locations('helper')) == 2
+        assert '"behavior": "allow"' in mcp_reply['result']['content'][0]['text']
+        bridge_result = []
+        window.claude_pane.auto_permissions.setChecked(True)
 
-        # legacy (no #id) file: parse_kant mints a fresh random uid every reparse, and _open_file
-        # always reparses from disk — so a tree item's uid (captured at the last tree rebuild) can
-        # silently stop matching tab.tree. _on_tree_item_clicked must fall back to document order
-        # (ROLE_ORDER) to still isolate the right section, instead of falling through to the
-        # whole-file view.
-        legacy = source_dir / 'legacy.py'
-        legacy.write_text('\n'.join([
-            '# [MOD OPEN] legacy.py',
-            '# [FN OPEN] alpha', 'def alpha(): pass', '# [FN CLOSED] alpha',
-            '# [FN OPEN] beta', 'def beta(): pass', '# [FN CLOSED] beta',
-            '# [MOD CLOSED] legacy.py',
-        ]), encoding='utf-8')
-        tree_window.tree.clear()
-        tree_window._build_project_tree(tree_window.tree.invisibleRootItem(), str(root))
-        legacy_file_item = next(
-            tree_window.tree.invisibleRootItem().child(i)
-            for i in range(tree_window.tree.invisibleRootItem().childCount())
-            if tree_window.tree.invisibleRootItem().child(i).data(0, ROLE_PATH) == str(legacy)
-        )
-        assert not legacy_file_item.isExpanded() and legacy_file_item.childCount() == 2  # collapsed by default, alpha+beta still built underneath
-        beta_item = None
-        it = tree_window.tree.invisibleRootItem()
-        stack = [it.child(i) for i in range(it.childCount())]
-        while stack:
-            candidate = stack.pop()
-            if candidate.data(0, ROLE_KIND) == 'section' and 'beta' in tree_window.tree.itemWidget(candidate, 0).text():
-                beta_item = candidate
-            for i in range(candidate.childCount()):
-                stack.append(candidate.child(i))
-        assert beta_item is not None and beta_item.data(0, ROLE_ORDER) is not None
-        stale_uid = beta_item.data(0, ROLE_UID)
-        tree_window._on_tree_item_clicked(beta_item, 0)
-        legacy_tab = tree_window.open_tabs[str(legacy)]
-        assert legacy_tab.filter_uid is not None and legacy_tab.filter_uid != stale_uid  # reparse minted a new uid
-        assert legacy_tab.view_layout.count() == 1
-        isolated_widget = legacy_tab.view_layout.itemAt(0).widget()
-        isolated_codes = [c.toPlainText().strip() for c in isolated_widget.findChildren(CodeEdit)]
-        assert isolated_codes == ['def beta(): pass']  # not alpha too — the whole-file fallback would show both
+        def ask_permission():
+            bridge = window.claude_pane.permission_bridge
+            with socket.create_connection(('127.0.0.1', bridge.port), timeout=2) as connection:
+                request = {'token': bridge.token, 'tool_name': 'Write', 'input': {'file_path': 'sample.py'}}
+                connection.sendall((json.dumps(request) + '\n').encode('utf-8'))
+                bridge_result.append(json.loads(connection.makefile('rb').readline().decode('utf-8')))
 
-        # the main tab's own title (next to its close x) follows the isolated KANT element's
-        # identity too, not the filename — matching the split pane's header convention. The plain
-        # tab text is cleared in favor of a rich-HTML label (_tab_label) using the same
-        # colored/bold "[TAG] name" convention as the tree and coding panel.
-        legacy_idx = tree_window.tabs.indexOf(legacy_tab)
-        assert tree_window.tabs.tabText(legacy_idx) == ''
-        tab_label_html = legacy_tab._tab_label.text()
-        assert '[FN]' in tab_label_html and '<b>beta</b>' in tab_label_html  # bold name
-        assert f'background-color:{theme.TAG_BACKGROUNDS["FN"]}' in tab_label_html  # colored tag badge
-        assert tree_window.tabs.tabBar().tabButton(legacy_idx, QTabBar.LeftSide) is legacy_tab._tab_label
-        # clicking the label (not the tab strip itself) must still switch to that tab
-        tree_window.tabs.setCurrentIndex(0 if tree_window.tabs.currentIndex() == legacy_idx else legacy_idx)
-        assert tree_window.tabs.currentWidget() is not legacy_tab
-        legacy_tab._tab_label.mousePressEvent(QMouseEvent(
-            QEvent.MouseButtonPress, QPointF(1, 1), QPointF(1, 1), Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
-        ))
-        assert tree_window.tabs.currentWidget() is legacy_tab
-        # regression: re-registering the SAME _tab_label widget via setTabButton (needed every call
-        # to keep the tab sized to fit it) made Qt hide it internally with no matching re-show —
-        # every theme refresh (or any second _update_tab_title call) left the tab blank
-        assert not legacy_tab._tab_label.isHidden()
-        tree_window._update_tab_title(legacy_tab)
-        assert not legacy_tab._tab_label.isHidden()
+        permission_thread = threading.Thread(target=ask_permission, daemon=True)
+        permission_thread.start()
+        deadline = time.monotonic() + 3
+        while permission_thread.is_alive() and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        permission_thread.join(timeout=0.1)
+        assert bridge_result and bridge_result[0]['behavior'] == 'allow'
+        window.claude_pane.auto_permissions.setChecked(False)
+        manual_request = {
+            'tool_name': 'Edit', 'input': {'file_path': 'sample.py'},
+            'event': threading.Event(), 'response': None,
+        }
+        window.claude_pane._permission_requested(manual_request)
+        window.claude_pane._permission_cards[-1][2][1].click()
+        assert manual_request['response']['behavior'] == 'allow'
+        cards_before = len(window.claude_pane._permission_cards)
+        window.claude_pane._auto_permissions_once = True
+        one_shot_request = {
+            'tool_name': 'Write', 'input': {'file_path': 'first_kant.py'},
+            'event': threading.Event(), 'response': None,
+        }
+        window.claude_pane._permission_requested(one_shot_request)
+        assert one_shot_request['response']['behavior'] == 'allow'
+        assert len(window.claude_pane._permission_cards) == cards_before
+        window.claude_pane._auto_permissions_once = False
+        window.close()
 
-        # the title bar's own slot shows the KANT identity too, not the filename — the filename
-        # itself now lives in file_path_label, on the Incoming/Outgoing row
-        assert tree_window.filename_label.text() == '[FN] beta'
-        assert tree_window.file_path_label.text() == 'legacy.py'
-        tree_window._render_view(legacy_tab, None)
-        # whole-file view: both the tab and the title bar show the file's own top-level KANT tag,
-        # not the raw filename — a module's identity is "[MOD] legacy.py", not just "legacy.py"
-        assert tree_window.tabs.tabText(legacy_idx) == ''
-        assert '[MOD]' in legacy_tab._tab_label.text() and 'legacy.py' in legacy_tab._tab_label.text()
-        assert tree_window.filename_label.text() == '[MOD] legacy.py'
-        assert tree_window.file_path_label.text() == 'legacy.py'
+    def test_kant_code_map_launch_args(self):
+        launch_args = []
+        set_agent_calls, model_select_calls = [], []
+        launch_window = MainWindow.__new__(MainWindow)
+        launch_window.claude_pane = type('Pane', (), {
+            'run_prompt': lambda _self, *args, **kwargs: launch_args.append((args, kwargs)),
+            'set_agent': lambda _self, agent: set_agent_calls.append(agent),
+            'model_select': type('Combo', (), {'setCurrentText': lambda _self, text: model_select_calls.append(text)})(),
+        })()
+        MainWindow._launch_kant_code_map(launch_window, 'claude')
+        assert launch_args[0][1]['auto_permissions_once'] is True
+        assert launch_args[0][1]['effort'] is None
+        assert not set_agent_calls  # no model given -> the combo is left alone
+        MainWindow._launch_kant_code_map(launch_window, 'claude', 'claude-opus-4-8', 'high')
+        assert set_agent_calls == ['claude'] and model_select_calls == ['claude-opus-4-8']
+        assert launch_args[1][1]['effort'] == 'high'
 
-        # the outermost element of an isolated view has its "[TAG] name" title suppressed — the
-        # tab/title-bar/split-header already announce that identity, so repeating it inline would
-        # be redundant; the panel starts directly with the category description instead. A NESTED
-        # element (not the one being isolated) keeps its own header, since nothing else names it.
-        nested_source = source_dir / 'nested.py'
-        nested_source.write_text('\n'.join([
-            '# [CLS CATEGORY] a class that does stuff',
-            '# [CLS OPEN] Widget', 'class Widget:',
-            '# [FN CATEGORY] initializes the widget',
-            '# [FN OPEN] init', '    def init(self): pass', '# [FN CLOSED] init',
-            '# [CLS CLOSED] Widget',
-        ]), encoding='utf-8')
-        assert tree_window._open_file(str(nested_source))
-        nested_tab = tree_window.open_tabs[str(nested_source)]
-        cls_node = next(n for n in nested_tab.tree.body if hasattr(n, 'body'))
-        fn_node = next(c for c in cls_node.body if getattr(c, 'tag', None) == 'FN')
-        tree_window._render_view(nested_tab, cls_node.uid)
-        cls_widget = nested_tab.section_widgets[cls_node.uid]
-        fn_widget = nested_tab.section_widgets[fn_node.uid]
-        assert isinstance(cls_widget, CollapsibleSection) and cls_widget.toggle_btn is None
-        cls_labels = ' '.join(l.text() for l in cls_widget.findChildren(QLabel))
-        assert '[CLS]' not in cls_labels and 'a class that does stuff' in cls_labels  # no title, category kept
-        assert isinstance(fn_widget, LeafSection)
-        fn_labels = ' '.join(l.text() for l in fn_widget.findChildren(QLabel))
-        assert '[FN]' in fn_labels  # nested element still gets its own header
+    def test_agent_command_building(self):
+        assert '--full-auto' in _agent_command('codex', 'tagga', True)[1]
+        # --model must precede the trailing prompt positional for both agents, or the CLI would
+        # consume the flag/value as the prompt itself instead of the actual prompt text
+        claude_args = _agent_command('claude', 'ciao', model='claude-opus-4-8')[1]
+        assert claude_args == ['--model', 'claude-opus-4-8', '-p', 'ciao']
+        codex_args = _agent_command('codex', 'ciao', True, 'gpt-5.1-codex')[1]
+        assert codex_args == ['exec', '--full-auto', '--model', 'gpt-5.1-codex', 'ciao']
+        assert _agent_command('claude', 'ciao')[1] == ['-p', 'ciao']  # no --model when unset
+        # effort: a real flag for claude, a config override for codex — both come after --model,
+        # before the trailing prompt positional
+        assert _agent_command('claude', 'ciao', effort='high')[1] == ['--effort', 'high', '-p', 'ciao']
+        codex_effort_args = _agent_command('codex', 'ciao', effort='medium')[1]
+        assert codex_effort_args == ['exec', '-c', 'model_reasoning_effort="medium"', 'ciao']
+        assert _agent_command('claude', 'ciao')[1] == ['-p', 'ciao']  # no --effort when unset
 
-        # split pane: identity is the KANT element, not a filename tab, and it must not disturb
-        # whatever the main pane currently has active
-        alpha_section = None
-        it = tree_window.tree.invisibleRootItem()
-        stack = [it.child(i) for i in range(it.childCount())]
-        while stack:
-            candidate = stack.pop()
-            if candidate.data(0, ROLE_KIND) == 'section' and 'alpha' in tree_window.tree.itemWidget(candidate, 0).text():
-                alpha_section = candidate
-            for i in range(candidate.childCount()):
-                stack.append(candidate.child(i))
-        assert alpha_section is not None
-        main_filter_before = legacy_tab.filter_uid
-        assert tree_window.split_panel.isHidden()  # tree_window is never shown, so isVisible() is unusable here
-        tree_window._on_tree_item_double_clicked(alpha_section, 0)
-        assert not tree_window.split_panel.isHidden()
-        assert tree_window.split_header_label.text() == '[FN] alpha'  # KANT identity, not "legacy.py"
-        assert legacy_tab.filter_uid == main_filter_before  # main pane untouched
-        split_codes = [c.toPlainText().strip() for c in tree_window.split_view_layout.itemAt(0).widget().findChildren(CodeEdit)]
-        assert split_codes == ['def alpha(): pass']
-        tree_window._close_split_pane()
-        assert tree_window.split_panel.isHidden() and tree_window.split_tab is None
+    def test_ai_context_hint(self):
+        hint_tree = parse_kant('\n'.join([
+            '# [MOD OPEN #hm1] hint.py',
+            '# [FN OPEN #hf1] alpha', 'def alpha(): pass', '# [FN CLOSED #hf1] alpha',
+            '# [MOD CLOSED #hm1] hint.py',
+        ]))
+        hint_tab = type('Tab', (), {'tree': hint_tree, 'path': 'hint.py', 'filter_uid': None})()
+        hint_window = MainWindow.__new__(MainWindow)
+        hint_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: hint_tab})()
+        hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: False})()
+        whole_file_hint = MainWindow._build_ai_context_hint(hint_window)
+        assert 'hint.py' in whole_file_hint and 'non menzionarlo' in whole_file_hint
+        hint_tab.filter_uid = 'hf1'
+        element_hint = MainWindow._build_ai_context_hint(hint_window)
+        assert 'alpha' in element_hint and 'FN' in element_hint
+        hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: True})()
+        assert MainWindow._build_ai_context_hint(hint_window) is None  # GLOBAL suppresses the hint entirely
+        hint_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: None})()
+        hint_window.global_mode_btn = type('Btn', (), {'isChecked': lambda _self: False})()
+        assert MainWindow._build_ai_context_hint(hint_window) is None  # no open tab -> nothing to scope to
 
-        # closing the tab the split pane is showing must close the split pane too, not leave it
-        # pointing at a tab that's been torn down
-        tree_window._on_tree_item_double_clicked(alpha_section, 0)
-        assert not tree_window.split_panel.isHidden()
-        tree_window._close_tab(tree_window.tabs.indexOf(legacy_tab), flush=False)
-        assert tree_window.split_panel.isHidden() and tree_window.split_tab is None
-        tree_window.close()
+    def test_tree_label_click_forwarding(self):
+        window = MainWindow()
+        assert not hasattr(window, 'results_label_btn')
+        # tree rows use a rich-HTML label via setItemWidget; it must forward its own clicks to the
+        # owning item directly (WA_TransparentForMouseEvents pass-through proved unreliable for this)
+        dummy_item = QTreeWidgetItem(window.tree)
+        label_clicks, label_dclicks = [], []
+        window.tree.itemClicked.connect(lambda it, col: label_clicks.append(it))
+        window.tree.itemDoubleClicked.connect(lambda it, col: label_dclicks.append(it))
+        tree_label = window._tree_label(dummy_item, 'MOD', 'short')
+        tree_label.resize(100, 20)
+        QTest.mouseClick(tree_label, Qt.LeftButton)
+        assert label_clicks == [dummy_item]
+        QTest.mouseDClick(tree_label, Qt.LeftButton)
+        assert label_dclicks == [dummy_item]
+        assert window.title_bar.file_menu_btn.menu() is not None
+        assert window.title_bar.file_menu_btn.popupMode() == QToolButton.DelayedPopup
+        window.close()
 
-        # the MAPPA window spans the full page: left/right edges of the main window, top just
-        # under the action toolbar (Save row), bottom just above the status bar (UTF-8 row) —
-        # needs a real shown/laid-out window, unlike tree_window above, since it reads real
-        # on-screen positions via mapToGlobal. Clears any windowGeometry saved by an earlier run
-        # first — MainWindow.__init__ restores it, which would otherwise override the resize below
-        # once the window is actually realized on screen.
-        # wide enough that the MAPPA toolbar's own minimum content width (many buttons) never
-        # forces the dialog wider than the window — otherwise Qt can't honor the requested width
-        QSettings('KANT', 'KANT Editor').remove('windowGeometry')
-        mappa_window = MainWindow()
-        mappa_window.resize(2000, 900)
-        mappa_window.show()
-        app.processEvents()
-        window_width_at_show = mappa_window.width()  # same moment showEvent reads parent.width()
-        mappa_window.project_root_path = str(root)
-        mappa_window._open_xref_window()
-        app.processEvents()
-        dialog = mappa_window.map_dialog
-        toolbar_bottom = mappa_window.action_toolbar.mapToGlobal(mappa_window.action_toolbar.rect().bottomLeft()).y()
-        status_top = mappa_window.statusBar().mapToGlobal(mappa_window.statusBar().rect().topLeft()).y()
-        assert abs(dialog.geometry().top() - toolbar_bottom) <= 1
-        assert abs(dialog.geometry().bottom() - status_top) <= 1
-        assert dialog.width() == window_width_at_show
+    def test_project_tree_build_read_label_and_fs_reload(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            source_dir = root / 'src'
+            source_dir.mkdir()
+            source = _write_app_py(source_dir)
+            label, error = read_top_level_label_result(str(source))
+            assert error is None and label[:2] == ('MOD', 'package exports')
+            assert label[3].category_desc == 'exposes the server module from the package namespace'
+            bad = source_dir / 'bad.py'
+            bad.write_text('# [FN OPEN #deadbeef] broken\n', encoding='utf-8')
+            label, error = read_top_level_label_result(str(bad))
+            assert label is None and error is not None
 
-        # regression: the alignment used to be computed once (a _positioned flag in
-        # XrefMapDialog.showEvent) and never redone — resizing the main window, closing MAPPA,
-        # and reopening it kept the stale old geometry. Positioning now lives in MainWindow
-        # (_position_map_dialog), called on every open, not just the first.
-        mappa_window._toggle_xref_window()  # close
-        app.processEvents()
-        # must stay above the MAPPA toolbar's own minimum content width (many buttons), same
-        # constraint as window_width_at_show above, or Qt can't honor the narrower resize
-        mappa_window.resize(2300, 1000)
-        app.processEvents()
-        mappa_window._open_xref_window()  # reopen
-        app.processEvents()
-        new_toolbar_bottom = mappa_window.action_toolbar.mapToGlobal(mappa_window.action_toolbar.rect().bottomLeft()).y()
-        new_status_top = mappa_window.statusBar().mapToGlobal(mappa_window.statusBar().rect().topLeft()).y()
-        assert dialog.width() == mappa_window.width()
-        assert abs(dialog.geometry().top() - new_toolbar_bottom) <= 1
-        assert abs(dialog.geometry().bottom() - new_status_top) <= 1
+            tree_window = MainWindow()
+            tree_window.project_root_path = str(root)
+            tree_window.git_root = None
+            tree_window.git_status = {}
+            tree_window.tree.clear()
+            tree_window._build_project_tree(tree_window.tree.invisibleRootItem(), str(root))
+            top_kinds = [tree_window.tree.topLevelItem(i).data(0, ROLE_KIND) for i in range(tree_window.tree.topLevelItemCount())]
+            assert 'dir' not in top_kinds and 'file' in top_kinds and 'invalidfile' in top_kinds
+            # a file item starts collapsed — compact by default, expand on demand
+            file_item = next(
+                tree_window.tree.topLevelItem(i) for i in range(tree_window.tree.topLevelItemCount())
+                if tree_window.tree.topLevelItem(i).data(0, ROLE_KIND) == 'file'
+            )
+            assert not file_item.isExpanded()
+            assert 'ERRORI' in tree_window._validate_kant_project()
+            assert tree_window.results_view.topLevelItemCount() == 1
+            assert tree_window._open_file(str(source))
+            opened_tab = tree_window.open_tabs[str(source)]
+            source.write_text(source.read_text(encoding='utf-8').replace('print(1)', 'print(9)'), encoding='utf-8')
+            tree_window._on_fs_file_changed(str(source))
+            assert 'print(9)' in serialize_kant(opened_tab.tree)
+            source.write_text(source.read_text(encoding='utf-8').replace('print(9)', 'print(1)'), encoding='utf-8')
+            tree_window._on_fs_file_changed(str(source))
+            tree_window._update_action_buttons()
+            assert tree_window.title_bar.lsp_hover_menu_action.isEnabled()
+            assert tree_window._lsp_status_text(str(source), None) == ' | LSP locale'
+            assert 'pyright-langserver' in tree_window._lsp_missing_server_message(str(source))
+            plain = source_dir / 'plain.py'
+            plain.write_text('def helper():\n    return helper()\n', encoding='utf-8')
+            assert tree_window._local_definition_locations('helper')[0][2] == 1
+            assert len(tree_window._local_reference_locations('helper')) == 2
+            tree_window.close()
 
-        # regression: dragging a tab by its rich-HTML label used to be swallowed entirely (the
-        # label accepted every press without forwarding to the QTabBar), breaking setMovable(True)
-        # tabs' built-in reorder gesture from the labeled region — now the exact same press/move/
-        # release sequence is forwarded to the tab bar so its native drag still fires.
-        tag_a = source_dir / 'taga.py'
-        tag_b = source_dir / 'tagb.py'
-        tag_a.write_text('# [MOD OPEN] taga.py\nx=1\n# [MOD CLOSED] taga.py\n', encoding='utf-8')
-        tag_b.write_text('# [MOD OPEN] tagb.py\nx=1\n# [MOD CLOSED] tagb.py\n', encoding='utf-8')
-        mappa_window._open_file(str(tag_a))
-        mappa_window._open_file(str(tag_b))
-        app.processEvents()
-        tab_a = mappa_window.open_tabs[str(tag_a)]
-        tab_b = mappa_window.open_tabs[str(tag_b)]
-        idx_a, idx_b = mappa_window.tabs.indexOf(tab_a), mappa_window.tabs.indexOf(tab_b)
-        assert idx_a < idx_b  # opened in this order
-        label_a = tab_a._tab_label
-        start = label_a.rect().center()
-        mid = label_a.mapFromGlobal(tab_b._tab_label.mapToGlobal(tab_b._tab_label.rect().center()))
-        QTest.mousePress(label_a, Qt.LeftButton, Qt.NoModifier, start)
-        app.processEvents()
-        QTest.mouseMove(label_a, mid)
-        app.processEvents()
-        QTest.mouseRelease(label_a, Qt.LeftButton, Qt.NoModifier, mid)
-        app.processEvents()
-        assert mappa_window.tabs.indexOf(tab_a) > mappa_window.tabs.indexOf(tab_b)  # actually reordered
+    def test_legacy_file_uid_fallback_tab_identity_and_split_pane(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            source_dir = root / 'src'
+            source_dir.mkdir()
+            source = _write_app_py(source_dir)
+            tree_window = MainWindow()
+            tree_window.project_root_path = str(root)
+            tree_window.git_root = None
+            tree_window.git_status = {}
+            assert tree_window._open_file(str(source))  # a second open tab, so switching to index 0 below is a real tab change
 
-        # regression: transitioning a tab from tagged to untagged used to drop the old _tab_label
-        # widget's only Python reference without deleteLater() — an orphaned hidden QLabel per
-        # transition, never freed until the whole window closed
-        tag_a.write_text('x = 1\n', encoding='utf-8')  # strip the KANT tag entirely
-        mappa_window._on_fs_file_changed(str(tag_a))
-        mappa_window._update_tab_title(tab_a)
-        assert tab_a._tab_label is None
-        final_idx_a = mappa_window.tabs.indexOf(tab_a)  # reorder above may have moved it
-        assert mappa_window.tabs.tabBar().tabButton(final_idx_a, QTabBar.LeftSide) is None
-        mappa_window.close()
+            # legacy (no #id) file: parse_kant mints a fresh random uid every reparse, and _open_file
+            # always reparses from disk — so a tree item's uid (captured at the last tree rebuild) can
+            # silently stop matching tab.tree. _on_tree_item_clicked must fall back to document order
+            # (ROLE_ORDER) to still isolate the right section, instead of falling through to the
+            # whole-file view.
+            legacy = source_dir / 'legacy.py'
+            legacy.write_text('\n'.join([
+                '# [MOD OPEN] legacy.py',
+                '# [FN OPEN] alpha', 'def alpha(): pass', '# [FN CLOSED] alpha',
+                '# [FN OPEN] beta', 'def beta(): pass', '# [FN CLOSED] beta',
+                '# [MOD CLOSED] legacy.py',
+            ]), encoding='utf-8')
+            tree_window.tree.clear()
+            tree_window._build_project_tree(tree_window.tree.invisibleRootItem(), str(root))
+            legacy_file_item = next(
+                tree_window.tree.invisibleRootItem().child(i)
+                for i in range(tree_window.tree.invisibleRootItem().childCount())
+                if tree_window.tree.invisibleRootItem().child(i).data(0, ROLE_PATH) == str(legacy)
+            )
+            assert not legacy_file_item.isExpanded() and legacy_file_item.childCount() == 2  # collapsed by default, alpha+beta still built underneath
+            beta_item = None
+            it = tree_window.tree.invisibleRootItem()
+            stack = [it.child(i) for i in range(it.childCount())]
+            while stack:
+                candidate = stack.pop()
+                if candidate.data(0, ROLE_KIND) == 'section' and 'beta' in tree_window.tree.itemWidget(candidate, 0).text():
+                    beta_item = candidate
+                for i in range(candidate.childCount()):
+                    stack.append(candidate.child(i))
+            assert beta_item is not None and beta_item.data(0, ROLE_ORDER) is not None
+            stale_uid = beta_item.data(0, ROLE_UID)
+            tree_window._on_tree_item_clicked(beta_item, 0)
+            legacy_tab = tree_window.open_tabs[str(legacy)]
+            assert legacy_tab.filter_uid is not None and legacy_tab.filter_uid != stale_uid  # reparse minted a new uid
+            assert legacy_tab.view_layout.count() == 1
+            isolated_widget = legacy_tab.view_layout.itemAt(0).widget()
+            isolated_codes = [c.toPlainText().strip() for c in isolated_widget.findChildren(CodeEdit)]
+            assert isolated_codes == ['def beta(): pass']  # not alpha too — the whole-file fallback would show both
 
-        tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
-        top = next(node for node in tab.tree.body if hasattr(node, 'body'))
-        run = next(item for item in top.body if isinstance(item, Run))
-        tab.remember_undo_state()
-        run.lines = ['print(2)']
-        assert tab.undo_file() and 'print(1)' in serialize_kant(tab.tree)
-        assert tab.redo_file() and 'print(2)' in serialize_kant(tab.tree)
+            # the main tab's own title (next to its close x) follows the isolated KANT element's
+            # identity too, not the filename — matching the split pane's header convention. The plain
+            # tab text is cleared in favor of a rich-HTML label (_tab_label) using the same
+            # colored/bold "[TAG] name" convention as the tree and coding panel.
+            legacy_idx = tree_window.tabs.indexOf(legacy_tab)
+            assert tree_window.tabs.tabText(legacy_idx) == ''
+            tab_label_html = legacy_tab._tab_label.text()
+            assert '[FN]' in tab_label_html and '<b>beta</b>' in tab_label_html  # bold name
+            assert f'background-color:{theme.TAG_BACKGROUNDS["FN"]}' in tab_label_html  # colored tag badge
+            assert tree_window.tabs.tabBar().tabButton(legacy_idx, QTabBar.LeftSide) is legacy_tab._tab_label
+            # clicking the label (not the tab strip itself) must still switch to that tab
+            tree_window.tabs.setCurrentIndex(0 if tree_window.tabs.currentIndex() == legacy_idx else legacy_idx)
+            assert tree_window.tabs.currentWidget() is not legacy_tab
+            legacy_tab._tab_label.mousePressEvent(QMouseEvent(
+                QEvent.MouseButtonPress, QPointF(1, 1), QPointF(1, 1), Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
+            ))
+            assert tree_window.tabs.currentWidget() is legacy_tab
+            # regression: re-registering the SAME _tab_label widget via setTabButton (needed every call
+            # to keep the tab sized to fit it) made Qt hide it internally with no matching re-show —
+            # every theme refresh (or any second _update_tab_title call) left the tab blank
+            assert not legacy_tab._tab_label.isHidden()
+            tree_window._update_tab_title(legacy_tab)
+            assert not legacy_tab._tab_label.isHidden()
 
-        # mark_dirty() must only emit dirtyChanged on the false->true edge — it's wired to fire on
-        # every keystroke (CodeEdit.textChanged -> _on_code_changed -> mark_dirty), and dirtyChanged
-        # cascades into a full tab-title HTML rebuild + QTabBar relayout, so re-emitting on every
-        # subsequent keystroke while already dirty redid all of that for no actual change
-        tab.dirty = False
-        dirty_emits = []
-        tab.dirtyChanged.connect(lambda: dirty_emits.append(1))
-        tab.mark_dirty()
-        assert tab.dirty and len(dirty_emits) == 1
-        tab.mark_dirty()
-        tab.mark_dirty()
-        assert len(dirty_emits) == 1  # still dirty from the first call -> no further emits
-        tab.autosave_timer.stop()
+            # the title bar's own slot shows the KANT identity too, not the filename — the filename
+            # itself now lives in file_path_label, on the Incoming/Outgoing row
+            assert tree_window.filename_label.text() == '[FN] beta'
+            assert tree_window.file_path_label.text() == 'legacy.py'
+            tree_window._render_view(legacy_tab, None)
+            # whole-file view: both the tab and the title bar show the file's own top-level KANT tag,
+            # not the raw filename — a module's identity is "[MOD] legacy.py", not just "legacy.py"
+            assert tree_window.tabs.tabText(legacy_idx) == ''
+            assert '[MOD]' in legacy_tab._tab_label.text() and 'legacy.py' in legacy_tab._tab_label.text()
+            assert tree_window.filename_label.text() == '[MOD] legacy.py'
+            assert tree_window.file_path_label.text() == 'legacy.py'
 
+            # the outermost element of an isolated view has its "[TAG] name" title suppressed — the
+            # tab/title-bar/split-header already announce that identity, so repeating it inline would
+            # be redundant; the panel starts directly with the category description instead. A NESTED
+            # element (not the one being isolated) keeps its own header, since nothing else names it.
+            nested_source = source_dir / 'nested.py'
+            nested_source.write_text('\n'.join([
+                '# [CLS CATEGORY] a class that does stuff',
+                '# [CLS OPEN] Widget', 'class Widget:',
+                '# [FN CATEGORY] initializes the widget',
+                '# [FN OPEN] init', '    def init(self): pass', '# [FN CLOSED] init',
+                '# [CLS CLOSED] Widget',
+            ]), encoding='utf-8')
+            assert tree_window._open_file(str(nested_source))
+            nested_tab = tree_window.open_tabs[str(nested_source)]
+            cls_node = next(n for n in nested_tab.tree.body if hasattr(n, 'body'))
+            fn_node = next(c for c in cls_node.body if getattr(c, 'tag', None) == 'FN')
+            tree_window._render_view(nested_tab, cls_node.uid)
+            cls_widget = nested_tab.section_widgets[cls_node.uid]
+            fn_widget = nested_tab.section_widgets[fn_node.uid]
+            assert isinstance(cls_widget, CollapsibleSection) and cls_widget.toggle_btn is None
+            cls_labels = ' '.join(l.text() for l in cls_widget.findChildren(QLabel))
+            assert '[CLS]' not in cls_labels and 'a class that does stuff' in cls_labels  # no title, category kept
+            assert isinstance(fn_widget, LeafSection)
+            fn_labels = ' '.join(l.text() for l in fn_widget.findChildren(QLabel))
+            assert '[FN]' in fn_labels  # nested element still gets its own header
+
+            # split pane: identity is the KANT element, not a filename tab, and it must not disturb
+            # whatever the main pane currently has active
+            alpha_section = None
+            it = tree_window.tree.invisibleRootItem()
+            stack = [it.child(i) for i in range(it.childCount())]
+            while stack:
+                candidate = stack.pop()
+                if candidate.data(0, ROLE_KIND) == 'section' and 'alpha' in tree_window.tree.itemWidget(candidate, 0).text():
+                    alpha_section = candidate
+                for i in range(candidate.childCount()):
+                    stack.append(candidate.child(i))
+            assert alpha_section is not None
+            main_filter_before = legacy_tab.filter_uid
+            assert tree_window.split_panel.isHidden()  # tree_window is never shown, so isVisible() is unusable here
+            tree_window._on_tree_item_double_clicked(alpha_section, 0)
+            assert not tree_window.split_panel.isHidden()
+            assert tree_window.split_header_label.text() == '[FN] alpha'  # KANT identity, not "legacy.py"
+            assert legacy_tab.filter_uid == main_filter_before  # main pane untouched
+            split_codes = [c.toPlainText().strip() for c in tree_window.split_view_layout.itemAt(0).widget().findChildren(CodeEdit)]
+            assert split_codes == ['def alpha(): pass']
+            tree_window._close_split_pane()
+            assert tree_window.split_panel.isHidden() and tree_window.split_tab is None
+
+            # closing the tab the split pane is showing must close the split pane too, not leave it
+            # pointing at a tab that's been torn down
+            tree_window._on_tree_item_double_clicked(alpha_section, 0)
+            assert not tree_window.split_panel.isHidden()
+            tree_window._close_tab(tree_window.tabs.indexOf(legacy_tab), flush=False)
+            assert tree_window.split_panel.isHidden() and tree_window.split_tab is None
+            tree_window.close()
+
+    def test_mappa_geometry_drag_reorder_and_tab_label_leak(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            source_dir = root / 'src'
+            source_dir.mkdir()
+            app = self.app
+            # the MAPPA window spans the full page: left/right edges of the main window, top just
+            # under the action toolbar (Save row), bottom just above the status bar (UTF-8 row) —
+            # needs a real shown/laid-out window, unlike other tests, since it reads real on-screen
+            # positions via mapToGlobal. Clears any windowGeometry saved by an earlier run first —
+            # MainWindow.__init__ restores it, which would otherwise override the resize below once
+            # the window is actually realized on screen.
+            # wide enough that the MAPPA toolbar's own minimum content width (many buttons) never
+            # forces the dialog wider than the window — otherwise Qt can't honor the requested width
+            QSettings('KANT', 'KANT Editor').remove('windowGeometry')
+            mappa_window = MainWindow()
+            mappa_window.resize(2000, 900)
+            mappa_window.show()
+            app.processEvents()
+            window_width_at_show = mappa_window.width()  # same moment showEvent reads parent.width()
+            mappa_window.project_root_path = str(root)
+            mappa_window._open_xref_window()
+            app.processEvents()
+            dialog = mappa_window.map_dialog
+            toolbar_bottom = mappa_window.action_toolbar.mapToGlobal(mappa_window.action_toolbar.rect().bottomLeft()).y()
+            status_top = mappa_window.statusBar().mapToGlobal(mappa_window.statusBar().rect().topLeft()).y()
+            assert abs(dialog.geometry().top() - toolbar_bottom) <= 1
+            assert abs(dialog.geometry().bottom() - status_top) <= 1
+            assert dialog.width() == window_width_at_show
+
+            # regression: the alignment used to be computed once (a _positioned flag in
+            # XrefMapDialog.showEvent) and never redone — resizing the main window, closing MAPPA,
+            # and reopening it kept the stale old geometry. Positioning now lives in MainWindow
+            # (_position_map_dialog), called on every open, not just the first.
+            mappa_window._toggle_xref_window()  # close
+            app.processEvents()
+            # must stay above the MAPPA toolbar's own minimum content width (many buttons), same
+            # constraint as window_width_at_show above, or Qt can't honor the narrower resize
+            mappa_window.resize(2300, 1000)
+            app.processEvents()
+            mappa_window._open_xref_window()  # reopen
+            app.processEvents()
+            new_toolbar_bottom = mappa_window.action_toolbar.mapToGlobal(mappa_window.action_toolbar.rect().bottomLeft()).y()
+            new_status_top = mappa_window.statusBar().mapToGlobal(mappa_window.statusBar().rect().topLeft()).y()
+            assert dialog.width() == mappa_window.width()
+            assert abs(dialog.geometry().top() - new_toolbar_bottom) <= 1
+            assert abs(dialog.geometry().bottom() - new_status_top) <= 1
+
+            # regression: dragging a tab by its rich-HTML label used to be swallowed entirely (the
+            # label accepted every press without forwarding to the QTabBar), breaking setMovable(True)
+            # tabs' built-in reorder gesture from the labeled region — now the exact same press/move/
+            # release sequence is forwarded to the tab bar so its native drag still fires.
+            tag_a = source_dir / 'taga.py'
+            tag_b = source_dir / 'tagb.py'
+            tag_a.write_text('# [MOD OPEN] taga.py\nx=1\n# [MOD CLOSED] taga.py\n', encoding='utf-8')
+            tag_b.write_text('# [MOD OPEN] tagb.py\nx=1\n# [MOD CLOSED] tagb.py\n', encoding='utf-8')
+            mappa_window._open_file(str(tag_a))
+            mappa_window._open_file(str(tag_b))
+            app.processEvents()
+            tab_a = mappa_window.open_tabs[str(tag_a)]
+            tab_b = mappa_window.open_tabs[str(tag_b)]
+            idx_a, idx_b = mappa_window.tabs.indexOf(tab_a), mappa_window.tabs.indexOf(tab_b)
+            assert idx_a < idx_b  # opened in this order
+            label_a = tab_a._tab_label
+            start = label_a.rect().center()
+            mid = label_a.mapFromGlobal(tab_b._tab_label.mapToGlobal(tab_b._tab_label.rect().center()))
+            QTest.mousePress(label_a, Qt.LeftButton, Qt.NoModifier, start)
+            app.processEvents()
+            QTest.mouseMove(label_a, mid)
+            app.processEvents()
+            QTest.mouseRelease(label_a, Qt.LeftButton, Qt.NoModifier, mid)
+            app.processEvents()
+            assert mappa_window.tabs.indexOf(tab_a) > mappa_window.tabs.indexOf(tab_b)  # actually reordered
+
+            # regression: transitioning a tab from tagged to untagged used to drop the old _tab_label
+            # widget's only Python reference without deleteLater() — an orphaned hidden QLabel per
+            # transition, never freed until the whole window closed
+            tag_a.write_text('x = 1\n', encoding='utf-8')  # strip the KANT tag entirely
+            mappa_window._on_fs_file_changed(str(tag_a))
+            mappa_window._update_tab_title(tab_a)
+            assert tab_a._tab_label is None
+            final_idx_a = mappa_window.tabs.indexOf(tab_a)  # reorder above may have moved it
+            assert mappa_window.tabs.tabBar().tabButton(final_idx_a, QTabBar.LeftSide) is None
+            mappa_window.close()
+
+    def test_undo_redo_and_mark_dirty(self):
+        with _temp_dir() as tmp:
+            source_dir = Path(tmp) / 'src'
+            source_dir.mkdir()
+            source = _write_app_py(source_dir)
+            tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
+            top = next(node for node in tab.tree.body if hasattr(node, 'body'))
+            run = next(item for item in top.body if isinstance(item, Run))
+            tab.remember_undo_state()
+            run.lines = ['print(2)']
+            assert tab.undo_file() and 'print(1)' in serialize_kant(tab.tree)
+            assert tab.redo_file() and 'print(2)' in serialize_kant(tab.tree)
+
+            # mark_dirty() must only emit dirtyChanged on the false->true edge — it's wired to fire on
+            # every keystroke (CodeEdit.textChanged -> _on_code_changed -> mark_dirty), and dirtyChanged
+            # cascades into a full tab-title HTML rebuild + QTabBar relayout, so re-emitting on every
+            # subsequent keystroke while already dirty redid all of that for no actual change
+            tab.dirty = False
+            dirty_emits = []
+            tab.dirtyChanged.connect(lambda: dirty_emits.append(1))
+            tab.mark_dirty()
+            assert tab.dirty and len(dirty_emits) == 1
+            tab.mark_dirty()
+            tab.mark_dirty()
+            assert len(dirty_emits) == 1  # still dirty from the first call -> no further emits
+            tab.autosave_timer.stop()
+
+    def _make_lsp_window(self, root):
         lsp_window = MainWindow()
         lsp_window.project_root_path = str(root)
         lsp_window._render_view = lambda *_args, **_kwargs: None
@@ -460,135 +533,180 @@ def main():
         lsp_window._update_filename_label = lambda *_args, **_kwargs: None
         lsp_window._update_lsp_diagnostics = lambda *_args, **_kwargs: None
         lsp_window._ide_message = lambda *_args, **_kwargs: None
-        lsp_tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
-        lsp_window._apply_lsp_text_edits(lsp_tab, [{
-            'range': {'start': {'line': 3, 'character': 6}, 'end': {'line': 3, 'character': 7}},
-            'newText': '3',
-        }])
-        assert 'print(3)' in serialize_kant(lsp_tab.tree)
-        lsp_window._local_rename_in_tab(lsp_tab, 'print', 'echo')
-        assert 'echo(3)' in serialize_kant(lsp_tab.tree)
-        run = next(item for node in lsp_tab.tree.body if hasattr(node, 'body') for item in node.body if isinstance(item, Run))
-        run.lines = ['echo(3)   ']
-        lsp_window._local_format(lsp_tab)
-        assert 'echo(3)   ' not in serialize_kant(lsp_tab.tree)
-        lsp_tab.autosave_timer.stop()
-        assert lsp_window._offset_for_lsp_position('😀x\n', {'line': 0, 'character': 2}) == 1
+        return lsp_window
 
-        rename_source = source_dir / 'rename_source.py'
-        rename_source.write_text('old()\n', encoding='utf-8')
-        other = source_dir / 'other.py'
-        other.write_text('old()\n', encoding='utf-8')
-        lsp_window.open_tabs = {}
-        lsp_window._invalidate_xref = lambda: None
-        lsp_window._apply_lsp_workspace_edits({'changes': {
-            file_uri(rename_source): [{
-                'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 3}},
-                'newText': 'new',
-            }],
-            file_uri(other): [{
-                'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 3}},
-                'newText': 'new',
-            }],
-        }})
-        assert rename_source.read_text(encoding='utf-8') == 'new()\n'
-        assert other.read_text(encoding='utf-8') == 'new()\n'
+    def test_lsp_local_text_edits_rename_format_and_offset(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            source_dir = root / 'src'
+            source_dir.mkdir()
+            source = _write_app_py(source_dir)
+            lsp_window = self._make_lsp_window(root)
+            lsp_tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
+            lsp_window._apply_lsp_text_edits(lsp_tab, [{
+                'range': {'start': {'line': 3, 'character': 6}, 'end': {'line': 3, 'character': 7}},
+                'newText': '3',
+            }])
+            assert 'print(3)' in serialize_kant(lsp_tab.tree)
+            lsp_window._local_rename_in_tab(lsp_tab, 'print', 'echo')
+            assert 'echo(3)' in serialize_kant(lsp_tab.tree)
+            run = next(item for node in lsp_tab.tree.body if hasattr(node, 'body') for item in node.body if isinstance(item, Run))
+            run.lines = ['echo(3)   ']
+            lsp_window._local_format(lsp_tab)
+            assert 'echo(3)   ' not in serialize_kant(lsp_tab.tree)
+            lsp_tab.autosave_timer.stop()
+            assert lsp_window._offset_for_lsp_position('😀x\n', {'line': 0, 'character': 2}) == 1
+            lsp_window.close()
 
-        # autocomplete-as-you-type: typing restarts a debounce timer that asks completion_provider
-        # (wired by mainwindow to _request_completion) for fresh candidates
-        completion_edit = CodeEdit('')
-        completion_edit.show()
-        completion_edit.setFocus()
-        app.processEvents()
-        completion_calls = []
-        completion_edit.completion_provider = lambda e: completion_calls.append(e)
-        QTest.keyClicks(completion_edit, 'ab')
-        assert completion_edit._completion_timer.isActive()
-        completion_edit._trigger_completion()
-        assert completion_calls == [completion_edit]
+    def test_lsp_workspace_edits(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            source_dir = root / 'src'
+            source_dir.mkdir()
+            lsp_window = self._make_lsp_window(root)
+            rename_source = source_dir / 'rename_source.py'
+            rename_source.write_text('old()\n', encoding='utf-8')
+            other = source_dir / 'other.py'
+            other.write_text('old()\n', encoding='utf-8')
+            lsp_window.open_tabs = {}
+            lsp_window._invalidate_xref = lambda: None
+            lsp_window._apply_lsp_workspace_edits({'changes': {
+                file_uri(rename_source): [{
+                    'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 3}},
+                    'newText': 'new',
+                }],
+                file_uri(other): [{
+                    'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 3}},
+                    'newText': 'new',
+                }],
+            }})
+            assert rename_source.read_text(encoding='utf-8') == 'new()\n'
+            assert other.read_text(encoding='utf-8') == 'new()\n'
+            lsp_window.close()
 
-        # local (no-LSP-server) fallback: candidates are identifiers already in the open file
-        no_lsp_tab_tree = parse_kant('# [FN OPEN] x\ndef alpha_function():\n    pass\n# [FN CLOSED] x\n')
-        lsp_window.tabs = type('Tabs', (), {
-            'currentWidget': lambda _self: type('T', (), {'tree': no_lsp_tab_tree})(),
-        })()
-        local_completion_edit = CodeEdit('    alp')
-        cursor = local_completion_edit.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        local_completion_edit.setTextCursor(cursor)
-        local_completion_edit.show()
-        local_completion_edit.setFocus()
-        app.processEvents()
-        lsp_window._local_completion(local_completion_edit)
-        assert local_completion_edit._completer.popup().isVisible()
-        model = local_completion_edit._completer.completionModel()
-        assert [model.index(i, 0).data() for i in range(model.rowCount())] == ['alpha_function']
-        local_completion_edit._insert_completion('alpha_function')
-        assert local_completion_edit.toPlainText() == '    alpha_function'
+    def test_autocomplete_local_and_lsp_driven(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            app = self.app
+            lsp_window = self._make_lsp_window(root)
 
-        # LSP-driven path: _apply_completion_result dedupes items and forwards labels to the popup
-        lsp_completion_edit = CodeEdit('a')
-        cursor = lsp_completion_edit.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        lsp_completion_edit.setTextCursor(cursor)
-        lsp_completion_edit.show()
-        lsp_completion_edit.setFocus()
-        app.processEvents()
-        lsp_window._apply_completion_result(lsp_completion_edit, {'items': [
-            {'label': 'alpha', 'insertText': 'alpha'}, {'label': 'alpha'}, {'label': 'abc'},
-        ]})
-        model = lsp_completion_edit._completer.completionModel()
-        assert [model.index(i, 0).data() for i in range(model.rowCount())] == ['alpha', 'abc']
+            # autocomplete-as-you-type: typing restarts a debounce timer that asks completion_provider
+            # (wired by mainwindow to _request_completion) for fresh candidates
+            completion_edit = CodeEdit('')
+            completion_edit.show()
+            completion_edit.setFocus()
+            app.processEvents()
+            completion_calls = []
+            completion_edit.completion_provider = lambda e: completion_calls.append(e)
+            QTest.keyClicks(completion_edit, 'ab')
+            assert completion_edit._completion_timer.isActive()
+            completion_edit._trigger_completion()
+            assert completion_calls == [completion_edit]
 
-        # quick-doc-on-hover: PyCharm-style tooltip on the symbol under the mouse, no click needed
-        assert lsp_window._symbol_at_cursor(local_completion_edit.textCursor()) == 'alpha_function'
-        lsp_window.lsp_hover_requests[999] = (lsp_completion_edit, lsp_completion_edit.mapToGlobal(lsp_completion_edit.rect().center()))
-        lsp_window._on_lsp_response(999, 'textDocument/hover', {'contents': {'value': 'def f() -> None'}})
-        assert QToolTip.text() == 'def f() -> None'
-        assert 999 not in lsp_window.lsp_hover_requests
+            # local (no-LSP-server) fallback: candidates are identifiers already in the open file
+            no_lsp_tab_tree = parse_kant('# [FN OPEN] x\ndef alpha_function():\n    pass\n# [FN CLOSED] x\n')
+            lsp_window.tabs = type('Tabs', (), {
+                'currentWidget': lambda _self: type('T', (), {'tree': no_lsp_tab_tree})(),
+            })()
+            local_completion_edit = CodeEdit('    alp')
+            cursor = local_completion_edit.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            local_completion_edit.setTextCursor(cursor)
+            local_completion_edit.show()
+            local_completion_edit.setFocus()
+            app.processEvents()
+            lsp_window._local_completion(local_completion_edit)
+            assert local_completion_edit._completer.popup().isVisible()
+            model = local_completion_edit._completer.completionModel()
+            assert [model.index(i, 0).data() for i in range(model.rowCount())] == ['alpha_function']
+            local_completion_edit._insert_completion('alpha_function')
+            assert local_completion_edit.toPlainText() == '    alpha_function'
 
-        # local fallback: no LSP server configured -> definition-location lookup shown as tooltip
-        lsp_window._local_hover(local_completion_edit, local_completion_edit.mapToGlobal(local_completion_edit.rect().center()), 'alpha_function')
-        assert 'alpha_function' in QToolTip.text()
+            # LSP-driven path: _apply_completion_result dedupes items and forwards labels to the popup
+            lsp_completion_edit = CodeEdit('a')
+            cursor = lsp_completion_edit.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            lsp_completion_edit.setTextCursor(cursor)
+            lsp_completion_edit.show()
+            lsp_completion_edit.setFocus()
+            app.processEvents()
+            lsp_window._apply_completion_result(lsp_completion_edit, {'items': [
+                {'label': 'alpha', 'insertText': 'alpha'}, {'label': 'alpha'}, {'label': 'abc'},
+            ]})
+            model = lsp_completion_edit._completer.completionModel()
+            assert [model.index(i, 0).data() for i in range(model.rowCount())] == ['alpha', 'abc']
+            lsp_window.close()
 
-        # a real mouse move restarts the hover debounce, which then calls hover_provider
-        hover_calls = []
-        local_completion_edit.hover_provider = lambda e, c, p: hover_calls.append(e)
-        center = QPointF(local_completion_edit.rect().center())
-        move_event = QMouseEvent(
-            QEvent.MouseMove, center, local_completion_edit.mapToGlobal(center.toPoint()),
-            Qt.NoButton, Qt.NoButton, Qt.NoModifier,
-        )
-        local_completion_edit.mouseMoveEvent(move_event)
-        assert local_completion_edit._hover_timer.isActive()
-        local_completion_edit._trigger_hover()
-        assert hover_calls == [local_completion_edit]
+    def test_hover_tooltip_and_gesture_vocabulary(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            app = self.app
+            lsp_window = self._make_lsp_window(root)
+            no_lsp_tab_tree = parse_kant('# [FN OPEN] x\ndef alpha_function():\n    pass\n# [FN CLOSED] x\n')
+            lsp_window.tabs = type('Tabs', (), {
+                'currentWidget': lambda _self: type('T', (), {'tree': no_lsp_tab_tree})(),
+            })()
+            local_completion_edit = CodeEdit('    alpha_function')
+            cursor = local_completion_edit.textCursor()
+            cursor.movePosition(QTextCursor.End)  # symbol lookup below reads the identifier at the cursor
+            local_completion_edit.setTextCursor(cursor)
+            local_completion_edit.show()
+            local_completion_edit.setFocus()
+            app.processEvents()
 
-        # gesture vocabulary: Ctrl+Click jumps to definition, F2 renames — matching the vocabulary
-        # every other IDE uses instead of only exposing these through the LSP menu
-        gesture_calls = []
-        local_completion_edit.definition_provider = lambda e: gesture_calls.append('definition')
-        local_completion_edit.rename_provider = lambda e: gesture_calls.append('rename')
-        click_pos = QPointF(local_completion_edit.rect().center())
-        ctrl_click = QMouseEvent(
-            QEvent.MouseButtonPress, click_pos, local_completion_edit.mapToGlobal(click_pos.toPoint()),
-            Qt.LeftButton, Qt.LeftButton, Qt.ControlModifier,
-        )
-        local_completion_edit.mousePressEvent(ctrl_click)
-        assert gesture_calls == ['definition']
-        gesture_calls.clear()
-        plain_click = QMouseEvent(
-            QEvent.MouseButtonPress, click_pos, local_completion_edit.mapToGlobal(click_pos.toPoint()),
-            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
-        )
-        local_completion_edit.mousePressEvent(plain_click)
-        assert gesture_calls == []  # a plain click must not also jump to definition
-        f2_event = QKeyEvent(QEvent.KeyPress, Qt.Key_F2, Qt.NoModifier)
-        local_completion_edit.keyPressEvent(f2_event)
-        assert gesture_calls == ['rename']
+            # quick-doc-on-hover: PyCharm-style tooltip on the symbol under the mouse, no click needed
+            assert lsp_window._symbol_at_cursor(local_completion_edit.textCursor()) == 'alpha_function'
+            lsp_completion_edit = CodeEdit('a')
+            lsp_completion_edit.show()
+            lsp_completion_edit.setFocus()
+            app.processEvents()
+            lsp_window.lsp_hover_requests[999] = (lsp_completion_edit, lsp_completion_edit.mapToGlobal(lsp_completion_edit.rect().center()))
+            lsp_window._on_lsp_response(999, 'textDocument/hover', {'contents': {'value': 'def f() -> None'}})
+            assert QToolTip.text() == 'def f() -> None'
+            assert 999 not in lsp_window.lsp_hover_requests
 
-        lsp_window.close()
+            # local fallback: no LSP server configured -> definition-location lookup shown as tooltip
+            lsp_window._local_hover(local_completion_edit, local_completion_edit.mapToGlobal(local_completion_edit.rect().center()), 'alpha_function')
+            assert 'alpha_function' in QToolTip.text()
 
+            # a real mouse move restarts the hover debounce, which then calls hover_provider
+            hover_calls = []
+            local_completion_edit.hover_provider = lambda e, c, p: hover_calls.append(e)
+            center = QPointF(local_completion_edit.rect().center())
+            move_event = QMouseEvent(
+                QEvent.MouseMove, center, local_completion_edit.mapToGlobal(center.toPoint()),
+                Qt.NoButton, Qt.NoButton, Qt.NoModifier,
+            )
+            local_completion_edit.mouseMoveEvent(move_event)
+            assert local_completion_edit._hover_timer.isActive()
+            local_completion_edit._trigger_hover()
+            assert hover_calls == [local_completion_edit]
+
+            # gesture vocabulary: Ctrl+Click jumps to definition, F2 renames — matching the vocabulary
+            # every other IDE uses instead of only exposing these through the LSP menu
+            gesture_calls = []
+            local_completion_edit.definition_provider = lambda e: gesture_calls.append('definition')
+            local_completion_edit.rename_provider = lambda e: gesture_calls.append('rename')
+            click_pos = QPointF(local_completion_edit.rect().center())
+            ctrl_click = QMouseEvent(
+                QEvent.MouseButtonPress, click_pos, local_completion_edit.mapToGlobal(click_pos.toPoint()),
+                Qt.LeftButton, Qt.LeftButton, Qt.ControlModifier,
+            )
+            local_completion_edit.mousePressEvent(ctrl_click)
+            assert gesture_calls == ['definition']
+            gesture_calls.clear()
+            plain_click = QMouseEvent(
+                QEvent.MouseButtonPress, click_pos, local_completion_edit.mapToGlobal(click_pos.toPoint()),
+                Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
+            )
+            local_completion_edit.mousePressEvent(plain_click)
+            assert gesture_calls == []  # a plain click must not also jump to definition
+            f2_event = QKeyEvent(QEvent.KeyPress, Qt.Key_F2, Qt.NoModifier)
+            local_completion_edit.keyPressEvent(f2_event)
+            assert gesture_calls == ['rename']
+            lsp_window.close()
+
+    def test_xref_edges_ignore_comments_and_strings(self):
         xref_tree = parse_kant('\n'.join([
             '# [FN OPEN] alpha', 'def alpha():', '    """beta()"""',
             '    /* beta() */', '# [FN CLOSED] alpha',
@@ -598,354 +716,549 @@ def main():
         alpha = next(element for element in xref.values() if element.name == 'alpha')
         assert alpha.outgoing == []
 
-        io_dir = root / 'io-project'
-        io_dir.mkdir()
-        module_tree = parse_kant('\n'.join([
-            '# [MOD OPEN #m1] module.py',
-            '# [FN OPEN #f1] alpha', 'def alpha():', '    helper()', '# [FN CLOSED #f1] alpha',
-            '# [FN OPEN #f2] beta', 'def beta(): pass', '# [FN CLOSED #f2] beta',
-            '# [MOD CLOSED #m1] module.py',
-        ]))
-        external_tree = parse_kant('\n'.join([
-            '# [FN OPEN #f3] helper', 'def helper():', '    alpha()', '# [FN CLOSED #f3] helper',
-        ]))
-        io_xref = build_xref({'module.py': module_tree, 'external.py': external_tree})
-        io_window = MainWindow.__new__(MainWindow)
-        io_window.project_root_path = str(io_dir)
-        io_fake_tab = type('Tab', (), {'path': str(io_dir / 'module.py'), 'tree': module_tree})()
-        io_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: io_fake_tab})()
-        io_window._get_xref = lambda: io_xref
-        io_window.incoming_view = QListWidget()
-        io_window.outgoing_view = QListWidget()
-        module_uid = next(item.uid for item in module_tree.body if isinstance(item, Node))
-        MainWindow._update_io_tabs(io_window, module_uid)
-        # selecting the module aggregates its children's (alpha's) references, not just the
-        # module's own empty direct incoming/outgoing
-        assert io_window.incoming_view.count() == 1 and 'helper' in io_window.incoming_view.item(0).text()
-        assert io_window.outgoing_view.count() == 1 and 'helper' in io_window.outgoing_view.item(0).text()
-        # the whole-file view (uid=None — file tree item, or a tab with no section filter) is the
-        # same module element, not "nothing selected"; it must aggregate the same way
-        io_window.incoming_view.clear()
-        io_window.outgoing_view.clear()
-        MainWindow._update_io_tabs(io_window, None)
-        assert io_window.incoming_view.count() == 1 and 'helper' in io_window.incoming_view.item(0).text()
-        assert io_window.outgoing_view.count() == 1 and 'helper' in io_window.outgoing_view.item(0).text()
+    def test_incoming_outgoing_aggregation(self):
+        with _temp_dir() as tmp:
+            io_dir = Path(tmp) / 'io-project'
+            io_dir.mkdir()
+            module_tree = parse_kant('\n'.join([
+                '# [MOD OPEN #m1] module.py',
+                '# [FN OPEN #f1] alpha', 'def alpha():', '    helper()', '# [FN CLOSED #f1] alpha',
+                '# [FN OPEN #f2] beta', 'def beta(): pass', '# [FN CLOSED #f2] beta',
+                '# [MOD CLOSED #m1] module.py',
+            ]))
+            external_tree = parse_kant('\n'.join([
+                '# [FN OPEN #f3] helper', 'def helper():', '    alpha()', '# [FN CLOSED #f3] helper',
+            ]))
+            io_xref = build_xref({'module.py': module_tree, 'external.py': external_tree})
+            io_window = MainWindow.__new__(MainWindow)
+            io_window.project_root_path = str(io_dir)
+            io_fake_tab = type('Tab', (), {'path': str(io_dir / 'module.py'), 'tree': module_tree})()
+            io_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: io_fake_tab})()
+            io_window._get_xref = lambda: io_xref
+            io_window.incoming_view = QListWidget()
+            io_window.outgoing_view = QListWidget()
+            module_uid = next(item.uid for item in module_tree.body if isinstance(item, Node))
+            MainWindow._update_io_tabs(io_window, module_uid)
+            # selecting the module aggregates its children's (alpha's) references, not just the
+            # module's own empty direct incoming/outgoing
+            assert io_window.incoming_view.count() == 1 and 'helper' in io_window.incoming_view.item(0).text()
+            assert io_window.outgoing_view.count() == 1 and 'helper' in io_window.outgoing_view.item(0).text()
+            # the whole-file view (uid=None — file tree item, or a tab with no section filter) is the
+            # same module element, not "nothing selected"; it must aggregate the same way
+            io_window.incoming_view.clear()
+            io_window.outgoing_view.clear()
+            MainWindow._update_io_tabs(io_window, None)
+            assert io_window.incoming_view.count() == 1 and 'helper' in io_window.incoming_view.item(0).text()
+            assert io_window.outgoing_view.count() == 1 and 'helper' in io_window.outgoing_view.item(0).text()
 
-        graph = {
-            'a': XrefElement('a', 'a', 'FN', 'a', 'A', 'a.py', 0, outgoing=['b']),
-            'b': XrefElement('b', 'b', 'FN', 'b', 'B', 'b.py', 0, incoming=['a']),
-        }
-        assert _force_layout_positions(graph) == _force_layout_positions(graph)
-        flow_graph = {
-            'source': XrefElement('source', 'source', 'FN', 'source', 'Source', 'source.py', 0, outgoing=['middle']),
-            'middle': XrefElement('middle', 'middle', 'FN', 'middle', 'Middle', 'middle.py', 0, incoming=['source'], outgoing=['target']),
-            'target': XrefElement('target', 'target', 'FN', 'target', 'Target', 'target.py', 0, incoming=['middle']),
-        }
-        flow_positions = _force_layout_positions(flow_graph)
-        assert flow_positions['source'][0] < flow_positions['middle'][0] < flow_positions['target'][0]
-        map_view = XrefMapView()
-        moved = []
-        map_view.nodeMoved.connect(lambda *args: moved.append(args))
-        map_view.set_data(graph)
-        assert all(item.flags() & QGraphicsItem.ItemIsMovable for item in map_view._node_items.values())
-        old_edge = map_view._edges[0][2].path().boundingRect()
-        map_view._node_items['a'].moveBy(100, 60)
-        assert moved and map_view._edges[0][2].path().boundingRect() != old_edge
-        saved_positions = map_view.positions()
-        map_view.set_data(graph, saved_positions)
-        assert map_view.positions() == saved_positions
-        hovered_edges, pinned_edges = [], []
-        map_view.edgeHovered.connect(lambda *args: hovered_edges.append(args))
-        map_view.edgePinned.connect(lambda *args: pinned_edges.append(args))
-        map_view.resize(800, 500)
-        map_view.show()
-        map_view.fit()
-        app.processEvents()
-        edge_point = map_view.mapFromScene(map_view._edges[0][2].path().pointAtPercent(0.5))
-        QTest.mouseMove(map_view.viewport(), edge_point)
-        QTest.mouseClick(map_view.viewport(), Qt.LeftButton, Qt.NoModifier, edge_point)
-        app.processEvents()
-        assert hovered_edges and pinned_edges
-        map_view.close()
-        map_dialog = XrefMapDialog()
-        map_dialog.set_graph(graph, 'test', str(root / 'map-project'))
-        map_dialog.resize(900, 650)
-        map_dialog.show()
-        app.processEvents()
-        edge_scene_point = map_dialog.view._edges[0][2].path().pointAtPercent(0.5)
-        map_dialog._on_edge_hovered('a', 'b', edge_scene_point, True)
-        assert map_dialog._pending_hover == ('edge', ('a', 'b', edge_scene_point))  # shows only after a delay
-        map_dialog._show_pending_hover()  # simulate the delay timer firing
-        assert 'INCOMING' in map_dialog.edge_popup.incoming.text()
-        assert 'OUTGOING' in map_dialog.edge_popup.outgoing.text()
-        # hovering a node shows that element's own incoming/outgoing, same popup mechanism
-        node_scene_point = map_dialog.view._node_items['a'].sceneBoundingRect().center()
-        map_dialog._on_node_hovered('a', node_scene_point, True)
-        map_dialog._show_pending_hover()
-        assert 'OUTGOING' in map_dialog.edge_popup.outgoing.text()
-        map_dialog._on_edge_pinned('a', 'b', edge_scene_point)
-        assert map_dialog._pinned_edge == ('a', 'b')
-        map_dialog._on_edge_pinned('a', 'b', edge_scene_point)
-        assert map_dialog._pinned_edge is None and map_dialog.edge_popup.isHidden()
-        map_dialog.view._node_items['a'].moveBy(45, 25)
-        persisted = map_dialog.view.positions()['a']
-        map_dialog._save_positions()
-        restored_dialog = XrefMapDialog()
-        restored_dialog.set_graph(graph, 'test', str(root / 'map-project'))
-        assert restored_dialog.view.positions()['a'] == persisted
-        map_dialog.close()
-        restored_dialog.close()
-        QSettings('KANT', 'KANT Editor').remove(map_dialog._position_key)
-        module_graph = {
-            'module': XrefElement('module', 'module', 'MOD', 'module.py', 'Modulo', 'module.py', 0),
-            'child': XrefElement('child', 'child', 'FN', 'work', 'Funzione', 'module.py', 1),
-        }
-        expand_dialog = XrefMapDialog()
-        expand_dialog.resize(900, 650)
-        expand_dialog.set_graph(module_graph, 'expand', str(root / 'expand-project'))
-        expand_dialog.show()
-        app.processEvents()
-        assert len(expand_dialog._display) == 2  # every open starts fully expanded
-        node = expand_dialog.view._node_items['module']
-        click = expand_dialog.view.mapFromScene(node.sceneBoundingRect().center())
-        scale_before = expand_dialog.view.transform().m11()
-        center_before = expand_dialog.view.mapToScene(expand_dialog.view.viewport().rect().center())
-        QTest.mouseDClick(expand_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, click)
-        app.processEvents()
-        assert len(expand_dialog._display) == 1  # double-click on an expanded module collapses it
-        assert abs(expand_dialog.view.transform().m11() - scale_before) < 0.001
-        center_after = expand_dialog.view.mapToScene(expand_dialog.view.viewport().rect().center())
-        assert abs(center_after.x() - center_before.x()) < 2 and abs(center_after.y() - center_before.y()) < 2
-        node = expand_dialog.view._node_items['module']
-        click = expand_dialog.view.mapFromScene(node.sceneBoundingRect().center())
-        QTest.mouseDClick(expand_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, click)
-        app.processEvents()
-        assert len(expand_dialog._display) == 2  # double-click again re-expands it
-        expand_dialog.close()
-        QSettings('KANT', 'KANT Editor').remove(expand_dialog._position_key)
+    def test_xref_map_view_and_dialog_interactions(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            app = self.app
+            graph = {
+                'a': XrefElement('a', 'a', 'FN', 'a', 'A', 'a.py', 0, outgoing=['b']),
+                'b': XrefElement('b', 'b', 'FN', 'b', 'B', 'b.py', 0, incoming=['a']),
+            }
+            assert _force_layout_positions(graph) == _force_layout_positions(graph)
+            flow_graph = {
+                'source': XrefElement('source', 'source', 'FN', 'source', 'Source', 'source.py', 0, outgoing=['middle']),
+                'middle': XrefElement('middle', 'middle', 'FN', 'middle', 'Middle', 'middle.py', 0, incoming=['source'], outgoing=['target']),
+                'target': XrefElement('target', 'target', 'FN', 'target', 'Target', 'target.py', 0, incoming=['middle']),
+            }
+            flow_positions = _force_layout_positions(flow_graph)
+            assert flow_positions['source'][0] < flow_positions['middle'][0] < flow_positions['target'][0]
+            map_view = XrefMapView()
+            moved = []
+            map_view.nodeMoved.connect(lambda *args: moved.append(args))
+            map_view.set_data(graph)
+            assert all(item.flags() & QGraphicsItem.ItemIsMovable for item in map_view._node_items.values())
+            old_edge = map_view._edges[0][2].path().boundingRect()
+            map_view._node_items['a'].moveBy(100, 60)
+            assert moved and map_view._edges[0][2].path().boundingRect() != old_edge
+            saved_positions = map_view.positions()
+            map_view.set_data(graph, saved_positions)
+            assert map_view.positions() == saved_positions
+            hovered_edges, pinned_edges = [], []
+            map_view.edgeHovered.connect(lambda *args: hovered_edges.append(args))
+            map_view.edgePinned.connect(lambda *args: pinned_edges.append(args))
+            map_view.resize(800, 500)
+            map_view.show()
+            map_view.fit()
+            app.processEvents()
+            edge_point = map_view.mapFromScene(map_view._edges[0][2].path().pointAtPercent(0.5))
+            QTest.mouseMove(map_view.viewport(), edge_point)
+            QTest.mouseClick(map_view.viewport(), Qt.LeftButton, Qt.NoModifier, edge_point)
+            app.processEvents()
+            assert hovered_edges and pinned_edges
+            map_view.close()
+            map_dialog = XrefMapDialog()
+            map_dialog.set_graph(graph, 'test', str(root / 'map-project'))
+            map_dialog.resize(900, 650)
+            map_dialog.show()
+            app.processEvents()
+            edge_scene_point = map_dialog.view._edges[0][2].path().pointAtPercent(0.5)
+            map_dialog._on_edge_hovered('a', 'b', edge_scene_point, True)
+            assert map_dialog._pending_hover == ('edge', ('a', 'b', edge_scene_point))  # shows only after a delay
+            map_dialog._show_pending_hover()  # simulate the delay timer firing
+            assert 'INCOMING' in map_dialog.edge_popup.incoming.text()
+            assert 'OUTGOING' in map_dialog.edge_popup.outgoing.text()
+            # hovering a node shows that element's own incoming/outgoing, same popup mechanism
+            node_scene_point = map_dialog.view._node_items['a'].sceneBoundingRect().center()
+            map_dialog._on_node_hovered('a', node_scene_point, True)
+            map_dialog._show_pending_hover()
+            assert 'OUTGOING' in map_dialog.edge_popup.outgoing.text()
+            map_dialog._on_edge_pinned('a', 'b', edge_scene_point)
+            assert map_dialog._pinned_edge == ('a', 'b')
+            map_dialog._on_edge_pinned('a', 'b', edge_scene_point)
+            assert map_dialog._pinned_edge is None and map_dialog.edge_popup.isHidden()
+            map_dialog.view._node_items['a'].moveBy(45, 25)
+            persisted = map_dialog.view.positions()['a']
+            map_dialog._save_positions()
+            restored_dialog = XrefMapDialog()
+            restored_dialog.set_graph(graph, 'test', str(root / 'map-project'))
+            assert restored_dialog.view.positions()['a'] == persisted
+            map_dialog.close()
+            restored_dialog.close()
+            QSettings('KANT', 'KANT Editor').remove(map_dialog._position_key)
 
-        # drill-down: a class with 2 methods that call each other is drillable; a lone leaf isn't
-        drill_graph = {
-            'cls': XrefElement('cls', 'cls', 'CLS', 'Foo', 'classe', 'd.py', 0),
-            'm1': XrefElement('m1', 'm1', 'FN', 'bar', 'metodo bar', 'd.py', 1, outgoing=['m2'], parent='cls'),
-            'm2': XrefElement('m2', 'm2', 'FN', 'baz', 'metodo baz', 'd.py', 2, incoming=['m1'], parent='cls'),
-            'lone': XrefElement('lone', 'lone', 'FN', 'solo', 'funzione sola', 'd.py', 3),
-        }
-        drill_dialog = XrefMapDialog()
-        drill_dialog.resize(900, 650)
-        drill_dialog.set_graph(drill_graph, 'drill', str(root / 'drill-project'))
-        drill_dialog.show()
-        app.processEvents()
-        assert drill_dialog._is_drillable('cls') is True
-        assert drill_dialog._is_drillable('lone') is False
-        # real clicks end-to-end, not a direct _enter_drill_mode() call: the eye sits on top of its
-        # node with no item-data of its own, so a naive itemAt()-based click handler reads it back
-        # as "clicked empty canvas" and wipes the pin before the eye ever sees the press — exercise
-        # the actual pin-then-click-eye path to catch that regression.
-        cls_node = drill_dialog.view._node_items['cls']
-        cls_viewport_pos = drill_dialog.view.mapFromScene(cls_node.sceneBoundingRect().center())
-        QTest.mouseClick(drill_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, cls_viewport_pos)
-        app.processEvents()
-        eye = drill_dialog.view._eye_badges['cls']
-        assert eye.isVisible()
-        eye_viewport_pos = drill_dialog.view.mapFromScene(eye.mapToScene(eye.boundingRect().center()))
-        QTest.mouseClick(drill_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, eye_viewport_pos)
-        app.processEvents()
-        assert drill_dialog._drill_key == 'cls'
-        # the parent ('cls') is detached from the graph entirely — only its children remain,
-        # 'lone' stays excluded (not a child of 'cls')
-        assert set(drill_dialog._display) == {'m1', 'm2'}
-        assert drill_dialog._display['m1'].outgoing == ['m2']
-        assert 'cls' not in drill_dialog.view._node_items
-        # the parent becomes the fixed title card instead of a graph node
-        assert drill_dialog.drill_title_card.isVisible()
-        assert drill_dialog.drill_title_tag.text() == '[CLS]'
-        assert drill_dialog.drill_title_name.text() == 'classe'
-        assert drill_dialog.drill_back_btn.isVisible()
-        drill_dialog._exit_drill_mode()
-        app.processEvents()
-        assert set(drill_dialog._display) == {'cls', 'm1', 'm2', 'lone'}
-        assert not drill_dialog.drill_back_btn.isVisible()
-        assert not drill_dialog.drill_title_card.isVisible()
-        drill_dialog.close()
-        QSettings('KANT', 'KANT Editor').remove(drill_dialog._position_key)
+    def test_xref_map_dialog_expand_collapse(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            app = self.app
+            module_graph = {
+                'module': XrefElement('module', 'module', 'MOD', 'module.py', 'Modulo', 'module.py', 0),
+                'child': XrefElement('child', 'child', 'FN', 'work', 'Funzione', 'module.py', 1),
+            }
+            expand_dialog = XrefMapDialog()
+            expand_dialog.resize(900, 650)
+            expand_dialog.set_graph(module_graph, 'expand', str(root / 'expand-project'))
+            expand_dialog.show()
+            app.processEvents()
+            assert len(expand_dialog._display) == 2  # every open starts fully expanded
+            node = expand_dialog.view._node_items['module']
+            click = expand_dialog.view.mapFromScene(node.sceneBoundingRect().center())
+            scale_before = expand_dialog.view.transform().m11()
+            center_before = expand_dialog.view.mapToScene(expand_dialog.view.viewport().rect().center())
+            QTest.mouseDClick(expand_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, click)
+            app.processEvents()
+            assert len(expand_dialog._display) == 1  # double-click on an expanded module collapses it
+            assert abs(expand_dialog.view.transform().m11() - scale_before) < 0.001
+            center_after = expand_dialog.view.mapToScene(expand_dialog.view.viewport().rect().center())
+            assert abs(center_after.x() - center_before.x()) < 2 and abs(center_after.y() - center_before.y()) < 2
+            node = expand_dialog.view._node_items['module']
+            click = expand_dialog.view.mapFromScene(node.sceneBoundingRect().center())
+            QTest.mouseDClick(expand_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, click)
+            app.processEvents()
+            assert len(expand_dialog._display) == 2  # double-click again re-expands it
+            expand_dialog.close()
+            QSettings('KANT', 'KANT Editor').remove(expand_dialog._position_key)
 
-        replace_target = source_dir / 'replace.txt'
-        replace_target.write_text('old needle', encoding='utf-8')
-        replace_window = MainWindow.__new__(MainWindow)
-        replace_window.project_root_path = str(root)
-        answers = iter([('needle', True), ('replacement', True)])
-        replace_window._ide_text = lambda *_args, **_kwargs: next(answers)
-        replace_window._ide_yes_no = lambda *_args, **_kwargs: True
-        replace_window._flush_all_tabs = lambda: replace_target.write_text('new needle', encoding='utf-8') is not None
-        replace_window._iter_project_text_files = lambda project_root=None: MainWindow._iter_project_text_files(replace_window, project_root)
-        replace_window._run_background = lambda work, done: done(work(), None)
-        replace_window.open_tabs = {}
-        replace_window._refresh_after_fs_change = lambda: None
-        replace_window.terminal = LabelStub()
-        MainWindow._replace_project(replace_window)
-        assert replace_target.read_text(encoding='utf-8') == 'new replacement'
+    def test_xref_map_drill_down(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            app = self.app
+            # drill-down: a class with 2 methods that call each other is drillable; a lone leaf isn't
+            drill_graph = {
+                'cls': XrefElement('cls', 'cls', 'CLS', 'Foo', 'classe', 'd.py', 0),
+                'm1': XrefElement('m1', 'm1', 'FN', 'bar', 'metodo bar', 'd.py', 1, outgoing=['m2'], parent='cls'),
+                'm2': XrefElement('m2', 'm2', 'FN', 'baz', 'metodo baz', 'd.py', 2, incoming=['m1'], parent='cls'),
+                'lone': XrefElement('lone', 'lone', 'FN', 'solo', 'funzione sola', 'd.py', 3),
+            }
+            drill_dialog = XrefMapDialog()
+            drill_dialog.resize(900, 650)
+            drill_dialog.set_graph(drill_graph, 'drill', str(root / 'drill-project'))
+            drill_dialog.show()
+            app.processEvents()
+            assert drill_dialog._is_drillable('cls') is True
+            assert drill_dialog._is_drillable('lone') is False
+            # real clicks end-to-end, not a direct _enter_drill_mode() call: the eye sits on top of its
+            # node with no item-data of its own, so a naive itemAt()-based click handler reads it back
+            # as "clicked empty canvas" and wipes the pin before the eye ever sees the press — exercise
+            # the actual pin-then-click-eye path to catch that regression.
+            cls_node = drill_dialog.view._node_items['cls']
+            cls_viewport_pos = drill_dialog.view.mapFromScene(cls_node.sceneBoundingRect().center())
+            QTest.mouseClick(drill_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, cls_viewport_pos)
+            app.processEvents()
+            eye = drill_dialog.view._eye_badges['cls']
+            assert eye.isVisible()
+            eye_viewport_pos = drill_dialog.view.mapFromScene(eye.mapToScene(eye.boundingRect().center()))
+            QTest.mouseClick(drill_dialog.view.viewport(), Qt.LeftButton, Qt.NoModifier, eye_viewport_pos)
+            app.processEvents()
+            assert drill_dialog._drill_key == 'cls'
+            # the parent ('cls') is detached from the graph entirely — only its children remain,
+            # 'lone' stays excluded (not a child of 'cls')
+            assert set(drill_dialog._display) == {'m1', 'm2'}
+            assert drill_dialog._display['m1'].outgoing == ['m2']
+            assert 'cls' not in drill_dialog.view._node_items
+            # the parent becomes the fixed title card instead of a graph node
+            assert drill_dialog.drill_title_card.isVisible()
+            assert drill_dialog.drill_title_tag.text() == '[CLS]'
+            assert drill_dialog.drill_title_name.text() == 'classe'
+            assert drill_dialog.drill_back_btn.isVisible()
+            drill_dialog._exit_drill_mode()
+            app.processEvents()
+            assert set(drill_dialog._display) == {'cls', 'm1', 'm2', 'lone'}
+            assert not drill_dialog.drill_back_btn.isVisible()
+            assert not drill_dialog.drill_title_card.isVisible()
+            drill_dialog.close()
+            QSettings('KANT', 'KANT Editor').remove(drill_dialog._position_key)
 
-        delete_target = source_dir / 'delete.txt'
-        delete_target.write_text('old', encoding='utf-8')
-        events = []
+    def test_replace_project_and_delete_tree_item(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            replace_target = root / 'replace.txt'
+            replace_target.write_text('old needle', encoding='utf-8')
+            replace_window = MainWindow.__new__(MainWindow)
+            replace_window.project_root_path = str(root)
+            answers = iter([('needle', True), ('replacement', True)])
+            replace_window._ide_text = lambda *_args, **_kwargs: next(answers)
+            replace_window._ide_yes_no = lambda *_args, **_kwargs: True
+            replace_window._flush_all_tabs = lambda: replace_target.write_text('new needle', encoding='utf-8') is not None
+            replace_window._iter_project_text_files = lambda project_root=None: MainWindow._iter_project_text_files(replace_window, project_root)
+            replace_window._run_background = lambda work, done: done(work(), None)
+            replace_window.open_tabs = {}
+            replace_window._refresh_after_fs_change = lambda: None
+            replace_window.terminal = LabelStub()
+            MainWindow._replace_project(replace_window)
+            assert replace_target.read_text(encoding='utf-8') == 'new replacement'
 
-        class DirtyTab:
-            def flush_pending_save(self):
-                events.append('flush')
-                delete_target.write_text('new', encoding='utf-8')
-                return True
+            delete_target = root / 'delete.txt'
+            delete_target.write_text('old', encoding='utf-8')
+            events = []
 
-        delete_tab = DirtyTab()
-        delete_window = MainWindow.__new__(MainWindow)
-        delete_window.open_tabs = {str(delete_target): delete_tab}
-        delete_window.tabs = type('Tabs', (), {'indexOf': lambda _self, _tab: 0})()
-        delete_window._ide_yes_no = lambda *_args, **_kwargs: True
-        delete_window._close_tab = lambda _idx, flush=True: events.append(('close', flush)) or True
+            class DirtyTab:
+                def flush_pending_save(self):
+                    events.append('flush')
+                    delete_target.write_text('new', encoding='utf-8')
+                    return True
 
-        def move_after_save(path):
-            events.append('move')
-            assert Path(path).read_text(encoding='utf-8') == 'new'
-            return 'trash'
+            delete_tab = DirtyTab()
+            delete_window = MainWindow.__new__(MainWindow)
+            delete_window.open_tabs = {str(delete_target): delete_tab}
+            delete_window.tabs = type('Tabs', (), {'indexOf': lambda _self, _tab: 0})()
+            delete_window._ide_yes_no = lambda *_args, **_kwargs: True
+            delete_window._close_tab = lambda _idx, flush=True: events.append(('close', flush)) or True
 
-        delete_window._move_to_trash = move_after_save
-        delete_window._refresh_after_fs_change = lambda: None
-        delete_window.terminal = LabelStub()
-        delete_item = QTreeWidgetItem()
-        delete_item.setData(0, ROLE_PATH, str(delete_target))
-        MainWindow._delete_tree_item(delete_window, delete_item, 'file')
-        assert events == ['flush', ('close', False), 'move']
+            def move_after_save(path):
+                events.append('move')
+                assert Path(path).read_text(encoding='utf-8') == 'new'
+                return 'trash'
 
-        w = MainWindow.__new__(MainWindow)
-        w.project_root_path = str(root)
-        w.kant_map_path = None
-        w.kant_map_label = LabelStub()
-        w._xref_cache = None
-        w._xref_generation = 0
-        w._xref_pending_generation = None
-        w.map_dialog = None
-        w._map_sync_generation = 0
-        w._run_background = lambda work, done: done(work(), None)
-        MainWindow._sync_kant_map(w)
-        assert (root / f'KANT_{root.name}.md').exists()
-        assert 'ERRORI' in MainWindow._validate_kant_project(w)
+            delete_window._move_to_trash = move_after_save
+            delete_window._refresh_after_fs_change = lambda: None
+            delete_window.terminal = LabelStub()
+            delete_item = QTreeWidgetItem()
+            delete_item.setData(0, ROLE_PATH, str(delete_target))
+            MainWindow._delete_tree_item(delete_window, delete_item, 'file')
+            assert events == ['flush', ('close', False), 'move']
 
-        trash_me = source_dir / 'trash.txt'
-        trash_me.write_text('x', encoding='utf-8')
-        trashed = Path(MainWindow._move_to_trash(w, str(trash_me)))
-        assert trashed.exists()
-        assert Path(str(trashed) + '.restore').read_text(encoding='utf-8') == 'src/trash.txt'
-        candidates = MainWindow._restore_candidates(w)
-        assert any(candidate[2] == 'src/trash.txt' for candidate in candidates)
+    def test_git_commit_and_branch_switch(self):
+        # real repo, real `git` subprocess calls (_run_git shells out), only the modal dialogs are
+        # stubbed to bypass .exec()
+        git_root = Path(tempfile.mkdtemp())
+        subprocess.run(['git', 'init', '-q'], cwd=git_root, check=True)
+        subprocess.run(['git', 'config', 'user.email', 'test@test.local'], cwd=git_root, check=True)
+        subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=git_root, check=True)
+        (git_root / 'a.txt').write_text('one', encoding='utf-8')
+        subprocess.run(['git', 'add', 'a.txt'], cwd=git_root, check=True)
+
+        git_window = MainWindow.__new__(MainWindow)
+        git_window.git_root = str(git_root)
+        git_window._run_background = lambda work, done: done(work(), None)
+        git_window.terminal = LabelStub()
+        git_window._refresh_after_fs_change = lambda: None
+        git_window._run_git = lambda args, root=None: MainWindow._run_git(git_window, args, root)
+        git_window._ide_git_commit_form = lambda staged: 'test commit' if staged else None
+        MainWindow._git_commit(git_window)
+        log = subprocess.run(
+            ['git', 'log', '--oneline', '--format=%s'], cwd=git_root, capture_output=True, text=True, check=True,
+        )
+        assert log.stdout.strip() == 'test commit'
+
+        subprocess.run(['git', 'branch', 'feature-x'], cwd=git_root, check=True)
+        git_window._ide_item = lambda *_args, **_kwargs: ('feature-x', True)
+        MainWindow._git_switch_branch(git_window)
+        branch = subprocess.run(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=git_root, capture_output=True, text=True, check=True,
+        )
+        assert branch.stdout.strip() == 'feature-x'
+
+    def test_run_tests_pytest_integration(self):
+        # a real pytest subprocess against an isolated temp project with one passing and one failing
+        # test, checking the FAILED-line parser feeds results_view with a clickable entry
+        test_project = Path(tempfile.mkdtemp())
+        (test_project / 'test_sample.py').write_text(
+            'def test_ok():\n    assert True\n\n\ndef test_should_fail():\n    assert False\n',
+            encoding='utf-8',
+        )
+        test_window = MainWindow.__new__(MainWindow)
+        test_window.project_root_path = str(test_project)
+        test_window.git_root = None
+        test_window.open_tabs = {}
+        test_window._test_run_pending = False
+        test_window._run_background = lambda work, done: done(work(), None)
+        test_window.terminal = LabelStub()
+        test_window.results_view = QTreeWidget()
+        test_window._toggle_info_popup = lambda *_args, **_kwargs: None
+        MainWindow._run_tests(test_window)
+        assert test_window._test_run_pending is False
+        assert test_window.results_view.topLevelItemCount() == 1
+        root_item = test_window.results_view.topLevelItem(0)
+        assert 'failed' in root_item.text(0)
+        fail_labels = [root_item.child(i).text(0) for i in range(root_item.childCount())]
+        assert any('test_sample.py::test_should_fail' in label for label in fail_labels)
+        fail_item = next(root_item.child(i) for i in range(root_item.childCount()) if 'test_should_fail' in root_item.child(i).text(0))
+        assert fail_item.data(0, ROLE_PATH) == str(test_project / 'test_sample.py')
+        assert fail_item.data(0, ROLE_TEXT) == 'def test_should_fail'
+
+    def test_format_with_external_tool(self):
+        # black/ruff formatting: neither tool is installed in this environment, so shutil.which and
+        # subprocess.run are monkeypatched (module-level, restored in finally) to simulate black being
+        # on PATH and confirm the formatted stdout actually reaches _apply_local_text
+        with _temp_dir() as tmp:
+            fmt_source = Path(tmp) / 'fmt.py'
+            fmt_source.write_text('# [MOD OPEN] fmt.py\nx=1\n# [MOD CLOSED] fmt.py\n', encoding='utf-8')
+            fmt_tab = FileTab(str(fmt_source), parse_kant(fmt_source.read_text(encoding='utf-8')))
+            fmt_window = MainWindow.__new__(MainWindow)
+            fmt_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: fmt_tab})()
+            applied = []
+            fmt_window._apply_local_text = lambda tab, text, message: applied.append((text, message))
+            fmt_window._ide_message = lambda title, msg: applied.append(('MESSAGE', msg))
+
+            original_which = kant_mainwindow_module.shutil.which
+            original_run = kant_mainwindow_module.subprocess.run
+
+            def fake_which(name):
+                return '/usr/bin/black' if name == 'black' else None
+
+            def fake_run(args, input=None, capture_output=None, text=None, timeout=None):
+                assert args[0] == 'black'
+                return subprocess.CompletedProcess(args, 0, stdout=input.replace('x=1', 'x = 1'), stderr='')
+
+            kant_mainwindow_module.shutil.which = fake_which
+            kant_mainwindow_module.subprocess.run = fake_run
+            try:
+                MainWindow._format_with_external_tool(fmt_window)
+            finally:
+                kant_mainwindow_module.shutil.which = original_which
+                kant_mainwindow_module.subprocess.run = original_run
+            assert len(applied) == 1
+            assert 'x = 1' in applied[0][0]
+
+            # neither tool actually installed in this real environment -> the fallback message path
+            none_window = MainWindow.__new__(MainWindow)
+            none_window.tabs = type('Tabs', (), {'currentWidget': lambda _self: fmt_tab})()
+            none_messages = []
+            none_window._ide_message = lambda title, msg: none_messages.append(msg)
+            MainWindow._format_with_external_tool(none_window)
+            assert any('black' in m and 'ruff' in m for m in none_messages)
+
+    def test_command_palette(self):
+        # entries come from introspecting the title bar's own menus, disabled actions are excluded,
+        # and picking an entry just triggers the real QAction (real Qt signal dispatch, not a stub)
+        # so it reuses every menu action's existing wiring untouched
+        fired = []
+
+        class FakeMenuBtn:
+            def __init__(self, specs):
+                menu = QMenu()
+                for label, enabled in specs:
+                    action = menu.addAction(label)
+                    action.setEnabled(enabled)
+                    action.triggered.connect(lambda _checked=False, l=label: fired.append(l))
+                self._menu = menu
+
+            def menu(self):
+                return self._menu
+
+        palette_window = MainWindow.__new__(MainWindow)
+        palette_window.title_bar = type('TB', (), {
+            'file_menu_btn': FakeMenuBtn([('Salva', True), ('Disabilitato', False)]),
+            'search_menu_btn': FakeMenuBtn([('Cerca nel progetto', True)]),
+            'appearance_menu_btn': FakeMenuBtn([('Notte', True)]),
+            'lsp_menu_btn': FakeMenuBtn([('Formatta documento', True)]),
+            'git_menu_btn': FakeMenuBtn([('Commit...', True)]),
+        })()
+        captured = {}
+
+        def fake_palette(entries):
+            captured['entries'] = entries
+            return next(action for label, action in entries if label == 'Git: Commit...')
+
+        palette_window._ide_command_palette = fake_palette
+        MainWindow._show_command_palette(palette_window)
+        palette_labels = [label for label, _action in captured['entries']]
+        assert 'File: Disabilitato' not in palette_labels
+        assert 'File: Salva' in palette_labels
+        assert fired == ['Commit...']
+
+    def test_crash_handler_writes_log_and_shows_dialog(self):
+        # PySide6 routes an uncaught exception from a Qt slot through sys.excepthook same as any
+        # other uncaught exception, so installing the hook and invoking it directly with a synthetic
+        # exception exercises the real code path without needing to actually crash the app.
+        # QMessageBox.critical is monkeypatched (module-level, restored in finally) since it's a
+        # blocking modal that would otherwise hang an offscreen test run.
+        original_excepthook = sys.excepthook
+        original_critical = kant_editor.QMessageBox.critical
+        critical_calls = []
+        kant_editor.QMessageBox.critical = lambda *args, **kwargs: critical_calls.append(args)
         try:
-            safe_project_path(str(root), '../escape.txt')
-            assert False, 'restore path traversal accepted'
-        except ValueError:
-            pass
+            kant_editor._install_crash_handler()
+            try:
+                raise ValueError('synthetic crash for the regression check')
+            except ValueError:
+                sys.excepthook(*sys.exc_info())
+        finally:
+            sys.excepthook = original_excepthook
+            kant_editor.QMessageBox.critical = original_critical
+        assert len(critical_calls) == 1
+        assert 'synthetic crash' in critical_calls[0][2]
+        log_files = sorted(kant_editor.CRASH_LOG_DIR.glob('crash_*.log'), key=lambda p: p.stat().st_mtime)
+        assert log_files, 'no crash log file was written'
+        assert 'ValueError' in log_files[-1].read_text(encoding='utf-8')
+        assert 'synthetic crash' in log_files[-1].read_text(encoding='utf-8')
 
-        snapshot = create_snapshot(str(root), {'.kant-trash'})
-        rollback_target = source_dir / 'rollback.txt'
-        rollback_target.write_text('created later', encoding='utf-8')
-        source.write_text(source.read_text(encoding='utf-8').replace('print(1)', 'changed(1)'), encoding='utf-8')
-        review = build_ai_review(str(root), snapshot, {'.kant-trash'})
-        assert review and any('app.py' in item['path'] for item in review)
-        rollback_snapshot(str(root), snapshot, {'.kant-trash'})
-        assert not rollback_target.exists() and 'print(1)' in source.read_text(encoding='utf-8')
-        discard_snapshot(snapshot)
+    def test_kant_map_sync_trash_restore_and_ai_review(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            source_dir = root / 'src'
+            source_dir.mkdir()
+            source = _write_app_py(source_dir)
+            (source_dir / 'bad.py').write_text('# [FN OPEN #deadbeef] broken\n', encoding='utf-8')
 
-        review_root = root / 'review'
-        review_root.mkdir()
-        review_file = review_root / 'sample.txt'
-        original_lines = [f'line {index}\n' for index in range(20)]
-        review_file.write_text(''.join(original_lines), encoding='utf-8')
-        review_snapshot = create_snapshot(str(review_root))
-        changed_lines = original_lines[:]
-        changed_lines[1] = 'first change\n'
-        changed_lines[18] = 'second change\n'
-        review_file.write_text(''.join(changed_lines), encoding='utf-8')
-        review = build_ai_review(str(review_root), review_snapshot)
-        assert len(review) == 1 and len(review[0]['hunks']) == 2
-        review_card = _AiReviewCard(review, render_review_text)
-        assert review_card.details.objectName() == 'aiReviewDetails'
-        assert review_card.accepted_hunks('sample.txt') == {0, 1}
-        review_card.file_items['sample.txt'].child(1).setCheckState(0, Qt.Unchecked)
-        assert review_card.accepted_hunks('sample.txt') == {0}
-        resolved = []
-        review_card.resolved.connect(resolved.append)
-        review_card._show_details('sample.txt')
-        review_card.resolved.emit('cancel')
-        assert resolved == ['cancel']
-        review_card.set_resolved()
-        assert all(not button.isEnabled() for button in review_card._action_buttons)
-        review_card.close()
+            w = MainWindow.__new__(MainWindow)
+            w.project_root_path = str(root)
+            w.kant_map_path = None
+            w.kant_map_label = LabelStub()
+            w._xref_cache = None
+            w._xref_generation = 0
+            w._xref_pending_generation = None
+            w.map_dialog = None
+            w._map_sync_generation = 0
+            w._run_background = lambda work, done: done(work(), None)
+            MainWindow._sync_kant_map(w)
+            assert (root / f'KANT_{root.name}.md').exists()
+            assert 'ERRORI' in MainWindow._validate_kant_project(w)
 
-        rows_before = window.claude_pane.chat_layout.count()
-        review_outcomes = []
-        window.claude_pane.show_ai_review(review, render_review_text, lambda *args: review_outcomes.append(args))
-        assert window.claude_pane.chat_layout.count() == rows_before + 1  # inserted inline, not a popup
-        inserted_row = window.claude_pane.chat_layout.itemAt(window.claude_pane.chat_layout.count() - 2).widget()
-        inline_card = inserted_row.findChild(_AiReviewCard)
-        assert inline_card is not None
-        inline_card.resolved.emit('apply')
-        assert review_outcomes and review_outcomes[0][0] == 'apply'
-        assert all(not button.isEnabled() for button in inline_card._action_buttons)  # locks after resolving
-        apply_ai_review(str(review_root), review, {'sample.txt': {0}})
-        partial = review_file.read_text(encoding='utf-8')
-        assert 'first change' in partial and 'line 18' in partial and 'second change' not in partial
-        review_file.write_text(''.join(changed_lines), encoding='utf-8')
-        apply_ai_review(str(review_root), review, {'sample.txt': set()}, {'sample.txt': 'manually edited\n'})
-        assert review_file.read_text(encoding='utf-8') == 'manually edited\n'
-        review_file.write_text('external change\n', encoding='utf-8')
-        try:
-            apply_ai_review(str(review_root), review, {'sample.txt': {0, 1}})
-            assert False, 'external edit during AI review was overwritten'
-        except OSError:
-            assert review_file.read_text(encoding='utf-8') == 'external change\n'
-        discard_snapshot(review_snapshot)
+            trash_me = source_dir / 'trash.txt'
+            trash_me.write_text('x', encoding='utf-8')
+            trashed = Path(MainWindow._move_to_trash(w, str(trash_me)))
+            assert trashed.exists()
+            assert Path(str(trashed) + '.restore').read_text(encoding='utf-8') == 'src/trash.txt'
+            candidates = MainWindow._restore_candidates(w)
+            assert any(candidate[2] == 'src/trash.txt' for candidate in candidates)
+            try:
+                safe_project_path(str(root), '../escape.txt')
+                assert False, 'restore path traversal accepted'
+            except ValueError:
+                pass
 
-        conflict_tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
-        conflict_run = next(item for node in conflict_tab.tree.body if hasattr(node, 'body') for item in node.body if isinstance(item, Run))
-        conflict_run.lines = ['local()']
-        conflict_tab.dirty = True
-        source.write_text(source.read_text(encoding='utf-8').replace('print(1)', 'external(1)'), encoding='utf-8')
-        conflicts = []
-        save_failures = []
-        conflict_tab.saveConflict.connect(lambda: conflicts.append(True))
-        conflict_tab.saveFailed.connect(save_failures.append)
-        assert not conflict_tab.save() and conflicts and 'external(1)' in source.read_text(encoding='utf-8')
-        assert conflict_tab.save(force=True), save_failures
-        assert 'local()' in source.read_text(encoding='utf-8')
+            snapshot = create_snapshot(str(root), {'.kant-trash'})
+            rollback_target = source_dir / 'rollback.txt'
+            rollback_target.write_text('created later', encoding='utf-8')
+            source.write_text(source.read_text(encoding='utf-8').replace('print(1)', 'changed(1)'), encoding='utf-8')
+            review = build_ai_review(str(root), snapshot, {'.kant-trash'})
+            assert review and any('app.py' in item['path'] for item in review)
+            rollback_snapshot(str(root), snapshot, {'.kant-trash'})
+            assert not rollback_target.exists() and 'print(1)' in source.read_text(encoding='utf-8')
+            discard_snapshot(snapshot)
 
-        undo_tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
-        undo_tab.remember_undo_state(coalesce=True)
-        undo_tab.remember_undo_state(coalesce=True)
-        assert len(undo_tab.undo_stack) == 1
+            review_root = root / 'review'
+            review_root.mkdir()
+            review_file = review_root / 'sample.txt'
+            original_lines = [f'line {index}\n' for index in range(20)]
+            review_file.write_text(''.join(original_lines), encoding='utf-8')
+            review_snapshot = create_snapshot(str(review_root))
+            changed_lines = original_lines[:]
+            changed_lines[1] = 'first change\n'
+            changed_lines[18] = 'second change\n'
+            review_file.write_text(''.join(changed_lines), encoding='utf-8')
+            review = build_ai_review(str(review_root), review_snapshot)
+            assert len(review) == 1 and len(review[0]['hunks']) == 2
+            review_card = _AiReviewCard(review, render_review_text)
+            assert review_card.details.objectName() == 'aiReviewDetails'
+            assert review_card.accepted_hunks('sample.txt') == {0, 1}
+            review_card.file_items['sample.txt'].child(1).setCheckState(0, Qt.Unchecked)
+            assert review_card.accepted_hunks('sample.txt') == {0}
+            resolved = []
+            review_card.resolved.connect(resolved.append)
+            review_card._show_details('sample.txt')
+            review_card.resolved.emit('cancel')
+            assert resolved == ['cancel']
+            review_card.set_resolved()
+            assert all(not button.isEnabled() for button in review_card._action_buttons)
+            review_card.close()
 
-        lsp = LspClient()
-        errors = []
-        lsp.serverError.connect(errors.append)
-        lsp.init_id = 7
-        lsp._handle_message({'id': 7, 'error': {'message': 'bad initialize'}})
-        assert errors == ['bad initialize'] and not lsp.ready
+            window = MainWindow()
+            rows_before = window.claude_pane.chat_layout.count()
+            review_outcomes = []
+            window.claude_pane.show_ai_review(review, render_review_text, lambda *args: review_outcomes.append(args))
+            assert window.claude_pane.chat_layout.count() == rows_before + 1  # inserted inline, not a popup
+            inserted_row = window.claude_pane.chat_layout.itemAt(window.claude_pane.chat_layout.count() - 2).widget()
+            inline_card = inserted_row.findChild(_AiReviewCard)
+            assert inline_card is not None
+            inline_card.resolved.emit('apply')
+            assert review_outcomes and review_outcomes[0][0] == 'apply'
+            assert all(not button.isEnabled() for button in inline_card._action_buttons)  # locks after resolving
+            window.close()
+            apply_ai_review(str(review_root), review, {'sample.txt': {0}})
+            partial = review_file.read_text(encoding='utf-8')
+            assert 'first change' in partial and 'line 18' in partial and 'second change' not in partial
+            review_file.write_text(''.join(changed_lines), encoding='utf-8')
+            apply_ai_review(str(review_root), review, {'sample.txt': set()}, {'sample.txt': 'manually edited\n'})
+            assert review_file.read_text(encoding='utf-8') == 'manually edited\n'
+            review_file.write_text('external change\n', encoding='utf-8')
+            try:
+                apply_ai_review(str(review_root), review, {'sample.txt': {0, 1}})
+                assert False, 'external edit during AI review was overwritten'
+            except OSError:
+                assert review_file.read_text(encoding='utf-8') == 'external change\n'
+            discard_snapshot(review_snapshot)
 
-        calls = []
-        item = QTreeWidgetItem()
-        item.setData(0, ROLE_KIND, 'file')
-        item.setData(0, ROLE_PATH, str(source))
-        w.open_tabs = {str(source): object()}
-        w._open_file = lambda path: calls.append(('open', path)) or True
-        w._render_view = lambda tab, uid=None: calls.append(('render', uid))
-        w._update_io_tabs = lambda uid: calls.append(('io', uid))
-        MainWindow._on_tree_item_clicked(w, item, 0)
-        assert ('render', None) in calls and ('io', None) in calls
+    def test_conflict_save_undo_coalesce_lsp_error_and_tree_click_routing(self):
+        with _temp_dir() as tmp:
+            source_dir = Path(tmp) / 'src'
+            source_dir.mkdir()
+            source = _write_app_py(source_dir)
 
-    print('KANT smoke: OK')
+            conflict_tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
+            conflict_run = next(item for node in conflict_tab.tree.body if hasattr(node, 'body') for item in node.body if isinstance(item, Run))
+            conflict_run.lines = ['local()']
+            conflict_tab.dirty = True
+            source.write_text(source.read_text(encoding='utf-8').replace('print(1)', 'external(1)'), encoding='utf-8')
+            conflicts = []
+            save_failures = []
+            conflict_tab.saveConflict.connect(lambda: conflicts.append(True))
+            conflict_tab.saveFailed.connect(save_failures.append)
+            assert not conflict_tab.save() and conflicts and 'external(1)' in source.read_text(encoding='utf-8')
+            assert conflict_tab.save(force=True), save_failures
+            assert 'local()' in source.read_text(encoding='utf-8')
 
+            undo_tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
+            undo_tab.remember_undo_state(coalesce=True)
+            undo_tab.remember_undo_state(coalesce=True)
+            assert len(undo_tab.undo_stack) == 1
 
-class KantSmokeTest(unittest.TestCase):
-    def test_smoke(self):
-        main()
+            lsp = LspClient()
+            errors = []
+            lsp.serverError.connect(errors.append)
+            lsp.init_id = 7
+            lsp._handle_message({'id': 7, 'error': {'message': 'bad initialize'}})
+            assert errors == ['bad initialize'] and not lsp.ready
+
+            w = MainWindow.__new__(MainWindow)
+            calls = []
+            item = QTreeWidgetItem()
+            item.setData(0, ROLE_KIND, 'file')
+            item.setData(0, ROLE_PATH, str(source))
+            w.open_tabs = {str(source): object()}
+            w._open_file = lambda path: calls.append(('open', path)) or True
+            w._render_view = lambda tab, uid=None: calls.append(('render', uid))
+            w._update_io_tabs = lambda uid: calls.append(('io', uid))
+            MainWindow._on_tree_item_clicked(w, item, 0)
+            assert ('render', None) in calls and ('io', None) in calls
+# [TST CLOSED] KantSmokeTest
 
 
 if __name__ == '__main__':
-    main()
+    unittest.main()

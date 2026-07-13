@@ -12,7 +12,9 @@ workspace safety, or graph algorithms.
 """
 import os
 import re
+import shutil
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from html import escape as html_escape
 from pathlib import Path
@@ -36,8 +38,8 @@ from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending
 from kant.syntax import check_file_syntax, run_command_for_path
 from kant.xref import build_xref, _walk_nodes
 from kant.lsp import LSP_SERVERS_BY_EXT, file_uri, path_from_file_uri, lsp_server_for_path, LspClient
-from kant.gitutil import find_git_root, git_status_map
 from kant.dialogs import IdeDialogsMixin
+from kant.gitops import GitOpsMixin
 from kant.projectops import (
     build_kant_map, definition_locations, has_any_kant_tags, iter_kant_tagged_files,
     reference_locations, scan_project_replace, search_project, validate_kant_project,
@@ -45,9 +47,10 @@ from kant.projectops import (
 from kant.workspace import ROLE_PATH, WorkspaceMixin, discard_snapshot, rollback_snapshot
 from kant.widgets import (
     CodeEdit, TerminalPane, ClaudePane, CollapsibleSection, LeafSection,
-    ProjectTree, make_star_icon, TitleBar, FileTab, XrefMapDialog,
+    ProjectTree, make_star_icon, TitleBar, FileTab,
     MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS, _tag_header_html,
 )
+from kant.mappa import XrefMapDialog
 
 
 ROLE_KIND = Qt.UserRole
@@ -146,7 +149,7 @@ class _KantTabBar(QTabBar):
 # owns the currently-open file's parsed tree and dirty state
 # [FN] MainWindow — the KANT Editor application window
 # [FN OPEN] MainWindow
-class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
+class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     backgroundFinished = Signal(object, object, object)
 
     def __init__(self):
@@ -175,6 +178,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self._background = ThreadPoolExecutor(max_workers=2, thread_name_prefix='kant')
         self.backgroundFinished.connect(self._finish_background)
         self._git_refresh_pending = False
+        self._test_run_pending = False
         self._ai_snapshot = None
         self._map_sync_generation = 0
         self.syntax_timer = QTimer(self)
@@ -254,6 +258,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         QShortcut(QKeySequence('Ctrl+W'), self, self._close_active_tab)
         QShortcut(QKeySequence('Ctrl+R'), self, self._run_current_file)
         QShortcut(QKeySequence('F5'), self, self._debug_current_file)
+        QShortcut(QKeySequence('Ctrl+Shift+T'), self, self._run_tests)
+        QShortcut(QKeySequence('Ctrl+Shift+P'), self, self._show_command_palette)
         QShortcut(QKeySequence('Ctrl+Shift+F'), self, self._search_project)
         QShortcut(QKeySequence('Ctrl+Shift+H'), self, self._replace_project)
         QShortcut(QKeySequence.Undo, self, self._undo_file)
@@ -860,12 +866,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self.title_bar.git_diff_menu_action.setEnabled(has_git_file)
         self.title_bar.git_stage_menu_action.setEnabled(has_git_file)
         self.title_bar.git_unstage_menu_action.setEnabled(has_git_file)
+        self.title_bar.git_commit_menu_action.setEnabled(bool(self.git_root))
+        self.title_bar.git_branch_menu_action.setEnabled(bool(self.git_root))
+        self.title_bar.run_tests_menu_action.setEnabled(bool(self.project_root_path))
         for action in (
             self.title_bar.lsp_hover_menu_action,
             self.title_bar.lsp_definition_menu_action,
             self.title_bar.lsp_references_menu_action,
             self.title_bar.lsp_rename_menu_action,
             self.title_bar.lsp_format_menu_action,
+            self.title_bar.lsp_format_external_menu_action,
         ):
             action.setEnabled(has_tab)
 
@@ -1024,6 +1034,31 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
     def _find_prev(self):
         self._find_in_view(forward=False)
 
+    # [FN CATEGORY] _show_command_palette — builds its entries by introspecting the title bar's own
+    # menus (File/Cerca/Aspetto/LSP/Git) rather than a separately hand-maintained action list, so a
+    # future menu action is automatically in the palette with no second registration to forget.
+    # Disabled/separator actions are skipped; picking an entry just calls QAction.trigger(), reusing
+    # every action's existing wiring untouched.
+    # [FN] _show_command_palette — Ctrl+Shift+P: fuzzy-filtered list of every menu action
+    # [FN OPEN] _show_command_palette
+    def _show_command_palette(self):
+        entries = []
+        for prefix, menu_btn in (
+            ('File', self.title_bar.file_menu_btn),
+            ('Cerca', self.title_bar.search_menu_btn),
+            ('Aspetto', self.title_bar.appearance_menu_btn),
+            ('LSP', self.title_bar.lsp_menu_btn),
+            ('Git', self.title_bar.git_menu_btn),
+        ):
+            for action in menu_btn.menu().actions():
+                if action.isSeparator() or not action.isEnabled():
+                    continue
+                entries.append((f'{prefix}: {action.text()}', action))
+        chosen = self._ide_command_palette(entries)
+        if chosen is not None:
+            chosen.trigger()
+    # [FN CLOSED] _show_command_palette
+
     def _search_project(self):
         if not self.project_root_path:
             return
@@ -1056,7 +1091,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             QTreeWidgetItem(root, ['Nessun risultato'])
 
     def _open_result_item(self, item, _column):
-        if item.data(0, ROLE_KIND) not in ('search-result', 'validation-result', 'lsp-result', 'diagnostic-result'):
+        if item.data(0, ROLE_KIND) not in (
+            'search-result', 'validation-result', 'lsp-result', 'diagnostic-result', 'test-result',
+        ):
             return
         path = item.data(0, ROLE_PATH)
         line = item.data(0, ROLE_LINE) or 1
@@ -1603,42 +1640,6 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self._position_map_tab()
         self.claude_tab_btn.show()
         self._position_claude_tab()
-
-    def _refresh_git_status(self):
-        if self._git_refresh_pending or not self.project_root_path:
-            return
-        project_root = self.project_root_path
-        self._git_refresh_pending = True
-
-        def read_status():
-            git_root = find_git_root(project_root)
-            return git_root, git_status_map(git_root)
-
-        def apply_status(result, error):
-            self._git_refresh_pending = False
-            if self.project_root_path != project_root:
-                self._refresh_git_status()
-                return
-            if error:
-                return
-            self.git_root, self.git_status = result
-            self._update_action_buttons()
-            self._rebuild_tree(refresh_git=False)
-
-        self._run_background(read_status, apply_status)
-
-    def _git_status_for_path(self, path):
-        if not self.git_root:
-            return ''
-        rel = os.path.relpath(path, self.git_root)
-        return self.git_status.get(rel, '')
-
-    def _git_status_for_dir(self, path):
-        if not self.git_root:
-            return ''
-        rel = os.path.relpath(path, self.git_root)
-        prefix = '' if rel == '.' else rel + os.sep
-        return 'M' if any(p.startswith(prefix) for p in self.git_status) else ''
 
     # [FN CATEGORY] _check_kant_map — looks for a KANT_*.md structural map at the project root (the
     # file /kant-code-map writes) and reflects whether one exists in the label below the project tree
@@ -2444,6 +2445,41 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             return
         self._apply_local_text(tab, new_text, 'Whitespace ripulito.')
 
+    # [FN CATEGORY] _format_with_external_tool — runs black (falling back to `ruff format`) on the
+    # active file's text over stdin/stdout, independent of any LSP server — _lsp_command('format')
+    # only works when a language server for the file type is actually configured and running; this
+    # works for any Python file regardless, using whichever of the two tools is on PATH.
+    # [FN] _format_with_external_tool — formats the active Python file with black or ruff
+    # [FN OPEN] _format_with_external_tool
+    def _format_with_external_tool(self):
+        tab = self.active_tab
+        if tab is None:
+            return
+        if Path(tab.path).suffix.lower() != '.py':
+            self._ide_message('Formatta', 'Formattazione black/ruff disponibile solo per file Python.')
+            return
+        text = serialize_kant(tab.tree)
+        if shutil.which('black'):
+            args = ['black', '-q', '-']
+        elif shutil.which('ruff'):
+            args = ['ruff', 'format', '--stdin-filename', tab.path, '-']
+        else:
+            self._ide_message('Formatta', 'Ne black ne ruff sono installati (pip install black, oppure pip install ruff).')
+            return
+        try:
+            result = subprocess.run(args, input=text, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self._ide_message('Formatta', f'Errore avvio formatter: {e}')
+            return
+        if result.returncode:
+            self._ide_message('Formatta', f'Formattazione fallita:\n{result.stderr or result.stdout}')
+            return
+        if result.stdout == text:
+            self._ide_message('Formatta', 'Il file e gia formattato.')
+            return
+        self._apply_local_text(tab, result.stdout, 'Formattato con black/ruff.')
+    # [FN CLOSED] _format_with_external_tool
+
     def _apply_local_text(self, tab, text, message):
         try:
             new_tree = parse_kant(text)
@@ -3007,80 +3043,58 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             self._git_stage_file(item.data(0, ROLE_PATH), staged=False)
     # [FN CLOSED] _show_tree_context_menu
 
-    def _git_relpath(self, path):
-        if not self.git_root or not path:
-            return None
-        return os.path.relpath(path, self.git_root)
-
-    def _run_git(self, args, git_root=None):
-        git_root = git_root or self.git_root
-        if not git_root:
-            return None
-        return subprocess.run(
-            ['git', '-C', git_root, *args],
-            capture_output=True,
-            text=True,
-            timeout=8,
-        )
-
-    def _git_diff_file(self, path):
-        rel = self._git_relpath(path)
-        if not rel:
+    # [FN CATEGORY] _run_tests — runs the whole project through `python -m pytest` (auto-discovers
+    # test_*.py, matching this project's own test_kant_smoke.py convention) via _run_background so
+    # the UI doesn't block, then parses FAILED lines out of the captured output into results_view —
+    # the same clickable-results tree _show_search_results already uses — instead of a bespoke panel.
+    # [FN] _run_tests — runs pytest and surfaces pass/fail without an external terminal
+    # [FN OPEN] _run_tests
+    def _run_tests(self):
+        project_root = self.project_root_path or self.git_root
+        if not project_root or self._test_run_pending:
             return
-        git_root = self.git_root
-        def diff():
-            result = self._run_git(['diff', '--', rel], git_root)
-            text = result.stdout.strip() if result else ''
-            if not text:
-                cached = self._run_git(['diff', '--cached', '--', rel], git_root)
-                text = cached.stdout.strip() if cached else ''
-            return text
-
-        self._run_background(
-            diff,
-            lambda text, error: self.terminal.write_info(
-                f'\n# git diff -- {rel}\n{("Errore: " + str(error)) if error else (text or "Nessuna differenza")}\n'
-            ),
-        )
-
-    def _git_stage_file(self, path, staged):
-        rel = self._git_relpath(path)
-        if not rel:
+        if not self._flush_all_tabs():
             return
-        args = ['add', '--', rel] if staged else ['restore', '--staged', '--', rel]
-        action = 'stage' if staged else 'unstage'
-        git_root = self.git_root
+        self._test_run_pending = True
 
-        def done(result, error):
-            if error or result is None or result.returncode:
-                message = str(error) if error else ((result.stderr or result.stdout) if result else 'Git non disponibile')
-                self.terminal.write_info(f'\n# git {action} {rel}\n{message}\n')
-                return
-            self._refresh_after_fs_change()
-            self.terminal.write_info(f'\n# git {action} {rel}: OK\n')
+        def run():
+            return subprocess.run(
+                [sys.executable, '-m', 'pytest', '--tb=short', '-q', '--color=no'],
+                cwd=project_root, capture_output=True, text=True, timeout=300,
+            )
 
-        self._run_background(lambda: self._run_git(args, git_root), done)
+        self.terminal.write_info('\n# Esegui test: python -m pytest --tb=short -q\n')
+        self._run_background(run, lambda result, error: self._finish_test_run(project_root, result, error))
+    # [FN CLOSED] _run_tests
 
-    def _active_file_path(self):
-        tab = self.active_tab
-        return tab.path if tab is not None else None
+    def _finish_test_run(self, project_root, result, error):
+        self._test_run_pending = False
+        if error or result is None:
+            message = str(error) if error else 'Impossibile avviare pytest (installato?)'
+            self.terminal.write_info(f'\n# Test: errore\n{message}\n')
+            return
+        output = (result.stdout or '') + (result.stderr or '')
+        self.terminal.write_info(f'\n{output}\n')
+        # the final summary line ("1 failed, 1 passed in 0.74s") is printed bare, not wrapped in the
+        # "=== ... ===" banners pytest uses for FAILURES / short test summary info above it
+        summary_match = re.search(r'^\d+ \w+(?:, \d+ \w+)* in [\d.]+s$', output, re.MULTILINE)
+        summary = summary_match.group(0) if summary_match else f'exit code {result.returncode}'
+        failures = []
+        for match in re.finditer(r'^FAILED (\S+)', output, re.MULTILINE):
+            rel_path, _, rest = match.group(1).partition('::')
+            test_name = rest.rsplit('::', 1)[-1].split('[', 1)[0] if rest else ''
+            failures.append((os.path.join(project_root, rel_path), rel_path, test_name))
+        self._show_test_results(summary, failures)
 
-    def _git_refresh(self):
-        self._refresh_after_fs_change()
-        self.terminal.write_info('\n# Git refresh: OK\n')
-
-    def _git_diff_active_file(self):
-        path = self._active_file_path()
-        if path:
-            self._git_diff_file(path)
-
-    def _git_stage_active_file(self):
-        path = self._active_file_path()
-        if path:
-            self._git_stage_file(path, staged=True)
-
-    def _git_unstage_active_file(self):
-        path = self._active_file_path()
-        if path:
-            self._git_stage_file(path, staged=False)
+    def _show_test_results(self, summary, failures):
+        self.results_view.clear()
+        root = QTreeWidgetItem(self.results_view, [f'Test: {summary}'])
+        for path, rel, test_name in failures:
+            label = f'{rel}::{test_name}' if test_name else rel
+            item = QTreeWidgetItem(root, [label])
+            item.setData(0, ROLE_KIND, 'test-result')
+            item.setData(0, ROLE_PATH, path)
+            item.setData(0, ROLE_TEXT, f'def {test_name}' if test_name else '')
+        root.setExpanded(True)
+        self._toggle_info_popup(self.results_view, force_open=True)
 # [FN CLOSED] MainWindow

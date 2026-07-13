@@ -121,11 +121,15 @@ KANT IDE requires Python 3 and PySide6.
 ```powershell
 git clone https://github.com/FAUST-RD/KANT_IDE.git
 cd KANT_IDE
-python -m pip install -r requirements.txt
+.\install.ps1
 python kant_editor.py
 ```
 
+If PowerShell blocks the script (`running scripts is disabled on this system`), run it once with
+`powershell -ExecutionPolicy Bypass -File install.ps1` instead.
+
 On Linux or macOS, `./install.sh` installs the Python dependency and prints the launch command.
+No native installer/executable yet — see [`PACKAGING.md`](PACKAGING.md) to build a standalone one with PyInstaller.
 
 Language-server features activate only when a compatible server is already available on `PATH`. The editor works without one.
 
@@ -155,7 +159,7 @@ python test_kant_smoke.py
 
 On Linux or macOS, set `QT_QPA_PLATFORM=offscreen` before running the test.
 
-The legacy `index.html` prototype remains in the repository for reference. Current development targets the Python/PySide6 application.
+The legacy [`legacy/index.html`](legacy/index.html) prototype remains in the repository for reference. Current development targets the Python/PySide6 application.
 
 ## License
 

@@ -1,9 +1,32 @@
 """Small themed modal dialogs shared by the main window."""
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QPushButton, QTextEdit, QVBoxLayout, QWidget,
+)
 
 from kant import theme
+
+
+# [FN CATEGORY] _PaletteInput — a QLineEdit that forwards Up/Down to the command palette's result
+# list (wrapping at the ends) instead of the default no-op text-cursor movement, so arrow keys work
+# while the filter field keeps focus — the same forwarding shape _TabLabel (mainwindow.py) uses.
+# [FN] _PaletteInput — filter field that forwards Up/Down to a QListWidget
+# [FN OPEN] _PaletteInput
+class _PaletteInput(QLineEdit):
+    def __init__(self, listbox):
+        super().__init__()
+        self._listbox = listbox
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Down, Qt.Key_Up) and self._listbox.count():
+            row = self._listbox.currentRow()
+            delta = 1 if event.key() == Qt.Key_Down else -1
+            self._listbox.setCurrentRow((row + delta) % self._listbox.count())
+            return
+        super().keyPressEvent(event)
+# [FN CLOSED] _PaletteInput
 
 
 class IdeDialogsMixin:
@@ -256,6 +279,182 @@ class IdeDialogsMixin:
             'effort': None if effort in (model_default, '') else effort,
         }
     # [FN CLOSED] _ide_agent_choice_form
+
+    # [FN CATEGORY] _ide_git_commit_form — lists currently staged files (passed in by the caller, a
+    # fresh `git diff --cached --name-only`) and a message box. "Stage tutto" re-queries the staged
+    # list in place (git add -A, then re-read) instead of closing the dialog, so a commit with no
+    # per-file staging done beforehand is still one dialog, not stage-then-reopen-commit.
+    # [FN] _ide_git_commit_form — staged-file list + message box, with a stage-all shortcut
+    # [FN OPEN] _ide_git_commit_form
+    def _ide_git_commit_form(self, staged_files):
+        dialog = QDialog(self)
+        dialog.setModal(True)
+        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        dialog.setFixedWidth(460)
+        dialog.setStyleSheet(f'QDialog {{ background:{theme.BG}; border:1px solid {theme.BORDER}; }}')
+
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        header = QWidget()
+        header.setFixedHeight(34)
+        header.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(14, 0, 8, 0)
+        title = QLabel('Git commit')
+        title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
+        title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:2px; border:none;')
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+        close_btn = QPushButton('×')
+        close_btn.setFixedSize(26, 24)
+        close_btn.setStyleSheet(theme.BUTTON_STYLE)
+        close_btn.clicked.connect(dialog.reject)
+        header_row.addWidget(close_btn)
+        outer.addWidget(header)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(18, 16, 18, 16)
+        body.setSpacing(10)
+
+        files_label = QLabel()
+        files_label.setWordWrap(True)
+        files_label.setStyleSheet(f'color:{theme.DIM}; border:none;')
+        body.addWidget(files_label)
+
+        def render_staged(files):
+            files_label.setText('File in stage:\n' + '\n'.join(files) if files else 'Nessun file in stage.')
+
+        render_staged(staged_files)
+
+        stage_all_btn = QPushButton('Stage tutto')
+        stage_all_btn.setStyleSheet(theme.BUTTON_STYLE)
+
+        def stage_all():
+            self._run_git(['add', '-A'])
+            result = self._run_git(['diff', '--cached', '--name-only'])
+            files = [line for line in (result.stdout.splitlines() if result else []) if line.strip()]
+            render_staged(files)
+            commit_btn.setEnabled(bool(files))
+
+        stage_all_btn.clicked.connect(stage_all)
+        body.addWidget(stage_all_btn)
+
+        message_label = QLabel('Messaggio di commit:')
+        message_label.setStyleSheet(f'color:{theme.TEXT}; border:none;')
+        body.addWidget(message_label)
+        message_field = QTextEdit()
+        message_field.setFixedHeight(80)
+        message_field.setStyleSheet(
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:6px; padding:6px;'
+        )
+        body.addWidget(message_field)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton('Annulla')
+        commit_btn = QPushButton('Commit')
+        for button in (cancel, commit_btn):
+            button.setStyleSheet(theme.BUTTON_STYLE)
+            buttons.addWidget(button)
+        commit_btn.setEnabled(bool(staged_files))
+        cancel.clicked.connect(dialog.reject)
+        commit_btn.clicked.connect(dialog.accept)
+        body.addLayout(buttons)
+        outer.addLayout(body)
+
+        message_field.setFocus()
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return message_field.toPlainText().strip() or None
+    # [FN CLOSED] _ide_git_commit_form
+
+    # [FN CATEGORY] _ide_command_palette — `entries` is a caller-built [(label, payload), ...] list
+    # (the caller decides what payload means — mainwindow passes QActions and calls .trigger() on the
+    # pick, reusing every menu action's existing wiring instead of a separate hand-maintained
+    # registry). Filters case-insensitively as you type; Enter/double-click confirms the current row.
+    # [FN] _ide_command_palette — fuzzy-filtered command list, returns the picked payload or None
+    # [FN OPEN] _ide_command_palette
+    def _ide_command_palette(self, entries):
+        dialog = QDialog(self)
+        dialog.setModal(True)
+        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        dialog.setFixedWidth(460)
+        dialog.setStyleSheet(f'QDialog {{ background:{theme.BG}; border:1px solid {theme.BORDER}; }}')
+
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        header = QWidget()
+        header.setFixedHeight(34)
+        header.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(14, 0, 8, 0)
+        title = QLabel('Comandi')
+        title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
+        title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:2px; border:none;')
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+        close_btn = QPushButton('×')
+        close_btn.setFixedSize(26, 24)
+        close_btn.setStyleSheet(theme.BUTTON_STYLE)
+        close_btn.clicked.connect(dialog.reject)
+        header_row.addWidget(close_btn)
+        outer.addWidget(header)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(12, 12, 12, 12)
+        body.setSpacing(8)
+
+        listbox = QListWidget()
+        listbox.setStyleSheet(
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:6px;'
+        )
+
+        field = _PaletteInput(listbox)
+        field.setPlaceholderText('Filtra comandi…')
+        field.setStyleSheet(
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:6px; padding:8px;'
+        )
+        body.addWidget(field)
+        body.addWidget(listbox)
+
+        def populate(filter_text):
+            listbox.clear()
+            needle = filter_text.strip().lower()
+            for label, payload in entries:
+                if needle and needle not in label.lower():
+                    continue
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, payload)
+                listbox.addItem(item)
+            if listbox.count():
+                listbox.setCurrentRow(0)
+
+        populate('')
+        field.textChanged.connect(populate)
+
+        result = {'payload': None}
+
+        def confirm():
+            item = listbox.currentItem()
+            if item is not None:
+                result['payload'] = item.data(Qt.UserRole)
+            dialog.accept()
+
+        field.returnPressed.connect(confirm)
+        listbox.itemActivated.connect(lambda _item: confirm())
+        outer.addLayout(body)
+
+        field.setFocus()
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return result['payload']
+    # [FN CLOSED] _ide_command_palette
 
     def _ide_item(self, title, label, items):
         if not items:

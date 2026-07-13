@@ -23,7 +23,7 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 | Local syntax checks or run commands | `syntax.py` | status/run orchestration in `mainwindow.py` |
 | Project search, replace scan, map generation, validation | `projectops.py` | UI callbacks in `mainwindow.py` |
 | Incoming/Outgoing reference detection | `xref.py`: `build_xref` | cache and panels in `mainwindow.py` |
-| MAPPA layout, filters, drill-down, graphics | `widgets.py`: `_force_layout_positions`, `XrefMapView`, `XrefMapDialog` | graph creation in `xref.py`; dialog opening in `mainwindow.py` |
+| MAPPA layout, filters, drill-down, graphics | `mappa.py`: `_force_layout_positions`, `XrefMapView`, `XrefMapDialog` | graph creation in `xref.py`; dialog opening in `mainwindow.py` |
 | Editor blocks, tabs, autosave, undo/redo | `widgets.py`: `CodeEdit`, section widgets, `FileTab` | rendering and callbacks in `mainwindow.py` |
 | Project tree, active tabs, rendering, menus, Git/LSP routing | `mainwindow.py`: `MainWindow` | the service module called by the relevant method |
 | Snapshots, review/apply/rollback, file watching, create/rename/trash | `workspace.py` | review UI in `widgets.py`; orchestration in `mainwindow.py` |
@@ -32,7 +32,8 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 | LSP transport/configuration | `lsp.py` | request and fallback handling in `mainwindow.py` |
 | Theme or top-level visual constants | `theme.py` | each widget's `apply_style` method |
 | Modal forms | `dialogs.py` | caller in `mainwindow.py` |
-| Git status parsing | `gitutil.py` | Git commands/UI in `mainwindow.py` |
+| Git status parsing | `gitutil.py` | Git actions in `gitops.py` |
+| Git diff/stage/commit/branch actions | `gitops.py`: `GitOpsMixin` | status parsing in `gitutil.py`; commit dialog in `dialogs.py` |
 
 ## Files
 
@@ -43,17 +44,19 @@ The dependency direction is toward the deterministic service modules. `mainwindo
 - `kant/xref.py` — deterministic project-wide graph of KANT elements and identifier references.
 - `kant/projectops.py` — pure project scans and generated KANT map validation.
 - `kant/workspace.py` — trust boundary for filesystem watching/mutation and AI snapshot review/rollback.
-- `kant/widgets.py` — reusable Qt UI, agent terminal, review card, file tabs, and all MAPPA graphics.
+- `kant/widgets.py` — reusable Qt UI, agent terminal, review card, file tabs.
+- `kant/mappa.py` — MAPPA: layout algorithm, graph graphics items, `XrefMapView`, `XrefMapDialog`.
 - `kant/mainwindow.py` — application state and orchestration. Search its region headings or `AI-NAV` before reading linearly.
 - `kant/lsp.py` — JSON-RPC/LSP process lifecycle and document synchronization.
 - `kant/gitutil.py` — small read-only Git helpers.
+- `kant/gitops.py` — `GitOpsMixin`: status refresh, diff/stage, commit, branch switch, mixed into `MainWindow`.
 - `kant/dialogs.py` — themed modal forms mixed into `MainWindow`.
 - `kant/aipermissions.py` — authenticated localhost permission bridge owned by the IDE.
 - `kant/permission_mcp.py` — dependency-free stdio MCP process used by Claude Code.
 - `kant/theme.py` — live theme globals, styles, tag colors, limits, ignored directories.
-- `test_kant_smoke.py` — single offscreen integration/regression check.
+- `test_kant_smoke.py` — offscreen integration/regression checks, one `test_*` method per feature area.
 - `DESIGN.md` — invariants, data flow, and rationale; not a second file index.
-- `index.html` — legacy browser prototype, outside the Python runtime.
+- `legacy/index.html` — legacy browser prototype, outside the Python runtime.
 
 ## End-to-end flows
 

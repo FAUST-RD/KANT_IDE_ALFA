@@ -7,7 +7,7 @@ Read `PROJECT_MAP.md` first. It is the authoritative routing table for this repo
 1. Search for the public class/function named in `PROJECT_MAP.md`.
 2. In large files, search for `AI-NAV`, `[FN CATEGORY]`, or the nearest `# ----` region heading.
 3. Trace callers before editing shared parser, save, workspace, or xref code.
-4. Ignore `index.html` unless the task explicitly targets the legacy browser prototype.
+4. Ignore `legacy/index.html` unless the task explicitly targets the legacy browser prototype.
 
 ## Boundaries
 

@@ -14,7 +14,7 @@ KANT IDE is a desktop editor for source files containing structural comment mark
 [TAG CLOSED #stable-id] name
 ```
 
-The editor turns those markers into an outline, editable section views, Incoming/Outgoing lists, and a project graph. The Python/PySide6 application is current; `index.html` is a legacy prototype.
+The editor turns those markers into an outline, editable section views, Incoming/Outgoing lists, and a project graph. The Python/PySide6 application is current; `legacy/index.html` is a legacy prototype.
 
 ## Architecture
 
@@ -29,7 +29,9 @@ entry point
 
 - Deterministic services (`model`, `fileio`, `syntax`, `xref`, `gitutil`, `projectops`) do not depend on application UI state.
 - `workspace.py` is the filesystem trust boundary and is mixed into `MainWindow`.
+- `gitops.py` holds `GitOpsMixin` (diff/stage/commit/branch actions), mixed into `MainWindow` the same way — split out to keep `mainwindow.py` from growing indefinitely, not because git actions have a second consumer.
 - `widgets.py` owns reusable Qt components and exposes signals/callbacks.
+- `mappa.py` owns the MAPPA subsystem (layout algorithm, graph graphics items, `XrefMapView`, `XrefMapDialog`) — split out of `widgets.py` since it alone was roughly half that file's line count and depends only on `xref.py`'s graph, not on any other widget.
 - `mainwindow.py` owns application state, connects components, schedules background work, and invalidates derived state.
 - `kant_editor.py` starts the app and retains compatibility re-exports; feature code does not belong there.
 
@@ -102,7 +104,7 @@ Comments should help future contributors and coding agents decide where to look 
 
 ## Verification strategy
 
-There is one runnable offscreen regression check rather than a large test hierarchy:
+One offscreen regression file (`test_kant_smoke.py`), one focused `test_*` method per feature area rather than a single end-to-end test — a failing assertion names the feature that broke, and `pytest test_kant_smoke.py -k <name>` runs just it:
 
 ```powershell
 python -m compileall -q kant kant_editor.py test_kant_smoke.py

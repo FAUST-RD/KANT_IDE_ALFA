@@ -1,7 +1,10 @@
 """KANT Editor entry point. Application code lives in the kant package."""
+import datetime
 import sys
+import traceback
+from pathlib import Path
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from kant.model import parse_kant, serialize_kant, read_top_level_label_result, Node, KantParseError
 from kant.fileio import is_safe_child_name
@@ -10,6 +13,41 @@ from kant.xref import build_xref
 from kant.gitutil import parse_git_status
 from kant.widgets import make_star_icon, CodeEdit
 from kant.mainwindow import MainWindow
+
+
+CRASH_LOG_DIR = Path.home() / '.kant_ide' / 'crash_logs'
+
+
+# [FN CATEGORY] _install_crash_handler — PySide6 routes an exception raised inside a Qt slot/event
+# handler through sys.excepthook same as any other uncaught exception, so replacing it here is
+# enough to catch both startup failures (_self_check, MainWindow construction) and runtime crashes
+# during the event loop. Without this, a windowed launch (no attached console, e.g. a future
+# double-clicked .exe) would just have the app vanish with zero visible error for the user.
+# [FN] _install_crash_handler — writes a crash log and shows an error dialog on any uncaught exception
+# [FN OPEN] _install_crash_handler
+def _install_crash_handler():
+    def handle(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        text = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        sys.__excepthook__(exc_type, exc_value, exc_tb)  # still visible when run from a console
+        log_path = None
+        try:
+            CRASH_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = CRASH_LOG_DIR / f'crash_{datetime.datetime.now():%Y%m%d_%H%M%S}.log'
+            log_path.write_text(text, encoding='utf-8')
+        except OSError:
+            pass
+        app = QApplication.instance()
+        if app is None:
+            return
+        detail = f'{exc_type.__name__}: {exc_value}'
+        location = f'\n\nDettagli salvati in:\n{log_path}' if log_path else ''
+        QMessageBox.critical(None, 'KANT IDE — errore imprevisto', f'{detail}{location}')
+
+    sys.excepthook = handle
+# [FN CLOSED] _install_crash_handler
 
 
 # [FN CATEGORY] _self_check — smallest runnable check for the parser: parses a fixture with nested
@@ -175,6 +213,7 @@ def _self_check():
 
 
 def main():
+    _install_crash_handler()
     _self_check()
     app = QApplication(sys.argv)
     app.setWindowIcon(make_star_icon())
