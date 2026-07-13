@@ -1785,9 +1785,14 @@ class FileTab(QWidget):
         self.scroll_area.setStyleSheet(f'border:none; background:{theme.BG};')
 
     def mark_dirty(self):
+        already_dirty = self.dirty
         self.dirty = True
         self.autosave_timer.start(2000)
-        self.dirtyChanged.emit()
+        # dirtyChanged fans out into a real rebuild (tab title HTML + a QTabBar relayout) — this
+        # is called on every keystroke via CodeEdit.textChanged, so re-emitting once already dirty
+        # (i.e. every keystroke after the first) redid all of that for no actual state change
+        if not already_dirty:
+            self.dirtyChanged.emit()
 
     def remember_undo_state(self, coalesce=False):
         now = time.monotonic()
@@ -3282,6 +3287,12 @@ class XrefMapDialog(QDialog):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # generic fallback sizing only — precise full-page alignment (flush with the main
+        # window's own action toolbar/status bar) is MainWindow's job, not this dialog's: it
+        # needs mainwindow-specific coordination ("Application-wide coordination stays in
+        # mainwindow.py", per this module's own docstring), and MainWindow already has the
+        # established pattern for it (see _position_map_dialog, called after every .show() —
+        # not just the first — so it can't go stale like a one-shot flag here would)
         parent = self.parentWidget()
         if not self._positioned and parent is not None:
             self.resize(int(parent.width() * 0.96), int(parent.height() * 0.94))

@@ -17,14 +17,14 @@ from concurrent.futures import ThreadPoolExecutor
 from html import escape as html_escape
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, Qt, QSettings, QSize, Signal, QTimer
+from PySide6.QtCore import QFileSystemWatcher, QPoint, QPointF, Qt, QSettings, QSize, Signal, QTimer
 from PySide6.QtGui import (
-    QColor, QFont, QKeySequence, QShortcut, QTextCursor, QTextDocument,
+    QColor, QFont, QKeySequence, QMouseEvent, QShortcut, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton, QScrollArea,
-    QSizeGrip, QSplitter, QStackedWidget, QTabWidget, QToolButton, QToolTip,
+    QSizeGrip, QSplitter, QStackedWidget, QTabBar, QTabWidget, QToolButton, QToolTip,
     QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
@@ -46,7 +46,7 @@ from kant.workspace import ROLE_PATH, WorkspaceMixin, discard_snapshot, rollback
 from kant.widgets import (
     CodeEdit, TerminalPane, ClaudePane, CollapsibleSection, LeafSection,
     ProjectTree, make_star_icon, TitleBar, FileTab, XrefMapDialog,
-    MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS,
+    MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS, _tag_header_html,
 )
 
 
@@ -85,6 +85,61 @@ class _TreeItemLabel(QLabel):
             self._tree.itemDoubleClicked.emit(self._item, 0)
         event.accept()
 # [FN CLOSED] _TreeItemLabel
+
+
+# [FN CATEGORY] _TabLabel — QTabBar.setTabButton() lets a rich-HTML QLabel replace a tab's plain
+# text, giving the tab strip the same colored/bold "[TAG] name" convention already used in the
+# tree and the coding panel. It selects its own tab on click, then forwards the same press (and
+# any move/release) on to the QTabBar itself — the label now covers the tab's whole visible area,
+# so without forwarding, QTabBar's own mouse handling never sees the press and its built-in
+# drag-to-reorder (tabs are setMovable(True)) stops working from the labeled region entirely.
+# [FN] _TabLabel — a tab-strip label that forwards its own clicks to select its tab
+# [FN OPEN] _TabLabel
+class _TabLabel(QLabel):
+    def __init__(self, tabs, tab):
+        super().__init__()
+        self.setTextFormat(Qt.RichText)
+        self._tabs = tabs
+        self._tab = tab
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._tabs.setCurrentWidget(self._tab)
+        self._forward_to_tab_bar(event)
+
+    def mouseMoveEvent(self, event):
+        self._forward_to_tab_bar(event)
+
+    def mouseReleaseEvent(self, event):
+        self._forward_to_tab_bar(event)
+
+    def _forward_to_tab_bar(self, event):
+        bar = self._tabs.tabBar()
+        pos = self.mapTo(bar, event.position().toPoint())
+        forwarded = QMouseEvent(
+            event.type(), QPointF(pos), event.globalPosition(),
+            event.button(), event.buttons(), event.modifiers(),
+        )
+        QApplication.sendEvent(bar, forwarded)
+        event.accept()
+# [FN CLOSED] _TabLabel
+
+
+# [FN CATEGORY] _KantTabBar — QTabBar's own tabSizeHint only accounts for a tab's text/icon, not a
+# button widget set via setTabButton — with the plain text cleared in favor of _TabLabel, tabs
+# were sizing themselves as if empty and clipping the rich label down to a sliver. This widens the
+# hint to fit the label's own sizeHint plus room for the close button.
+# [FN] _KantTabBar — a QTabBar that sizes tabs to fit their LeftSide button widget
+# [FN OPEN] _KantTabBar
+class _KantTabBar(QTabBar):
+    def tabSizeHint(self, index):
+        size = super().tabSizeHint(index)
+        label = self.tabButton(index, QTabBar.LeftSide)
+        if label is not None:
+            needed = label.sizeHint().width() + 40  # + close button and padding
+            size.setWidth(max(size.width(), needed))
+        return size
+# [FN CLOSED] _KantTabBar
 
 
 # [FN CATEGORY] MainWindow — wires the project tree, the section view and the toolbar together;
@@ -315,6 +370,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             self.size_grip.raise_()
         self._position_map_tab()
         self._position_claude_tab()
+        self._position_map_dialog()
 
     def _position_claude_tab(self):
         if not hasattr(self, 'claude_tab_btn'):
@@ -335,6 +391,24 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             return
         self.map_tab_btn.move((parent.width() - self.map_tab_btn.width()) // 2, parent.height() - self.map_tab_btn.height())
         self.map_tab_btn.raise_()
+
+    # [FN CATEGORY] _position_map_dialog — the MAPPA dialog spans the full page: left/right edges
+    # match this window's own, top sits just under the action toolbar (the Save row), bottom sits
+    # just above the status bar (the UTF-8 row). Lives here (not in XrefMapDialog itself) because
+    # it needs this window's own action_toolbar/statusBar — the same "coordination stays in
+    # mainwindow.py" boundary _position_map_tab already follows for the dialog's drawer-handle
+    # button. Called every time the dialog is (re)opened, not just once, so resizing or moving
+    # this window between an MAPPA close and reopen doesn't leave the dialog at a stale rectangle.
+    # [FN] _position_map_dialog — aligns the MAPPA dialog to the toolbar/status-bar band
+    # [FN OPEN] _position_map_dialog
+    def _position_map_dialog(self):
+        if self.map_dialog is None or not self.map_dialog.isVisible():
+            return
+        top = self.action_toolbar.mapToGlobal(QPoint(0, self.action_toolbar.height())).y()
+        bottom = self.statusBar().mapToGlobal(QPoint(0, 0)).y()
+        left = self.mapToGlobal(QPoint(0, 0)).x()
+        self.map_dialog.setGeometry(left, top, self.width(), bottom - top)
+    # [FN CLOSED] _position_map_dialog
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -551,6 +625,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         # each open file is a tab (FileTab) with its own scroll area/view/dirty state; switching
         # tabs is just switching the QTabWidget's current index, nothing to rebuild
         self.tabs = QTabWidget()
+        self.tabs.setTabBar(_KantTabBar())
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
@@ -1218,6 +1293,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         project_name = os.path.basename(self.project_root_path) if self.project_root_path else ''
         self.map_dialog.set_graph(self._get_xref(), project_name, self.project_root_path or '')
         self.map_dialog.show()
+        self._position_map_dialog()
         self.map_dialog.raise_()
         self.map_dialog.activateWindow()
         self.map_tab_btn.setParent(self.map_dialog)
@@ -1738,8 +1814,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             f'<span style="font-weight:{weight}">{html_escape(text)}</span>{git_html}{detail_html}'
         )
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
-        lbl.setMargin(2)
-        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:1px 4px;')
+        lbl.setMargin(0)
+        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:0px 4px;')
         lbl.setWordWrap(True)  # long labels wrap instead of overflowing the column
         lbl.setCursor(Qt.PointingHandCursor)
         return lbl
@@ -1777,7 +1853,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             f'{html_escape(name)} <span style="color:{theme.DIM}">{html_escape(str(error))}</span>'
         )
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
-        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:1px 4px;')
+        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:0px 4px;')
         lbl.setWordWrap(True)
         lbl.setCursor(Qt.PointingHandCursor)
         return lbl
@@ -1789,7 +1865,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         )
         lbl = _TreeItemLabel(self.tree, item, html_escape(name) + git_html)
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
-        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:1px 4px;')
+        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:0px 4px;')
         lbl.setWordWrap(True)
         lbl.setCursor(Qt.PointingHandCursor)
         return lbl
@@ -1956,25 +2032,63 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                 return False
         return True
 
-    # [FN] _kant_identity_text — "[TAG] name/desc" for whatever's isolated in tab, or (optionally)
-    # the file's own top-level KANT tag when nothing is; None when neither is available
-    # [FN OPEN] _kant_identity_text
-    def _kant_identity_text(self, tab, fallback_to_top_level=False):
+    # [FN] _kant_identity_node — the node whose identity a tab should be shown by: whatever's
+    # isolated, or (optionally) the file's own top-level KANT node when nothing is; None when
+    # neither is available (untagged/unparseable file)
+    # [FN OPEN] _kant_identity_node
+    def _kant_identity_node(self, tab, fallback_to_top_level=False):
         node = self._find_node_by_uid(tab.tree, tab.filter_uid) if tab.filter_uid else None
         if node is None and fallback_to_top_level:
             node = next((n for n in tab.tree.body if isinstance(n, Node)), None)
-        return f'[{node.tag}] {node.desc or node.name}' if node is not None else None
-    # [FN CLOSED] _kant_identity_text
+        return node
+    # [FN CLOSED] _kant_identity_node
 
+    def _kant_identity_text(self, tab, fallback_to_top_level=False):
+        node = self._kant_identity_node(tab, fallback_to_top_level)
+        return f'[{node.tag}] {node.desc or node.name}' if node is not None else None
+
+    # [FN CATEGORY] _update_tab_title — the main tab is titled by the KANT identity of whatever
+    # it's isolated on, or the file's own top-level tag in whole-file view — matching the title
+    # bar and split pane header, which both already do this. It uses the same colored/bold
+    # "[TAG] name" convention as the tree and coding panel too, via a rich-HTML label swapped in
+    # for the tab's plain text (see _TabLabel) — only an untagged/unparseable file falls back to
+    # plain filename text, since there's no tag to color.
+    # [FN] _update_tab_title — refreshes a tab's label to match what it's currently showing
+    # [FN OPEN] _update_tab_title
     def _update_tab_title(self, tab):
         idx = self.tabs.indexOf(tab)
         if idx == -1:
             return
-        # a tab is titled by the KANT identity of whatever it's isolated on, or the file's own
-        # top-level tag in whole-file view — matching the title bar and split pane header, which
-        # both already do this. Only an untagged/unparseable file falls back to the raw filename.
-        name = self._kant_identity_text(tab, fallback_to_top_level=True) or os.path.basename(tab.path)
-        self.tabs.setTabText(idx, (name + ' ●') if tab.dirty else name)
+        bar = self.tabs.tabBar()
+        node = self._kant_identity_node(tab, fallback_to_top_level=True)
+        if node is None:
+            if getattr(tab, '_tab_label', None) is not None:
+                bar.setTabButton(idx, QTabBar.LeftSide, None)
+                # setTabButton only detaches/hides the old widget, it doesn't delete it — without
+                # this, every tag<->untagged transition on this tab leaked one hidden orphaned
+                # QLabel, never freed until the whole tab bar (window) closes
+                tab._tab_label.deleteLater()
+                tab._tab_label = None
+            name = os.path.basename(tab.path)
+            self.tabs.setTabText(idx, (name + ' ●') if tab.dirty else name)
+            return
+        html = _tag_header_html(node.tag, node.name, node.desc, bold_name=True)
+        if tab.dirty:
+            html += f' <span style="color:{theme.ACCENT}">●</span>'
+        if getattr(tab, '_tab_label', None) is None:
+            tab._tab_label = _TabLabel(self.tabs, tab)
+        # set the text BEFORE (re-)registering the button — QTabBar computes its tab layout
+        # against the button's sizeHint at registration time, not on later in-place text changes,
+        # so re-registering after every text update is what keeps the tab wide enough for it
+        tab._tab_label.setText(html)
+        tab._tab_label.adjustSize()
+        bar.setTabButton(idx, QTabBar.LeftSide, tab._tab_label)
+        # re-registering the SAME widget instance at a position it already occupies makes Qt hide
+        # it internally without a matching re-show (a real, reproduced bug — every theme refresh
+        # or repeated _update_tab_title call left the label blank), so force it visible again here
+        tab._tab_label.show()
+        self.tabs.setTabText(idx, '')
+    # [FN CLOSED] _update_tab_title
 
     def _on_tab_dirty_changed(self, tab):
         self._update_tab_title(tab)

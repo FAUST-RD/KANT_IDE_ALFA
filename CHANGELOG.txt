@@ -1,5 +1,26 @@
 KANT IDE changelog
 
+2026-07-13 (17)
+- Fixed a performance bug: mark_dirty() fired dirtyChanged on every keystroke, not just the first one after a save, cascading into a full tab-title HTML rebuild and QTabBar relayout on every single keystroke while a file stayed dirty. Now only emits on the clean-to-dirty edge.
+- Fixed tab drag-to-reorder: the rich-HTML tab label (added in round 12) covered the tab's whole clickable area and swallowed every mouse press, silently breaking the tab strip's native drag-to-reorder. The label now forwards press/move/release to the underlying QTabBar after handling its own click-to-select.
+- Fixed the MAPPA dialog going stale after a resize: its full-page alignment (added in round 16) was computed once behind a one-shot flag, so resizing the main window and reopening MAPPA kept the old geometry. Positioning now lives in MainWindow (mirroring the existing map-tab pattern) and is recomputed on every open plus on live resize.
+- Fixed a widget leak: transitioning a tab between tagged and untagged state dropped the old tab-label widget's only reference without deleteLater(), leaking one hidden QLabel per transition.
+
+2026-07-13 (16)
+- The MAPPA window now spans the full page instead of a centered ~96%x94% box: left/right edges match the main window, top sits just under the action toolbar (the Save row), bottom sits just above the status bar (the UTF-8 row).
+
+2026-07-13 (15)
+- Reverted the previous round's auto-expand: file items in the KANT elements panel start collapsed again, per feedback — compact by default, expand on demand.
+
+2026-07-13 (14)
+- Fixed a real bug from the previous tab-label change: re-registering the SAME _tab_label widget via setTabButton (needed every call so the tab stays sized to fit it) made Qt hide it internally with no matching re-show — every theme refresh (or any second title update for the same tab) left the tab blank white instead of showing the colored badge and name. Fixed by explicitly re-showing the label after each re-registration.
+
+2026-07-13 (13)
+- Reduced dead space in the KANT elements panel: a file's tree item now starts expanded, showing its top-level sections immediately instead of leaving the panel mostly empty behind a collapsed row. Also trimmed the leftover per-row label margin/padding, dropping row height from 26px to 20px.
+
+2026-07-13 (12)
+- The main tab's title (next to its own closing x) now uses the same colored/bold "[TAG] name" convention as the tree and coding panel, not plain text — QTabWidget's native tab text can't render rich HTML, so a small tab-strip label (_TabLabel) replaces it, with a custom QTabBar (_KantTabBar) sizing the tab to fit it. Clicking the label still switches to that tab (same click-forwarding pattern already used for tree rows, since WA_TransparentForMouseEvents pass-through proved unreliable there too).
+
 2026-07-13 (11)
 - The coding panel no longer repeats the "[TAG] name" title for the outermost element of an isolated/whole-file view — that identity is already announced by the tab title, split header, and title bar (which already share one format), so showing it a third time inline was pure redundancy. The panel now starts directly with the category description instead. Nested elements (anything that isn't the one actually being isolated) keep their own header, since nothing else names them.
 

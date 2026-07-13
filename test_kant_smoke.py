@@ -11,8 +11,11 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QEvent, QPointF, QSettings
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QGraphicsItem, QLabel, QListWidget, QToolButton, QToolTip, QTreeWidgetItem
+from PySide6.QtWidgets import (
+    QApplication, QGraphicsItem, QLabel, QListWidget, QTabBar, QToolButton, QToolTip, QTreeWidgetItem,
+)
 
+from kant import theme
 from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID
 from kant.lsp import file_uri, LspClient
 from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
@@ -193,6 +196,12 @@ def main():
         tree_window._build_project_tree(tree_window.tree.invisibleRootItem(), str(root))
         top_kinds = [tree_window.tree.topLevelItem(i).data(0, ROLE_KIND) for i in range(tree_window.tree.topLevelItemCount())]
         assert 'dir' not in top_kinds and 'file' in top_kinds and 'invalidfile' in top_kinds
+        # a file item starts collapsed — compact by default, expand on demand
+        file_item = next(
+            tree_window.tree.topLevelItem(i) for i in range(tree_window.tree.topLevelItemCount())
+            if tree_window.tree.topLevelItem(i).data(0, ROLE_KIND) == 'file'
+        )
+        assert not file_item.isExpanded()
         assert 'ERRORI' in tree_window._validate_kant_project()
         assert tree_window.results_view.topLevelItemCount() == 1
         assert tree_window._open_file(str(source))
@@ -225,6 +234,12 @@ def main():
         ]), encoding='utf-8')
         tree_window.tree.clear()
         tree_window._build_project_tree(tree_window.tree.invisibleRootItem(), str(root))
+        legacy_file_item = next(
+            tree_window.tree.invisibleRootItem().child(i)
+            for i in range(tree_window.tree.invisibleRootItem().childCount())
+            if tree_window.tree.invisibleRootItem().child(i).data(0, ROLE_PATH) == str(legacy)
+        )
+        assert not legacy_file_item.isExpanded() and legacy_file_item.childCount() == 2  # collapsed by default, alpha+beta still built underneath
         beta_item = None
         it = tree_window.tree.invisibleRootItem()
         stack = [it.child(i) for i in range(it.childCount())]
@@ -245,9 +260,28 @@ def main():
         assert isolated_codes == ['def beta(): pass']  # not alpha too — the whole-file fallback would show both
 
         # the main tab's own title (next to its close x) follows the isolated KANT element's
-        # identity too, not the filename — matching the split pane's header convention
+        # identity too, not the filename — matching the split pane's header convention. The plain
+        # tab text is cleared in favor of a rich-HTML label (_tab_label) using the same
+        # colored/bold "[TAG] name" convention as the tree and coding panel.
         legacy_idx = tree_window.tabs.indexOf(legacy_tab)
-        assert tree_window.tabs.tabText(legacy_idx) == '[FN] beta'
+        assert tree_window.tabs.tabText(legacy_idx) == ''
+        tab_label_html = legacy_tab._tab_label.text()
+        assert '[FN]' in tab_label_html and '<b>beta</b>' in tab_label_html  # bold name
+        assert f'background-color:{theme.TAG_BACKGROUNDS["FN"]}' in tab_label_html  # colored tag badge
+        assert tree_window.tabs.tabBar().tabButton(legacy_idx, QTabBar.LeftSide) is legacy_tab._tab_label
+        # clicking the label (not the tab strip itself) must still switch to that tab
+        tree_window.tabs.setCurrentIndex(0 if tree_window.tabs.currentIndex() == legacy_idx else legacy_idx)
+        assert tree_window.tabs.currentWidget() is not legacy_tab
+        legacy_tab._tab_label.mousePressEvent(QMouseEvent(
+            QEvent.MouseButtonPress, QPointF(1, 1), QPointF(1, 1), Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
+        ))
+        assert tree_window.tabs.currentWidget() is legacy_tab
+        # regression: re-registering the SAME _tab_label widget via setTabButton (needed every call
+        # to keep the tab sized to fit it) made Qt hide it internally with no matching re-show —
+        # every theme refresh (or any second _update_tab_title call) left the tab blank
+        assert not legacy_tab._tab_label.isHidden()
+        tree_window._update_tab_title(legacy_tab)
+        assert not legacy_tab._tab_label.isHidden()
 
         # the title bar's own slot shows the KANT identity too, not the filename — the filename
         # itself now lives in file_path_label, on the Incoming/Outgoing row
@@ -256,7 +290,8 @@ def main():
         tree_window._render_view(legacy_tab, None)
         # whole-file view: both the tab and the title bar show the file's own top-level KANT tag,
         # not the raw filename — a module's identity is "[MOD] legacy.py", not just "legacy.py"
-        assert tree_window.tabs.tabText(legacy_idx) == '[MOD] legacy.py'
+        assert tree_window.tabs.tabText(legacy_idx) == ''
+        assert '[MOD]' in legacy_tab._tab_label.text() and 'legacy.py' in legacy_tab._tab_label.text()
         assert tree_window.filename_label.text() == '[MOD] legacy.py'
         assert tree_window.file_path_label.text() == 'legacy.py'
 
@@ -317,6 +352,85 @@ def main():
         assert tree_window.split_panel.isHidden() and tree_window.split_tab is None
         tree_window.close()
 
+        # the MAPPA window spans the full page: left/right edges of the main window, top just
+        # under the action toolbar (Save row), bottom just above the status bar (UTF-8 row) —
+        # needs a real shown/laid-out window, unlike tree_window above, since it reads real
+        # on-screen positions via mapToGlobal. Clears any windowGeometry saved by an earlier run
+        # first — MainWindow.__init__ restores it, which would otherwise override the resize below
+        # once the window is actually realized on screen.
+        # wide enough that the MAPPA toolbar's own minimum content width (many buttons) never
+        # forces the dialog wider than the window — otherwise Qt can't honor the requested width
+        QSettings('KANT', 'KANT Editor').remove('windowGeometry')
+        mappa_window = MainWindow()
+        mappa_window.resize(2000, 900)
+        mappa_window.show()
+        app.processEvents()
+        window_width_at_show = mappa_window.width()  # same moment showEvent reads parent.width()
+        mappa_window.project_root_path = str(root)
+        mappa_window._open_xref_window()
+        app.processEvents()
+        dialog = mappa_window.map_dialog
+        toolbar_bottom = mappa_window.action_toolbar.mapToGlobal(mappa_window.action_toolbar.rect().bottomLeft()).y()
+        status_top = mappa_window.statusBar().mapToGlobal(mappa_window.statusBar().rect().topLeft()).y()
+        assert abs(dialog.geometry().top() - toolbar_bottom) <= 1
+        assert abs(dialog.geometry().bottom() - status_top) <= 1
+        assert dialog.width() == window_width_at_show
+
+        # regression: the alignment used to be computed once (a _positioned flag in
+        # XrefMapDialog.showEvent) and never redone — resizing the main window, closing MAPPA,
+        # and reopening it kept the stale old geometry. Positioning now lives in MainWindow
+        # (_position_map_dialog), called on every open, not just the first.
+        mappa_window._toggle_xref_window()  # close
+        app.processEvents()
+        # must stay above the MAPPA toolbar's own minimum content width (many buttons), same
+        # constraint as window_width_at_show above, or Qt can't honor the narrower resize
+        mappa_window.resize(2300, 1000)
+        app.processEvents()
+        mappa_window._open_xref_window()  # reopen
+        app.processEvents()
+        new_toolbar_bottom = mappa_window.action_toolbar.mapToGlobal(mappa_window.action_toolbar.rect().bottomLeft()).y()
+        new_status_top = mappa_window.statusBar().mapToGlobal(mappa_window.statusBar().rect().topLeft()).y()
+        assert dialog.width() == mappa_window.width()
+        assert abs(dialog.geometry().top() - new_toolbar_bottom) <= 1
+        assert abs(dialog.geometry().bottom() - new_status_top) <= 1
+
+        # regression: dragging a tab by its rich-HTML label used to be swallowed entirely (the
+        # label accepted every press without forwarding to the QTabBar), breaking setMovable(True)
+        # tabs' built-in reorder gesture from the labeled region — now the exact same press/move/
+        # release sequence is forwarded to the tab bar so its native drag still fires.
+        tag_a = source_dir / 'taga.py'
+        tag_b = source_dir / 'tagb.py'
+        tag_a.write_text('# [MOD OPEN] taga.py\nx=1\n# [MOD CLOSED] taga.py\n', encoding='utf-8')
+        tag_b.write_text('# [MOD OPEN] tagb.py\nx=1\n# [MOD CLOSED] tagb.py\n', encoding='utf-8')
+        mappa_window._open_file(str(tag_a))
+        mappa_window._open_file(str(tag_b))
+        app.processEvents()
+        tab_a = mappa_window.open_tabs[str(tag_a)]
+        tab_b = mappa_window.open_tabs[str(tag_b)]
+        idx_a, idx_b = mappa_window.tabs.indexOf(tab_a), mappa_window.tabs.indexOf(tab_b)
+        assert idx_a < idx_b  # opened in this order
+        label_a = tab_a._tab_label
+        start = label_a.rect().center()
+        mid = label_a.mapFromGlobal(tab_b._tab_label.mapToGlobal(tab_b._tab_label.rect().center()))
+        QTest.mousePress(label_a, Qt.LeftButton, Qt.NoModifier, start)
+        app.processEvents()
+        QTest.mouseMove(label_a, mid)
+        app.processEvents()
+        QTest.mouseRelease(label_a, Qt.LeftButton, Qt.NoModifier, mid)
+        app.processEvents()
+        assert mappa_window.tabs.indexOf(tab_a) > mappa_window.tabs.indexOf(tab_b)  # actually reordered
+
+        # regression: transitioning a tab from tagged to untagged used to drop the old _tab_label
+        # widget's only Python reference without deleteLater() — an orphaned hidden QLabel per
+        # transition, never freed until the whole window closed
+        tag_a.write_text('x = 1\n', encoding='utf-8')  # strip the KANT tag entirely
+        mappa_window._on_fs_file_changed(str(tag_a))
+        mappa_window._update_tab_title(tab_a)
+        assert tab_a._tab_label is None
+        final_idx_a = mappa_window.tabs.indexOf(tab_a)  # reorder above may have moved it
+        assert mappa_window.tabs.tabBar().tabButton(final_idx_a, QTabBar.LeftSide) is None
+        mappa_window.close()
+
         tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
         top = next(node for node in tab.tree.body if hasattr(node, 'body'))
         run = next(item for item in top.body if isinstance(item, Run))
@@ -324,6 +438,19 @@ def main():
         run.lines = ['print(2)']
         assert tab.undo_file() and 'print(1)' in serialize_kant(tab.tree)
         assert tab.redo_file() and 'print(2)' in serialize_kant(tab.tree)
+
+        # mark_dirty() must only emit dirtyChanged on the false->true edge — it's wired to fire on
+        # every keystroke (CodeEdit.textChanged -> _on_code_changed -> mark_dirty), and dirtyChanged
+        # cascades into a full tab-title HTML rebuild + QTabBar relayout, so re-emitting on every
+        # subsequent keystroke while already dirty redid all of that for no actual change
+        tab.dirty = False
+        dirty_emits = []
+        tab.dirtyChanged.connect(lambda: dirty_emits.append(1))
+        tab.mark_dirty()
+        assert tab.dirty and len(dirty_emits) == 1
+        tab.mark_dirty()
+        tab.mark_dirty()
+        assert len(dirty_emits) == 1  # still dirty from the first call -> no further emits
         tab.autosave_timer.stop()
 
         lsp_window = MainWindow()
