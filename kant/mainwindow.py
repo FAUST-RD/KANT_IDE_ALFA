@@ -17,19 +17,20 @@ from concurrent.futures import ThreadPoolExecutor
 from html import escape as html_escape
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, Qt, QSettings, Signal, QTimer
+from PySide6.QtCore import QFileSystemWatcher, Qt, QSettings, QSize, Signal, QTimer
 from PySide6.QtGui import (
     QColor, QFont, QKeySequence, QShortcut, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton,
-    QSizeGrip, QSplitter, QStackedWidget, QTabWidget,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton, QScrollArea,
+    QSizeGrip, QSplitter, QStackedWidget, QTabWidget, QToolButton, QToolTip,
     QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
 from kant import theme
 from kant.theme import set_theme
+from kant.icons import draw_icon
 from kant.model import Run, Node, parse_kant, serialize_kant, read_top_level_label, read_top_level_label_result, KantParseError
 from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending
 from kant.syntax import check_file_syntax, run_command_for_path
@@ -59,6 +60,31 @@ ROLE_KEY = Qt.UserRole + 7   # xref element key '<rel_path>::<uid>', on Incoming
 # document order (pre-order over tagged nodes, matching _nodes_in_order) of a 'section' tree item —
 # the reliable fallback when a legacy (no #id) file's uid doesn't survive _open_file's own reparse
 ROLE_ORDER = Qt.UserRole + 8
+
+
+# [FN CATEGORY] _TreeItemLabel — tree rows use setItemWidget with a rich-HTML QLabel instead of plain
+# item text (for colored tag badges); WA_TransparentForMouseEvents alone was unreliable for getting
+# clicks through to the QTreeWidget's own itemClicked/itemDoubleClicked, so this label forwards
+# clicks to its own item directly instead of depending on hit-test pass-through.
+# [FN] _TreeItemLabel — a tree-row label that forwards its own clicks to the owning QTreeWidgetItem
+# [FN OPEN] _TreeItemLabel
+class _TreeItemLabel(QLabel):
+    def __init__(self, tree, item, html):
+        super().__init__(html)
+        self._tree = tree
+        self._item = item
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._tree.setCurrentItem(self._item)
+            self._tree.itemClicked.emit(self._item, 0)
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._tree.itemDoubleClicked.emit(self._item, 0)
+        event.accept()
+# [FN CLOSED] _TreeItemLabel
 
 
 # [FN CATEGORY] MainWindow — wires the project tree, the section view and the toolbar together;
@@ -101,6 +127,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self.syntax_timer.timeout.connect(self._update_syntax_status)
         self.lsp_diagnostics = {}
         self.lsp_pending_requests = {}
+        self.lsp_completion_requests = {}  # request_id -> the specific CodeEdit awaiting its popup
+        self.lsp_hover_requests = {}  # request_id -> (edit, global_pos) awaiting its tooltip
         self.lsp_client = LspClient(self)
         self.lsp_client.diagnosticsChanged.connect(self._on_lsp_diagnostics)
         self.lsp_client.responseReceived.connect(self._on_lsp_response)
@@ -134,6 +162,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         # keep short aliases so the rest of MainWindow doesn't need to know that
         self.filename_label = self.title_bar.filename_label
         self.syntax_label = self.title_bar.syntax_label
+        # its own row, not squeezed into the title bar — that row's essential window chrome
+        # (minimize/maximize/close) was getting crowded out once these were added there
+        shell_layout.addWidget(self._build_action_toolbar())
 
         self.stack = QStackedWidget()
         shell_layout.addWidget(self.stack, 1)
@@ -357,6 +388,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             self.claude_pane.apply_style()
             self._style_io_tabs()
             self._style_view_mode_bar()
+            self._style_action_toolbar()
             self._style_find_bar()
             self._style_status_bar()
             self._update_kant_map_label()
@@ -366,6 +398,47 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             if self.active_tab is not None:
                 self._update_io_tabs(self.active_tab.filter_uid)
         self._refresh_recent_folders()
+
+    # [FN CATEGORY] _build_action_toolbar — a persistent one-click icon row for the highest-
+    # frequency actions (Save/Undo/Redo/Run/Find), in its own row below the title bar rather than
+    # squeezed into it — the title bar's own essential window chrome (minimize/maximize/close) was
+    # getting crowded out once these were added there. The File/Search/LSP menus stay too, for
+    # discoverability and the lower-frequency actions; these are just a faster path to the same
+    # window methods.
+    # [FN] _build_action_toolbar — builds the Save/Undo/Redo/Run/Find icon row
+    # [FN OPEN] _build_action_toolbar
+    def _build_action_toolbar(self):
+        bar = QWidget()
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(10, 5, 10, 5)
+        layout.setSpacing(4)
+        self.action_toolbar_buttons = {}
+        for key, tooltip, callback in (
+            ('save', 'Salva (Ctrl+S)', self._save_file),
+            ('undo', 'Annulla file (Ctrl+Z)', self._undo_file),
+            ('redo', 'Ripeti file (Ctrl+Y)', self._redo_file),
+            ('run', 'Esegui (F5)', self._run_current_file),
+            ('find', 'Trova nel file (Ctrl+F)', self._show_find_bar),
+        ):
+            btn = QToolButton()
+            btn.setIcon(draw_icon(key, 18))
+            btn.setIconSize(QSize(18, 18))
+            btn.setToolTip(tooltip)
+            btn.setFixedSize(32, 28)
+            btn.clicked.connect(callback)
+            layout.addWidget(btn)
+            self.action_toolbar_buttons[key] = btn
+        layout.addStretch(1)
+        self.action_toolbar = bar
+        self._style_action_toolbar()
+        return bar
+    # [FN CLOSED] _build_action_toolbar
+
+    def _style_action_toolbar(self):
+        self.action_toolbar.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
+        style = theme.BUTTON_STYLE.replace('QPushButton', 'QToolButton').replace('padding:7px 13px;', 'padding:4px;')
+        for btn in self.action_toolbar_buttons.values():
+            btn.setStyleSheet(style)
 
     def _build_welcome_page(self):
         page = QWidget()
@@ -455,7 +528,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         # drawer handle) rather than a button buried in the tree panel; clicking it again while
         # the map is open closes it back down. Parented directly to the shell (not the stack) so
         # it stays put and clickable regardless of which page/tab is showing underneath.
-        self.map_tab_btn = QPushButton('▲ MAPPA', self.shell)
+        self.map_tab_btn = QPushButton(' MAPPA', self.shell)
+        self.map_tab_btn.setIcon(draw_icon('arrow-up', 12))
+        self.map_tab_btn.setIconSize(QSize(12, 12))
         self.map_tab_btn.setFixedSize(96, 22)
         self.map_tab_btn.setCursor(Qt.PointingHandCursor)
         self.map_tab_btn.clicked.connect(self._toggle_xref_window)
@@ -464,7 +539,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         # same tab-on-the-edge pattern as MAPPA's, but on the right edge for the AI terminal pane:
         # one button whose arrow flips between flattening the pane to zero width and restoring it
         self._claude_pane_width = None
-        self.claude_tab_btn = QPushButton('◀', self.shell)
+        self.claude_tab_btn = QPushButton('', self.shell)
+        self.claude_tab_btn.setIcon(draw_icon('arrow-left', 14))
+        self.claude_tab_btn.setIconSize(QSize(14, 14))
         self.claude_tab_btn.setFixedSize(22, 90)
         self.claude_tab_btn.setCursor(Qt.PointingHandCursor)
         self.claude_tab_btn.setToolTip('Comprimi/espandi il terminale AI')
@@ -480,12 +557,29 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(self._on_active_tab_changed)
 
+        self.tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
+        self.split_tab = None   # FileTab currently rendered in the split pane, or None if closed
+        self.split_uid = None   # which of its KANT elements is isolated there (None = whole file)
+        self.split_panel, self.split_view_layout = self._build_split_panel()
+
+        self.editor_splitter = QSplitter(Qt.Horizontal)
+        self.editor_splitter.addWidget(self.tabs)
+        self.editor_splitter.addWidget(self.split_panel)
+        self.editor_splitter.setStretchFactor(0, 1)
+        self.editor_splitter.setStretchFactor(1, 1)
+        saved_editor_sizes = self.settings.value('editorSplitterSizes')
+        if saved_editor_sizes and len(saved_editor_sizes) == 2:
+            self.editor_splitter.setSizes([int(x) for x in saved_editor_sizes])
+        self.editor_splitter.splitterMoved.connect(
+            lambda *_: self.settings.setValue('editorSplitterSizes', self.editor_splitter.sizes())
+        )
+
         view_panel = QWidget()
         view_panel_layout = QVBoxLayout(view_panel)
         view_panel_layout.setContentsMargins(0, 0, 0, 0)
         view_panel_layout.setSpacing(0)
         view_panel_layout.addWidget(self._build_find_bar())
-        view_panel_layout.addWidget(self.tabs, 1)
+        view_panel_layout.addWidget(self.editor_splitter, 1)
         self.io_tabs = self._build_io_tabs()
         view_panel_layout.addWidget(self.io_tabs)
 
@@ -615,7 +709,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         layout.addWidget(self.code_view_btn)
         layout.addWidget(self.file_view_btn)
         layout.addStretch(1)
-        self.global_mode_btn = QPushButton('GLOBAL')
+        self.global_mode_btn = QPushButton(' GLOBAL')
+        self.global_mode_btn.setIcon(draw_icon('globe', 14))
+        self.global_mode_btn.setIconSize(QSize(14, 14))
         self.global_mode_btn.setCheckable(True)
         self.global_mode_btn.setToolTip(
             "Se disattivo (default), i messaggi in chat AI includono un riferimento nascosto al file/elemento "
@@ -678,6 +774,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self.title_bar.validate_kant_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.run_menu_action.setEnabled(has_tab)
         self.title_bar.find_menu_action.setEnabled(has_tab)
+        self.action_toolbar_buttons['save'].setEnabled(has_tab)
+        self.action_toolbar_buttons['undo'].setEnabled(bool(has_tab and self.active_tab.undo_stack))
+        self.action_toolbar_buttons['redo'].setEnabled(bool(has_tab and self.active_tab.redo_stack))
+        self.action_toolbar_buttons['run'].setEnabled(has_tab)
+        self.action_toolbar_buttons['find'].setEnabled(has_tab)
         self.title_bar.project_search_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.project_replace_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.git_refresh_menu_action.setEnabled(bool(self.git_root))
@@ -692,6 +793,50 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             self.title_bar.lsp_format_menu_action,
         ):
             action.setEnabled(has_tab)
+
+    # [FN CATEGORY] _build_split_panel — the second coding-panel view, shown side-by-side with the
+    # main tabs. Its identity is a KANT element ("[FN] alpha — file.py"), not a filename tab: it
+    # has no tab strip of its own, just a header naming whatever is currently isolated in it. It
+    # renders straight from the SAME FileTab/Node tree as the main pane (via _build_node_widgets,
+    # already generic over which layout it targets), so editing here shares save/dirty/undo state
+    # with the main pane automatically — it's another view onto the same data, not a duplicate.
+    # Not live-synced against edits made to the same element in the main pane at the same time
+    # (each pane's CodeEdit widgets are separate instances); reopening the element refreshes it.
+    # [FN] _build_split_panel — builds the split pane widget and its content layout
+    # [FN OPEN] _build_split_panel
+    def _build_split_panel(self):
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(0)
+
+        header = QWidget()
+        header.setFixedHeight(28)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 0, 4, 0)
+        self.split_header_label = QLabel('')
+        self.split_header_label.setFont(QFont('Consolas', theme.TREE_FONT_PT, QFont.DemiBold))
+        header_layout.addWidget(self.split_header_label, 1)
+        close_btn = QPushButton('×')
+        close_btn.setFixedSize(22, 20)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.clicked.connect(self._close_split_pane)
+        header_layout.addWidget(close_btn)
+        panel_layout.addWidget(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setAlignment(Qt.AlignTop)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(1)
+        scroll.setWidget(container)
+        panel_layout.addWidget(scroll, 1)
+
+        panel.hide()  # only relevant once something has been opened into it
+        return panel, layout
+    # [FN CLOSED] _build_split_panel
 
     # [FN CATEGORY] _build_find_bar — Ctrl+F search across every CodeEdit currently in the view (the
     # KANT view splits a file into many small editors, so search has to hop between them, not just
@@ -713,12 +858,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self.find_input.setFont(QFont('Consolas', theme.CODE_FONT_PT))
         layout.addWidget(self.find_input, 1)
 
-        prev_btn = QPushButton('▲')
+        prev_btn = QPushButton('')
+        prev_btn.setIcon(draw_icon('arrow-up', 14))
+        prev_btn.setIconSize(QSize(14, 14))
         prev_btn.setFixedWidth(32)
         prev_btn.clicked.connect(self._find_prev)
         layout.addWidget(prev_btn)
 
-        next_btn = QPushButton('▼')
+        next_btn = QPushButton('')
+        next_btn.setIcon(draw_icon('arrow-down', 14))
+        next_btn.setIconSize(QSize(14, 14))
         next_btn.setFixedWidth(32)
         next_btn.clicked.connect(self._find_next)
         layout.addWidget(next_btn)
@@ -746,8 +895,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
             f'border-radius:6px; padding:5px 8px;'
         )
+        icon_button_style = theme.BUTTON_STYLE.replace('padding:7px 13px;', 'padding:4px;')
         for btn in self.find_bar.findChildren(QPushButton):
-            btn.setStyleSheet(theme.BUTTON_STYLE)
+            btn.setStyleSheet(icon_button_style if not btn.text() else theme.BUTTON_STYLE)
 
     def _show_find_bar(self):
         self.find_bar.setVisible(True)
@@ -997,6 +1147,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         for btn in (self.incoming_label_btn, self.outgoing_label_btn):
             label_layout.addWidget(btn)
         label_layout.addStretch(1)
+        # the filename itself lives here, not in the title bar — that slot shows the KANT identity
+        # of whatever's isolated instead (see _update_filename_label)
+        self.file_path_label = QLabel('')
+        self.file_path_label.setStyleSheet(f'color:{theme.DIM};')
+        label_layout.addWidget(self.file_path_label)
         layout.addWidget(label_bar)
 
         panel.setFixedHeight(42)
@@ -1066,7 +1221,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self.map_dialog.raise_()
         self.map_dialog.activateWindow()
         self.map_tab_btn.setParent(self.map_dialog)
-        self.map_tab_btn.setText('▼ MAPPA')
+        self.map_tab_btn.setText(' MAPPA')
+        self.map_tab_btn.setIcon(draw_icon('arrow-down', 12))
         self.map_tab_btn.show()
         self._position_map_tab()
     # [FN CLOSED] _open_xref_window
@@ -1076,7 +1232,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             key = self.map_dialog.selected_key()
             self.map_dialog.hide()
             self.map_tab_btn.setParent(self.shell)
-            self.map_tab_btn.setText('▲ MAPPA')
+            self.map_tab_btn.setText(' MAPPA')
+            self.map_tab_btn.setIcon(draw_icon('arrow-up', 12))
             self.map_tab_btn.show()
             self._position_map_tab()
             if key:
@@ -1096,12 +1253,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         if sizes[1] > 0:
             self._claude_pane_width = sizes[1]
             self.splitter.setSizes([sizes[0] + sizes[1], 0])
-            self.claude_tab_btn.setText('▶')
+            self.claude_tab_btn.setIcon(draw_icon('arrow-right', 14))
         else:
             restore = self._claude_pane_width or 360
             total = sum(sizes)
             self.splitter.setSizes([max(200, total - restore), restore])
-            self.claude_tab_btn.setText('◀')
+            self.claude_tab_btn.setIcon(draw_icon('arrow-left', 14))
     # [FN CLOSED] _toggle_claude_pane
 
     # [FN CATEGORY] _navigate_to_element — jumps the editor to a cross-reference element by its key
@@ -1316,7 +1473,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self._refresh_recent_folders()
         self.stack.setCurrentIndex(0)
         self.map_tab_btn.setParent(self.shell)
-        self.map_tab_btn.setText('▲ MAPPA')
+        self.map_tab_btn.setText(' MAPPA')
+        self.map_tab_btn.setIcon(draw_icon('arrow-up', 12))
         self.map_tab_btn.hide()
         self.claude_tab_btn.hide()
         if self.map_dialog is not None:
@@ -1532,7 +1690,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                 file_item = QTreeWidgetItem(parent_item)
                 file_item.setData(0, ROLE_KIND, 'invalidfile')
                 file_item.setData(0, ROLE_PATH, file_path)
-                self.tree.setItemWidget(file_item, 0, self._invalid_file_label(os.path.basename(file_path), error))
+                self.tree.setItemWidget(file_item, 0, self._invalid_file_label(file_item, os.path.basename(file_path), error))
                 continue
             if label is None:
                 continue  # no KANT tags — only convention-tagged files show up in the tree
@@ -1542,7 +1700,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             file_item.setData(0, ROLE_PATH, file_path)
             self.tree.setItemWidget(
                 file_item, 0, self._tree_label(
-                    tag, desc, bold=True, git_status=self._git_status_for_path(file_path),
+                    file_item, tag, desc, bold=True, git_status=self._git_status_for_path(file_path),
                     detail=top_node.category_desc,
                 )
             )
@@ -1561,10 +1719,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             item.setData(0, ROLE_PATH, path)
             item.setData(0, ROLE_ORDER, order_counter[0])
             order_counter[0] += 1
-            self.tree.setItemWidget(item, 0, self._tree_label(child.tag, child.desc or child.name, detail=child.category_desc))
+            self.tree.setItemWidget(item, 0, self._tree_label(item, child.tag, child.desc or child.name, detail=child.category_desc))
             self._build_outline_items(item, child, path, order_counter)
 
-    def _tree_label(self, tag, text, bold=False, git_status='', detail=''):
+    def _tree_label(self, item, tag, text, bold=False, git_status='', detail=''):
         color = theme.TAG_COLORS.get(tag, theme.TEXT)
         bg = theme.TAG_BACKGROUNDS.get(tag, '#eef2f7')
         weight = '700' if bold else '400'
@@ -1573,7 +1731,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             if git_status else ''
         )
         detail_html = f'<br><span style="color:{theme.DIM}">{html_escape(detail)}</span>' if detail else ''
-        lbl = QLabel(
+        lbl = _TreeItemLabel(
+            self.tree, item,
             f'<span style="color:{color}; background-color:{bg}; font-weight:700; '
             f'padding:0px 4px; border-radius:4px">[{tag}]</span> '
             f'<span style="font-weight:{weight}">{html_escape(text)}</span>{git_html}{detail_html}'
@@ -1582,7 +1741,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         lbl.setMargin(2)
         lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:1px 4px;')
         lbl.setWordWrap(True)  # long labels wrap instead of overflowing the column
-        lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        lbl.setCursor(Qt.PointingHandCursor)
         return lbl
 
     # [FN CATEGORY] _build_plain_project_tree — classic PyCharm-style file browser: every file and
@@ -1608,30 +1767,31 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                 file_item = QTreeWidgetItem(parent_item)
                 file_item.setData(0, ROLE_KIND, 'plainfile')
                 file_item.setData(0, ROLE_PATH, entry.path)
-                self.tree.setItemWidget(file_item, 0, self._plain_file_label(entry.name, self._git_status_for_path(entry.path)))
+                self.tree.setItemWidget(file_item, 0, self._plain_file_label(file_item, entry.name, self._git_status_for_path(entry.path)))
     # [FN CLOSED] _build_plain_project_tree
 
-    def _invalid_file_label(self, name, error):
-        lbl = QLabel(
+    def _invalid_file_label(self, item, name, error):
+        lbl = _TreeItemLabel(
+            self.tree, item,
             f'<span style="color:{theme.TAG_COLORS["TST"]}; font-weight:700">[ERR]</span> '
             f'{html_escape(name)} <span style="color:{theme.DIM}">{html_escape(str(error))}</span>'
         )
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
         lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:1px 4px;')
         lbl.setWordWrap(True)
-        lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        lbl.setCursor(Qt.PointingHandCursor)
         return lbl
 
-    def _plain_file_label(self, name, git_status=''):
+    def _plain_file_label(self, item, name, git_status=''):
         git_html = (
             f' <span style="color:{theme.WARN}; font-weight:700">[{html_escape(git_status)}]</span>'
             if git_status else ''
         )
-        lbl = QLabel(html_escape(name) + git_html)
+        lbl = _TreeItemLabel(self.tree, item, html_escape(name) + git_html)
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
         lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:1px 4px;')
         lbl.setWordWrap(True)
-        lbl.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        lbl.setCursor(Qt.PointingHandCursor)
         return lbl
 
     def _on_tree_item_clicked(self, item, _column):
@@ -1666,6 +1826,76 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             resolved_uid = node.uid if node is not None else uid
             self._render_view(tab, resolved_uid)
             self._update_io_tabs(resolved_uid)
+
+    # [FN CATEGORY] _on_tree_item_double_clicked — sends a file or KANT section to the split pane
+    # instead of the main one. Reuses whatever FileTab is already open for that path rather than
+    # going through _open_file when possible, so double-clicking to populate the split doesn't
+    # also steal focus away from whatever the main pane currently has active.
+    # [FN] _on_tree_item_double_clicked — opens the double-clicked tree item into the split pane
+    # [FN OPEN] _on_tree_item_double_clicked
+    def _on_tree_item_double_clicked(self, item, _column):
+        kind = item.data(0, ROLE_KIND)
+        if kind not in ('file', 'section'):
+            return
+        path = item.data(0, ROLE_PATH)
+        tab = self.open_tabs.get(path)
+        if tab is None:
+            if not self._open_file(path):
+                return
+            tab = self.open_tabs.get(path)
+            if tab is None:
+                return
+        if kind == 'file':
+            self._show_in_split(tab, None)
+            return
+        order = item.data(0, ROLE_ORDER)
+        uid = item.data(0, ROLE_UID)
+        node = self._find_node_by_uid(tab.tree, uid)
+        if node is None and order is not None:
+            nodes = self._nodes_in_order(tab.tree)
+            if order < len(nodes):
+                node = nodes[order]
+        self._show_in_split(tab, node.uid if node is not None else uid)
+    # [FN CLOSED] _on_tree_item_double_clicked
+
+    # [FN CATEGORY] _show_in_split — renders one KANT element (or the whole file, if uid is None)
+    # into the split pane from the same FileTab/Node tree the main pane uses, via the same
+    # _build_node_widgets the main pane's _render_view calls — so editing there marks the same tab
+    # dirty and shares its undo stack. The header names the element itself ("[FN] alpha — a.py"),
+    # not the filename, since the split pane's identity is a KANT element, not a file.
+    # [FN] _show_in_split — displays a KANT element (or whole file) in the split pane
+    # [FN OPEN] _show_in_split
+    def _show_in_split(self, tab, uid):
+        self.split_tab = tab
+        self.split_uid = uid
+        while self.split_view_layout.count():
+            taken = self.split_view_layout.takeAt(0)
+            widget = taken.widget()
+            if widget:
+                widget.deleteLater()
+        if uid is None:
+            node = next((item for item in tab.tree.body if isinstance(item, Node)), None)
+            self._build_node_widgets(tab, tab.tree, self.split_view_layout, 0)
+        else:
+            node = self._find_node_by_uid(tab.tree, uid)
+            if node is not None:
+                wrapper = Node(tag='ROOT', name='', open_raw=None, body=[node])
+                self._build_node_widgets(tab, wrapper, self.split_view_layout, 0)
+        label = f'[{node.tag}] {node.desc or node.name}' if node is not None else os.path.basename(tab.path)
+        self.split_header_label.setText(label)
+        self.split_header_label.setToolTip(tab.path)
+        self.split_panel.show()
+    # [FN CLOSED] _show_in_split
+
+    def _close_split_pane(self):
+        while self.split_view_layout.count():
+            taken = self.split_view_layout.takeAt(0)
+            widget = taken.widget()
+            if widget:
+                widget.deleteLater()
+        self.split_tab = None
+        self.split_uid = None
+        self.split_panel.hide()
 
     # ---- tabs (AI-NAV: active-tab ownership and close/flush lifecycle) ---
 
@@ -1702,6 +1932,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             del self.open_tabs[tab.path]
         if tab.path in self.fs_watcher.files():
             self.fs_watcher.removePath(tab.path)
+        if self.split_tab is tab:
+            self._close_split_pane()  # don't leave the split pane editing a tab that's gone
         self.tabs.removeTab(index)
         tab.deleteLater()
         return True
@@ -1724,11 +1956,24 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                 return False
         return True
 
+    # [FN] _kant_identity_text — "[TAG] name/desc" for whatever's isolated in tab, or (optionally)
+    # the file's own top-level KANT tag when nothing is; None when neither is available
+    # [FN OPEN] _kant_identity_text
+    def _kant_identity_text(self, tab, fallback_to_top_level=False):
+        node = self._find_node_by_uid(tab.tree, tab.filter_uid) if tab.filter_uid else None
+        if node is None and fallback_to_top_level:
+            node = next((n for n in tab.tree.body if isinstance(n, Node)), None)
+        return f'[{node.tag}] {node.desc or node.name}' if node is not None else None
+    # [FN CLOSED] _kant_identity_text
+
     def _update_tab_title(self, tab):
         idx = self.tabs.indexOf(tab)
         if idx == -1:
             return
-        name = os.path.basename(tab.path)
+        # a tab is titled by the KANT identity of whatever it's isolated on, or the file's own
+        # top-level tag in whole-file view — matching the title bar and split pane header, which
+        # both already do this. Only an untagged/unparseable file falls back to the raw filename.
+        name = self._kant_identity_text(tab, fallback_to_top_level=True) or os.path.basename(tab.path)
         self.tabs.setTabText(idx, (name + ' ●') if tab.dirty else name)
 
     def _on_tab_dirty_changed(self, tab):
@@ -1824,12 +2069,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
 
     def _update_filename_label(self):
         tab = self.active_tab
-        text = tab.path if tab else ''
+        # the title bar slot shows the KANT identity (isolated element, or the file's own top-level
+        # tag when nothing is filtered in) — the filename itself lives in file_path_label instead,
+        # on the Incoming/Outgoing row
+        text = (self._kant_identity_text(tab, fallback_to_top_level=True) or '') if tab else ''
         if tab and tab.dirty:
             text += '  ●'
         self.filename_label.setText(text)
         self.filename_label.setStyleSheet(f'color:{theme.ACCENT if (tab and tab.dirty) else theme.DIM};')
         self.title_bar.set_save_state(tab is not None, tab.dirty if tab else False)
+        self.file_path_label.setText(os.path.basename(tab.path) if tab else '')
 
     def _update_syntax_status(self):
         tab = self.active_tab
@@ -1892,8 +2141,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         msg = first.get('message', '').splitlines()[0]
         return f' | LSP {server}: {len(diagnostics)} diag, riga {line}: {msg[:80]}'
 
-    def _update_lsp_diagnostics(self):
-        tab = self.active_tab
+    def _update_lsp_diagnostics(self, tab=None):
+        tab = tab or self.active_tab
         if tab is None:
             return
         text = serialize_kant(tab.tree)
@@ -1948,17 +2197,25 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                 count += 1
         return None
 
-    def _active_lsp_position(self):
-        tab = self.active_tab
-        if tab is None:
-            return None
-        edit = QApplication.focusWidget()
-        if not isinstance(edit, CodeEdit):
-            edits = tab.view_container.findChildren(CodeEdit)
-            edit = edits[0] if edits else None
+    def _active_lsp_position(self, edit=None, cursor=None):
         if edit is None:
-            return None
-        cursor = edit.textCursor()
+            tab = self.active_tab
+            if tab is None:
+                return None
+            edit = QApplication.focusWidget()
+            if not isinstance(edit, CodeEdit):
+                edits = tab.view_container.findChildren(CodeEdit)
+                edit = edits[0] if edits else None
+            if edit is None:
+                return None
+        else:
+            # edit may belong to the split pane's own tab, not whatever's active in the main tabs —
+            # kant_tab (set at construction) is the reliable owner, self.active_tab only a fallback
+            tab = getattr(edit, 'kant_tab', None) or self.active_tab
+            if tab is None:
+                return None
+        if cursor is None:
+            cursor = edit.textCursor()
         offset = self._line_count_before_run(tab.tree, getattr(edit, 'kant_item', None))
         if offset is None:
             offset = 0
@@ -2027,10 +2284,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             edit = edits[0] if edits else None
         if not isinstance(edit, CodeEdit):
             return ''
-        cursor = edit.textCursor()
-        cursor.select(QTextCursor.WordUnderCursor)
-        symbol = cursor.selectedText().strip()
-        return symbol if re.fullmatch(r'[A-Za-z_]\w*', symbol) else ''
+        return self._symbol_at_cursor(edit.textCursor())
 
     def _local_lsp_command(self, action, tab):
         if action == 'format':
@@ -2091,6 +2345,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
         self._ide_message('LSP locale', message)
 
     def _on_lsp_response(self, request_id, method, result):
+        if method == 'textDocument/completion':
+            edit = self.lsp_completion_requests.pop(request_id, None)
+            if edit is not None:
+                self._apply_completion_result(edit, result)
+            return
+        if request_id in self.lsp_hover_requests:
+            edit, global_pos = self.lsp_hover_requests.pop(request_id)
+            self._show_hover_tooltip(edit, global_pos, result)
+            return
         action, path = self.lsp_pending_requests.pop(request_id, ('', ''))
         tab = self.open_tabs.get(path)
         if action == 'hover':
@@ -2102,6 +2365,109 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             self._apply_lsp_text_edits(tab, result or [])
         elif action == 'rename' and tab is not None:
             self._apply_lsp_workspace_edits(result or {})
+
+    # [FN CATEGORY] _request_completion — the CodeEdit.completion_provider callback: fires an async
+    # LSP textDocument/completion at the cursor (or a local word-completion fallback when no server
+    # is available for this file type), matching the on-demand hover/definition/etc. path's
+    # local/LSP split. The document is re-synced first since typing doesn't otherwise push
+    # didChange to the server until the next explicit LSP action.
+    # [FN] _request_completion — asks for fresh completion candidates at edit's current cursor
+    # [FN OPEN] _request_completion
+    def _request_completion(self, edit):
+        tab = getattr(edit, 'kant_tab', None) or self.active_tab
+        if tab is None:
+            return
+        if not lsp_server_for_path(tab.path):
+            self._local_completion(edit, tab)
+            return
+        self._update_lsp_diagnostics(tab)
+        params = self._active_lsp_position(edit)
+        if params is None:
+            return
+        request_id = self.lsp_client.request('textDocument/completion', params)
+        if request_id is not None:
+            self.lsp_completion_requests[request_id] = edit
+    # [FN CLOSED] _request_completion
+
+    def _apply_completion_result(self, edit, result):
+        items = result.get('items', []) if isinstance(result, dict) else (result or [])
+        labels, seen = [], set()
+        for item in items:
+            text = (item.get('insertText') or item.get('label') or '').strip() if isinstance(item, dict) else ''
+            if text and text not in seen:
+                seen.add(text)
+                labels.append(text)
+        try:
+            edit.show_completions(labels)
+        except RuntimeError:
+            pass  # the widget (or its tab) was closed while the request was in flight
+
+    # [FN] _local_completion — word-completion fallback for files with no LSP server available:
+    # every identifier already typed anywhere in the open file is a candidate
+    # [FN OPEN] _local_completion
+    def _local_completion(self, edit, tab=None):
+        tab = tab or getattr(edit, 'kant_tab', None) or self.active_tab
+        if tab is None:
+            return
+        prefix = edit._text_under_cursor()
+        if not prefix:
+            edit.show_completions([])
+            return
+        words = set(re.findall(r'[A-Za-z_]\w*', serialize_kant(tab.tree)))
+        words.discard(prefix)
+        candidates = sorted(w for w in words if w.lower().startswith(prefix.lower()))
+        edit.show_completions(candidates)
+    # [FN CLOSED] _local_completion
+
+    # [FN CATEGORY] quick-doc-on-hover — CodeEdit.hover_provider callback, mirroring PyCharm/VS
+    # Code: resting the mouse on a symbol shows its documentation as a tooltip, no click needed.
+    # Same LSP method (textDocument/hover) the menu-triggered "Hover" action already uses, but
+    # tracked in its own request dict (lsp_hover_requests) since the result must be routed back to
+    # a specific mouse position/CodeEdit instead of shown as a message dialog.
+    # [FN] _request_hover — asks for documentation at the symbol under the mouse
+    # [FN OPEN] _request_hover
+    def _request_hover(self, edit, cursor, global_pos):
+        tab = getattr(edit, 'kant_tab', None) or self.active_tab
+        if tab is None:
+            return
+        symbol = self._symbol_at_cursor(cursor)
+        if not symbol:
+            return
+        if not lsp_server_for_path(tab.path):
+            self._local_hover(edit, global_pos, symbol)
+            return
+        self._update_lsp_diagnostics(tab)
+        params = self._active_lsp_position(edit, cursor)
+        if params is None:
+            return
+        request_id = self.lsp_client.request('textDocument/hover', params)
+        if request_id is not None:
+            self.lsp_hover_requests[request_id] = edit, global_pos
+    # [FN CLOSED] _request_hover
+
+    def _symbol_at_cursor(self, cursor):
+        word_cursor = QTextCursor(cursor)
+        word_cursor.select(QTextCursor.WordUnderCursor)
+        symbol = word_cursor.selectedText().strip()
+        return symbol if re.fullmatch(r'[A-Za-z_]\w*', symbol) else ''
+
+    def _show_hover_tooltip(self, edit, global_pos, result):
+        text = self._lsp_hover_text(result)
+        try:
+            if text:
+                QToolTip.showText(global_pos, text, edit)
+            else:
+                QToolTip.hideText()
+        except RuntimeError:
+            pass  # the widget was closed while the request was in flight
+
+    def _local_hover(self, edit, global_pos, symbol):
+        definitions = self._local_definition_locations(symbol, limit=1)
+        where = f'\nDefinizione probabile: {definitions[0][1]}:{definitions[0][2]}' if definitions else ''
+        try:
+            QToolTip.showText(global_pos, f'{symbol}{where}', edit)
+        except RuntimeError:
+            pass
 
     def _lsp_hover_text(self, result):
         contents = (result or {}).get('contents') if isinstance(result, dict) else result
@@ -2278,6 +2644,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
 
     def _render_view(self, tab, only_uid=None):
         tab.filter_uid = only_uid
+        self._update_tab_title(tab)
+        self._update_filename_label()
         while tab.view_layout.count():
             item = tab.view_layout.takeAt(0)
             w = item.widget()
@@ -2306,7 +2674,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
             tab.tree.body.append(run)
         edit = CodeEdit('\n'.join(run.lines))
         edit.kant_item = run
+        edit.kant_tab = tab
         edit.textChanged.connect(lambda e=edit, it=run, t=tab: self._on_code_changed(t, e, it))
+        edit.completion_provider = self._request_completion
+        edit.hover_provider = self._request_hover
+        edit.definition_provider = lambda _edit: self._lsp_command('definition')
+        edit.rename_provider = lambda _edit: self._lsp_command('rename')
         tab.view_layout.addWidget(edit)
 
     def _find_node_by_uid(self, node, uid):
@@ -2331,7 +2704,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                     continue
                 edit = CodeEdit(text)
                 edit.kant_item = item
+                edit.kant_tab = tab
                 edit.textChanged.connect(lambda e=edit, it=item, t=tab: self._on_code_changed(t, e, it))
+                edit.completion_provider = self._request_completion
+                edit.hover_provider = self._request_hover
+                edit.definition_provider = lambda _edit: self._lsp_command('definition')
+                edit.rename_provider = lambda _edit: self._lsp_command('rename')
                 layout.addWidget(edit)
                 i += 1
             else:
@@ -2342,8 +2720,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                         i = next_i
                         continue
                 has_children = any(isinstance(c, Node) for c in item.body)
+                # depth 0 is always the outermost element of an isolated/whole-file view — its
+                # identity is already shown in the tab label / split header / title bar, so its own
+                # "[TAG] name" title here would be pure redundancy
                 if has_children:
-                    section = CollapsibleSection(item)
+                    section = CollapsibleSection(item, show_header=depth > 0)
                     section.editMetadata.connect(lambda node, t=tab: self._edit_kant_metadata(t, node))
                     section.set_expanded(depth < 1)
                     layout.addWidget(section)
@@ -2351,7 +2732,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, QMainWindow):
                     tab.section_widgets[item.uid] = section
                     self._build_node_widgets(tab, item, section.content_layout, depth + 1)
                 else:
-                    leaf = LeafSection(item)
+                    leaf = LeafSection(item, show_header=depth > 0)
                     leaf.editMetadata.connect(lambda node, t=tab: self._edit_kant_metadata(t, node))
                     layout.addWidget(leaf)
                     tab.section_widgets[item.uid] = leaf

@@ -8,15 +8,19 @@ import time
 import unittest
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt, QEvent, QPointF, QSettings
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QGraphicsItem, QListWidget, QToolButton, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QGraphicsItem, QLabel, QListWidget, QToolButton, QToolTip, QTreeWidgetItem
 
 from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID
 from kant.lsp import file_uri, LspClient
 from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
 from kant.xref import build_xref, XrefElement
-from kant.widgets import FileTab, XrefMapDialog, XrefMapView, _AiReviewCard, _agent_command, _force_layout_positions, CodeEdit
+from kant.widgets import (
+    CollapsibleSection, FileTab, LeafSection, XrefMapDialog, XrefMapView,
+    _AiReviewCard, _agent_command, _force_layout_positions, CodeEdit,
+)
 from kant.workspace import (
     apply_ai_review, build_ai_review, create_snapshot, discard_snapshot, rollback_snapshot,
     render_review_text, safe_project_path,
@@ -145,7 +149,18 @@ def main():
     assert MainWindow._build_ai_context_hint(hint_window) is None  # no open tab -> nothing to scope to
 
     assert not hasattr(window, 'results_label_btn')
-    assert window._tree_label('MOD', 'short').testAttribute(Qt.WA_TransparentForMouseEvents)
+    # tree rows use a rich-HTML label via setItemWidget; it must forward its own clicks to the
+    # owning item directly (WA_TransparentForMouseEvents pass-through proved unreliable for this)
+    dummy_item = QTreeWidgetItem(window.tree)
+    label_clicks, label_dclicks = [], []
+    window.tree.itemClicked.connect(lambda it, col: label_clicks.append(it))
+    window.tree.itemDoubleClicked.connect(lambda it, col: label_dclicks.append(it))
+    tree_label = window._tree_label(dummy_item, 'MOD', 'short')
+    tree_label.resize(100, 20)
+    QTest.mouseClick(tree_label, Qt.LeftButton)
+    assert label_clicks == [dummy_item]
+    QTest.mouseDClick(tree_label, Qt.LeftButton)
+    assert label_dclicks == [dummy_item]
     assert window.title_bar.file_menu_btn.menu() is not None
     assert window.title_bar.file_menu_btn.popupMode() == QToolButton.DelayedPopup
     window.close()
@@ -228,6 +243,78 @@ def main():
         isolated_widget = legacy_tab.view_layout.itemAt(0).widget()
         isolated_codes = [c.toPlainText().strip() for c in isolated_widget.findChildren(CodeEdit)]
         assert isolated_codes == ['def beta(): pass']  # not alpha too — the whole-file fallback would show both
+
+        # the main tab's own title (next to its close x) follows the isolated KANT element's
+        # identity too, not the filename — matching the split pane's header convention
+        legacy_idx = tree_window.tabs.indexOf(legacy_tab)
+        assert tree_window.tabs.tabText(legacy_idx) == '[FN] beta'
+
+        # the title bar's own slot shows the KANT identity too, not the filename — the filename
+        # itself now lives in file_path_label, on the Incoming/Outgoing row
+        assert tree_window.filename_label.text() == '[FN] beta'
+        assert tree_window.file_path_label.text() == 'legacy.py'
+        tree_window._render_view(legacy_tab, None)
+        # whole-file view: both the tab and the title bar show the file's own top-level KANT tag,
+        # not the raw filename — a module's identity is "[MOD] legacy.py", not just "legacy.py"
+        assert tree_window.tabs.tabText(legacy_idx) == '[MOD] legacy.py'
+        assert tree_window.filename_label.text() == '[MOD] legacy.py'
+        assert tree_window.file_path_label.text() == 'legacy.py'
+
+        # the outermost element of an isolated view has its "[TAG] name" title suppressed — the
+        # tab/title-bar/split-header already announce that identity, so repeating it inline would
+        # be redundant; the panel starts directly with the category description instead. A NESTED
+        # element (not the one being isolated) keeps its own header, since nothing else names it.
+        nested_source = source_dir / 'nested.py'
+        nested_source.write_text('\n'.join([
+            '# [CLS CATEGORY] a class that does stuff',
+            '# [CLS OPEN] Widget', 'class Widget:',
+            '# [FN CATEGORY] initializes the widget',
+            '# [FN OPEN] init', '    def init(self): pass', '# [FN CLOSED] init',
+            '# [CLS CLOSED] Widget',
+        ]), encoding='utf-8')
+        assert tree_window._open_file(str(nested_source))
+        nested_tab = tree_window.open_tabs[str(nested_source)]
+        cls_node = next(n for n in nested_tab.tree.body if hasattr(n, 'body'))
+        fn_node = next(c for c in cls_node.body if getattr(c, 'tag', None) == 'FN')
+        tree_window._render_view(nested_tab, cls_node.uid)
+        cls_widget = nested_tab.section_widgets[cls_node.uid]
+        fn_widget = nested_tab.section_widgets[fn_node.uid]
+        assert isinstance(cls_widget, CollapsibleSection) and cls_widget.toggle_btn is None
+        cls_labels = ' '.join(l.text() for l in cls_widget.findChildren(QLabel))
+        assert '[CLS]' not in cls_labels and 'a class that does stuff' in cls_labels  # no title, category kept
+        assert isinstance(fn_widget, LeafSection)
+        fn_labels = ' '.join(l.text() for l in fn_widget.findChildren(QLabel))
+        assert '[FN]' in fn_labels  # nested element still gets its own header
+
+        # split pane: identity is the KANT element, not a filename tab, and it must not disturb
+        # whatever the main pane currently has active
+        alpha_section = None
+        it = tree_window.tree.invisibleRootItem()
+        stack = [it.child(i) for i in range(it.childCount())]
+        while stack:
+            candidate = stack.pop()
+            if candidate.data(0, ROLE_KIND) == 'section' and 'alpha' in tree_window.tree.itemWidget(candidate, 0).text():
+                alpha_section = candidate
+            for i in range(candidate.childCount()):
+                stack.append(candidate.child(i))
+        assert alpha_section is not None
+        main_filter_before = legacy_tab.filter_uid
+        assert tree_window.split_panel.isHidden()  # tree_window is never shown, so isVisible() is unusable here
+        tree_window._on_tree_item_double_clicked(alpha_section, 0)
+        assert not tree_window.split_panel.isHidden()
+        assert tree_window.split_header_label.text() == '[FN] alpha'  # KANT identity, not "legacy.py"
+        assert legacy_tab.filter_uid == main_filter_before  # main pane untouched
+        split_codes = [c.toPlainText().strip() for c in tree_window.split_view_layout.itemAt(0).widget().findChildren(CodeEdit)]
+        assert split_codes == ['def alpha(): pass']
+        tree_window._close_split_pane()
+        assert tree_window.split_panel.isHidden() and tree_window.split_tab is None
+
+        # closing the tab the split pane is showing must close the split pane too, not leave it
+        # pointing at a tab that's been torn down
+        tree_window._on_tree_item_double_clicked(alpha_section, 0)
+        assert not tree_window.split_panel.isHidden()
+        tree_window._close_tab(tree_window.tabs.indexOf(legacy_tab), flush=False)
+        assert tree_window.split_panel.isHidden() and tree_window.split_tab is None
         tree_window.close()
 
         tab = FileTab(str(source), parse_kant(source.read_text(encoding='utf-8')))
@@ -279,6 +366,100 @@ def main():
         }})
         assert rename_source.read_text(encoding='utf-8') == 'new()\n'
         assert other.read_text(encoding='utf-8') == 'new()\n'
+
+        # autocomplete-as-you-type: typing restarts a debounce timer that asks completion_provider
+        # (wired by mainwindow to _request_completion) for fresh candidates
+        completion_edit = CodeEdit('')
+        completion_edit.show()
+        completion_edit.setFocus()
+        app.processEvents()
+        completion_calls = []
+        completion_edit.completion_provider = lambda e: completion_calls.append(e)
+        QTest.keyClicks(completion_edit, 'ab')
+        assert completion_edit._completion_timer.isActive()
+        completion_edit._trigger_completion()
+        assert completion_calls == [completion_edit]
+
+        # local (no-LSP-server) fallback: candidates are identifiers already in the open file
+        no_lsp_tab_tree = parse_kant('# [FN OPEN] x\ndef alpha_function():\n    pass\n# [FN CLOSED] x\n')
+        lsp_window.tabs = type('Tabs', (), {
+            'currentWidget': lambda _self: type('T', (), {'tree': no_lsp_tab_tree})(),
+        })()
+        local_completion_edit = CodeEdit('    alp')
+        cursor = local_completion_edit.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        local_completion_edit.setTextCursor(cursor)
+        local_completion_edit.show()
+        local_completion_edit.setFocus()
+        app.processEvents()
+        lsp_window._local_completion(local_completion_edit)
+        assert local_completion_edit._completer.popup().isVisible()
+        model = local_completion_edit._completer.completionModel()
+        assert [model.index(i, 0).data() for i in range(model.rowCount())] == ['alpha_function']
+        local_completion_edit._insert_completion('alpha_function')
+        assert local_completion_edit.toPlainText() == '    alpha_function'
+
+        # LSP-driven path: _apply_completion_result dedupes items and forwards labels to the popup
+        lsp_completion_edit = CodeEdit('a')
+        cursor = lsp_completion_edit.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        lsp_completion_edit.setTextCursor(cursor)
+        lsp_completion_edit.show()
+        lsp_completion_edit.setFocus()
+        app.processEvents()
+        lsp_window._apply_completion_result(lsp_completion_edit, {'items': [
+            {'label': 'alpha', 'insertText': 'alpha'}, {'label': 'alpha'}, {'label': 'abc'},
+        ]})
+        model = lsp_completion_edit._completer.completionModel()
+        assert [model.index(i, 0).data() for i in range(model.rowCount())] == ['alpha', 'abc']
+
+        # quick-doc-on-hover: PyCharm-style tooltip on the symbol under the mouse, no click needed
+        assert lsp_window._symbol_at_cursor(local_completion_edit.textCursor()) == 'alpha_function'
+        lsp_window.lsp_hover_requests[999] = (lsp_completion_edit, lsp_completion_edit.mapToGlobal(lsp_completion_edit.rect().center()))
+        lsp_window._on_lsp_response(999, 'textDocument/hover', {'contents': {'value': 'def f() -> None'}})
+        assert QToolTip.text() == 'def f() -> None'
+        assert 999 not in lsp_window.lsp_hover_requests
+
+        # local fallback: no LSP server configured -> definition-location lookup shown as tooltip
+        lsp_window._local_hover(local_completion_edit, local_completion_edit.mapToGlobal(local_completion_edit.rect().center()), 'alpha_function')
+        assert 'alpha_function' in QToolTip.text()
+
+        # a real mouse move restarts the hover debounce, which then calls hover_provider
+        hover_calls = []
+        local_completion_edit.hover_provider = lambda e, c, p: hover_calls.append(e)
+        center = QPointF(local_completion_edit.rect().center())
+        move_event = QMouseEvent(
+            QEvent.MouseMove, center, local_completion_edit.mapToGlobal(center.toPoint()),
+            Qt.NoButton, Qt.NoButton, Qt.NoModifier,
+        )
+        local_completion_edit.mouseMoveEvent(move_event)
+        assert local_completion_edit._hover_timer.isActive()
+        local_completion_edit._trigger_hover()
+        assert hover_calls == [local_completion_edit]
+
+        # gesture vocabulary: Ctrl+Click jumps to definition, F2 renames — matching the vocabulary
+        # every other IDE uses instead of only exposing these through the LSP menu
+        gesture_calls = []
+        local_completion_edit.definition_provider = lambda e: gesture_calls.append('definition')
+        local_completion_edit.rename_provider = lambda e: gesture_calls.append('rename')
+        click_pos = QPointF(local_completion_edit.rect().center())
+        ctrl_click = QMouseEvent(
+            QEvent.MouseButtonPress, click_pos, local_completion_edit.mapToGlobal(click_pos.toPoint()),
+            Qt.LeftButton, Qt.LeftButton, Qt.ControlModifier,
+        )
+        local_completion_edit.mousePressEvent(ctrl_click)
+        assert gesture_calls == ['definition']
+        gesture_calls.clear()
+        plain_click = QMouseEvent(
+            QEvent.MouseButtonPress, click_pos, local_completion_edit.mapToGlobal(click_pos.toPoint()),
+            Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
+        )
+        local_completion_edit.mousePressEvent(plain_click)
+        assert gesture_calls == []  # a plain click must not also jump to definition
+        f2_event = QKeyEvent(QEvent.KeyPress, Qt.Key_F2, Qt.NoModifier)
+        local_completion_edit.keyPressEvent(f2_event)
+        assert gesture_calls == ['rename']
+
         lsp_window.close()
 
         xref_tree = parse_kant('\n'.join([

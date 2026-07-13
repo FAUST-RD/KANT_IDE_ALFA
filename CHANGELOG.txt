@@ -1,5 +1,36 @@
 KANT IDE changelog
 
+2026-07-13 (11)
+- The coding panel no longer repeats the "[TAG] name" title for the outermost element of an isolated/whole-file view — that identity is already announced by the tab title, split header, and title bar (which already share one format), so showing it a third time inline was pure redundancy. The panel now starts directly with the category description instead. Nested elements (anything that isn't the one actually being isolated) keep their own header, since nothing else names them.
+
+2026-07-13 (10)
+- Fixed the remaining case where a tab's own title (next to its own closing x) showed the raw filename instead of its KANT identity: whole-file/module view specifically — the title bar and split pane header already fell back to the file's own top-level tag ("[MOD] cart.py"), but the main tab's title still fell back to the plain filename. All three now agree.
+
+2026-07-13 (9)
+- Moved the new Save/Undo/Redo/Run/Find icon toolbar out of the title bar into its own row underneath — cramming 5 more buttons into the title bar was crowding out the essential window chrome (minimize/maximize/close). The title bar is back to its original density; the toolbar has its own dedicated space to breathe.
+
+2026-07-13 (8)
+- The title bar's own KANT-identity slot ("[MOD] cart.py" / "[FN] add_item") was going stale on the normal single-click isolate flow — _render_view updates the tab's own title but wasn't also refreshing the title bar. Fixed at the source. The filename itself now lives in a new label on the Incoming/Outgoing row, always visible regardless of what's isolated.
+- Added a new kant/icons.py: small drawn vector icons (QPainter shapes, same technique as the existing pin/eye badges and save/star glyphs) reused across the app instead of raw unicode arrow glyphs or plain text buttons.
+- Added a persistent one-click icon toolbar (Save/Undo/Redo/Run/Find) to the title bar — the highest-frequency actions no longer cost a click-to-open-menu + click-to-select; the File/Search/LSP menus stay for everything else.
+- Replaced every raw unicode arrow glyph (titlebar back button, MAPPA/AI-terminal edge tabs, find-bar prev/next, drill-mode back button) with a real drawn triangle icon.
+- Gave MAPPA's toolbar buttons (Espandi/Comprimi tutti, Riorganizza, Isola selezionato, Heatmap, Direzione, Appartenenza) icons of their own, so the whole app now uses one consistent icon-button language instead of mixing icon-capable buttons with plain text ones.
+- The GLOBAL scope toggle now has its own globe icon, on top of the solid-accent-fill it already got when checked.
+- Added the gesture vocabulary every other IDE uses instead of only exposing these through the LSP menu: Ctrl+Click a symbol jumps to its definition, F2 renames it.
+
+2026-07-13 (7)
+- Added PyCharm-style quick-doc-on-hover: resting the mouse over a symbol in the coding panel (no click needed) shows its documentation as a tooltip after a short pause, sourced from the LSP server's textDocument/hover when available, falling back to a local "probable definition location" lookup when no server is configured. Fixed a latent bug found along the way: completion and hover requests fired from the split pane were resolving against whatever tab happened to be active in the main tabs instead of the split pane's own tab — CodeEdit widgets now remember which tab they belong to.
+
+2026-07-13 (6)
+- The main tab's own title (next to its own closing x) now follows the isolated KANT element's identity too when one is filtered in — e.g. "[FN] alpha" instead of "legacy.py" — matching the split pane's header convention. Reverts to the filename in whole-file view, where there's no single element to name.
+
+2026-07-13 (5)
+- Added autocomplete-as-you-type: typing in the coding panel now pops up live completions after a short pause, driven by the LSP server's textDocument/completion when one is available for the file, falling back to identifiers already used elsewhere in the file when it isn't. Enter/Tab accepts the highlighted suggestion, Escape dismisses it, Up/Down navigates.
+- Fixed the real cause of the split editor pane "not working": KANT tree rows use a rich-HTML QLabel (via setItemWidget) for their colored tag badges, and WA_TransparentForMouseEvents pass-through onto the QTreeWidget's own itemClicked/itemDoubleClicked was unreliable — real clicks landing on a row's label could silently fail to reach either signal at all. Tree row labels now forward their own clicks to the owning item directly, so both single-click isolate and double-click-to-split fire correctly.
+
+2026-07-13 (4)
+- Added a split editor pane: double-clicking a file or section in the KANT tree opens it side-by-side with the main coding panel instead of replacing it. The split pane is keyed by KANT element identity (its tag + name/description), not by filename — its header reads e.g. "[FN] alpha", not the file's basename. Opening the same tab it's already showing in the main pane doesn't disturb the main pane's own isolation state. Closing the tab the split pane is displaying closes the split pane too, so it never points at a torn-down tab.
+
 2026-07-13 (3)
 - Pin and eye icons in MAPPA are now roughly twice as large (40px normal, 60px enlarged for the drillable single pin), same drawn shapes, same proportional gap above the node.
 - Fixed: clicking the eye icon did nothing. It sits on top of its node with no item-data of its own, so the view's click handler read the click back as "clicked empty canvas" and cleared every pin — hiding the eye — before Qt ever delivered the press to the eye's own handler. The view now recognizes a click landed on the eye specifically and lets it through untouched.

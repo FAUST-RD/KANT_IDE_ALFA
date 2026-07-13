@@ -24,23 +24,25 @@ from html import escape as html_escape
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QElapsedTimer, QFileSystemWatcher, QObject, QPointF, QProcess, QRect, QRectF, Qt, QSettings, QSize, Signal, QTimer,
+    QElapsedTimer, QFileSystemWatcher, QObject, QPointF, QProcess, QRect, QRectF, Qt, QSettings, QSize,
+    QStringListModel, Signal, QTimer,
 )
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
     QPainterPathStroker, QShortcut, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog, QFileDialog, QFrame,
     QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView,
     QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMenu, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QTabWidget, QToolButton,
+    QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QTabWidget, QToolButton, QToolTip,
     QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
 from kant import theme
 from kant.aipermissions import PermissionBridge, write_permission_config
+from kant.icons import draw_icon
 from kant.model import Node, parse_kant, serialize_kant, KantParseError
 from kant.fileio import file_fingerprint, write_file_atomic
 from kant.syntax import KEYWORDS, TOKEN_RE
@@ -160,6 +162,38 @@ class CodeEdit(QPlainTextEdit):
         self.horizontalScrollBar().rangeChanged.connect(lambda *_: QTimer.singleShot(0, self._auto_resize))
         self._auto_resize()
 
+        # autocomplete-as-you-type: mainwindow sets completion_provider to a callable(edit) that
+        # fires an async LSP textDocument/completion request (or a local fallback) and later calls
+        # back into show_completions on THIS same instance — kept as a callback, not a direct
+        # import, so this module stays decoupled from mainwindow (see module docstring)
+        self.completion_provider = None
+        self._completer = QCompleter(self)
+        self._completer.setWidget(self)
+        self._completer.setCompletionMode(QCompleter.PopupCompletion)
+        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._completer.activated.connect(self._insert_completion)
+        self._completion_timer = QTimer(self)
+        self._completion_timer.setSingleShot(True)
+        self._completion_timer.timeout.connect(self._trigger_completion)
+        self.textChanged.connect(self._on_text_changed_for_completion)
+
+        # PyCharm-style quick-doc-on-hover: mainwindow sets hover_provider to a callable(edit,
+        # cursor, global_pos) that fires an async LSP textDocument/hover (or a local fallback) and
+        # shows the result as a QToolTip — same 450ms delay already used for MAPPA's own hover popups
+        self.hover_provider = None
+        self.setMouseTracking(True)
+        self._hover_pos = None
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.timeout.connect(self._trigger_hover)
+
+        # gesture vocabulary matching other IDEs: Ctrl+Click jumps to a symbol's definition, F2
+        # renames it — both just resolve the cursor here and hand off to mainwindow's existing
+        # LSP/local rename-definition plumbing (same callback-not-import pattern as the providers
+        # above)
+        self.definition_provider = None
+        self.rename_provider = None
+
     def _auto_resize(self):
         lines = max(self.blockCount(), 1)
         padding = 10
@@ -222,6 +256,110 @@ class CodeEdit(QPlainTextEdit):
             top = bottom
             bottom = top + int(self.blockBoundingRect(block).height())
             block_number += 1
+
+    # [FN CATEGORY] autocomplete-as-you-type — QCompleter driven by an async provider (LSP
+    # textDocument/completion, or a local fallback) instead of a static word list. Typing restarts
+    # a short debounce timer; when it fires, completion_provider (set by mainwindow) is asked for
+    # fresh candidates and calls back into show_completions on this same widget once they arrive.
+    # keyPressEvent only needs to get out of the popup's way for accept/dismiss keys — Up/Down
+    # navigation and the popup's own positioning are handled by QCompleter itself (setWidget(self)
+    # installs its event filter), matching Qt's own "Custom Completer" reference pattern.
+    # [FN] keyPressEvent — lets the completer popup handle accept/dismiss keys when it's open
+    # [FN OPEN] keyPressEvent
+    def keyPressEvent(self, event):
+        if self._completer.popup().isVisible() and event.key() in (
+            Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape, Qt.Key_Tab, Qt.Key_Backtab,
+        ):
+            event.ignore()
+            return
+        if event.key() == Qt.Key_F2 and self.rename_provider is not None:
+            self.rename_provider(self)
+            return
+        super().keyPressEvent(event)
+    # [FN CLOSED] keyPressEvent
+
+    # [FN] mousePressEvent — Ctrl+Click jumps to the clicked symbol's definition, same gesture
+    # every other IDE uses; the normal click still runs first so the text cursor lands at the
+    # click position before definition_provider looks up what's there
+    # [FN OPEN] mousePressEvent
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        if (
+            event.button() == Qt.LeftButton
+            and event.modifiers() & Qt.ControlModifier
+            and self.definition_provider is not None
+        ):
+            self.definition_provider(self)
+    # [FN CLOSED] mousePressEvent
+
+    def _on_text_changed_for_completion(self):
+        if self.completion_provider is not None and self.hasFocus():
+            self._completion_timer.start(200)
+
+    def _trigger_completion(self):
+        if self.completion_provider is not None and self.hasFocus():
+            self.completion_provider(self)
+
+    def _text_under_cursor(self):
+        cursor = self.textCursor()
+        cursor.select(QTextCursor.WordUnderCursor)
+        return cursor.selectedText()
+
+    # [FN] show_completions — populates and pops up the completer with fresh candidates, called
+    # back by mainwindow once its async completion request (LSP or local) resolves
+    # [FN OPEN] show_completions
+    def show_completions(self, candidates):
+        if not candidates or not self.hasFocus():
+            self._completer.popup().hide()
+            return
+        prefix = self._text_under_cursor()
+        self._completer.setModel(QStringListModel(candidates, self._completer))
+        self._completer.setCompletionPrefix(prefix)
+        if self._completer.completionCount() == 0:
+            self._completer.popup().hide()
+            return
+        self._completer.popup().setCurrentIndex(self._completer.completionModel().index(0, 0))
+        cr = self.cursorRect()
+        cr.setWidth(
+            self._completer.popup().sizeHintForColumn(0)
+            + self._completer.popup().verticalScrollBar().sizeHint().width()
+        )
+        self._completer.complete(cr)
+    # [FN CLOSED] show_completions
+
+    def _insert_completion(self, completion):
+        cursor = self.textCursor()
+        extra = len(completion) - len(self._completer.completionPrefix())
+        cursor.movePosition(QTextCursor.Left)
+        cursor.movePosition(QTextCursor.EndOfWord)
+        cursor.insertText(completion[-extra:] if extra > 0 else '')
+        self.setTextCursor(cursor)
+
+    # [FN CATEGORY] quick-doc-on-hover — mirrors PyCharm/VS Code: resting the mouse over a symbol
+    # (no click needed) shows its documentation as a tooltip. mouseMoveEvent just restarts a
+    # debounce timer with the latest position; the actual lookup happens in _trigger_hover so a
+    # fast-moving mouse doesn't fire a request per pixel.
+    # [FN] mouseMoveEvent — restarts the hover-lookup debounce on mouse movement
+    # [FN OPEN] mouseMoveEvent
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        QToolTip.hideText()
+        self._hover_pos = event.position().toPoint()
+        self._hover_timer.start(450)
+    # [FN CLOSED] mouseMoveEvent
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._hover_timer.stop()
+        self._hover_pos = None
+        QToolTip.hideText()
+
+    def _trigger_hover(self):
+        if self.hover_provider is None or self._hover_pos is None:
+            return
+        cursor = self.cursorForPosition(self._hover_pos)
+        global_pos = self.viewport().mapToGlobal(self._hover_pos)
+        self.hover_provider(self, cursor, global_pos)
 
     # [FN] toggle_breakpoint_at — flips the breakpoint on the gutter line under a click, Python only
     # [FN OPEN] toggle_breakpoint_at
@@ -1227,7 +1365,11 @@ def _build_header_row(owner, node):
 class CollapsibleSection(QWidget):
     editMetadata = Signal(object)
 
-    def __init__(self, node: Node):
+    # show_header=False skips the "[TAG] name" title row entirely (fold arrow and ⋮ metadata
+    # button included) — used for the outermost element of an isolated/whole-file view, whose
+    # identity is already announced by the tab label / split header / title bar, so repeating it
+    # here would be pure redundancy. The panel then starts directly with the category description.
+    def __init__(self, node: Node, show_header=True):
         super().__init__()
         self.setObjectName('collapsible')
         self.setStyleSheet(
@@ -1238,19 +1380,22 @@ class CollapsibleSection(QWidget):
         outer.setContentsMargins(3, 1, 2, 1)
         outer.setSpacing(1)
 
-        self.toggle_btn = QToolButton()
-        self.toggle_btn.setArrowType(Qt.DownArrow)
-        self.toggle_btn.setCheckable(True)
-        self.toggle_btn.setChecked(True)
-        self.toggle_btn.setStyleSheet(f'border:none; color:{theme.TEXT}; background:transparent; padding:0; margin:0;')
-        self.toggle_btn.setMaximumWidth(16)
-        self.toggle_btn.clicked.connect(self._on_toggle)
+        if show_header:
+            self.toggle_btn = QToolButton()
+            self.toggle_btn.setArrowType(Qt.DownArrow)
+            self.toggle_btn.setCheckable(True)
+            self.toggle_btn.setChecked(True)
+            self.toggle_btn.setStyleSheet(f'border:none; color:{theme.TEXT}; background:transparent; padding:0; margin:0;')
+            self.toggle_btn.setMaximumWidth(16)
+            self.toggle_btn.clicked.connect(self._on_toggle)
 
-        header_row, header = _build_header_row(self, node)
-        header.setCursor(Qt.PointingHandCursor)
-        header.mousePressEvent = lambda _event: self.toggle_btn.click()
-        header_row.insertWidget(0, self.toggle_btn)
-        outer.addLayout(header_row)
+            header_row, header = _build_header_row(self, node)
+            header.setCursor(Qt.PointingHandCursor)
+            header.mousePressEvent = lambda _event: self.toggle_btn.click()
+            header_row.insertWidget(0, self.toggle_btn)
+            outer.addLayout(header_row)
+        else:
+            self.toggle_btn = None
 
         if node.category_desc:
             cat = QLabel(html_escape(node.category_desc))
@@ -1271,6 +1416,9 @@ class CollapsibleSection(QWidget):
         self.toggle_btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
 
     def set_expanded(self, expanded):
+        if self.toggle_btn is None:
+            self.content.setVisible(True)  # no fold arrow to collapse it with — always shown
+            return
         self.toggle_btn.setChecked(expanded)
         self._on_toggle()
 # [FN CLOSED] CollapsibleSection
@@ -1285,7 +1433,10 @@ class CollapsibleSection(QWidget):
 class LeafSection(QWidget):
     editMetadata = Signal(object)
 
-    def __init__(self, node: Node, compact=False):
+    # show_header=False skips the "[TAG] name" title row (same redundancy this is skipped for on
+    # CollapsibleSection) — the outermost element of an isolated/whole-file view already has its
+    # identity shown in the tab label / split header / title bar
+    def __init__(self, node: Node, compact=False, show_header=True):
         super().__init__()
         self.setObjectName('leafCompact' if compact else 'leafSection')
         self.setStyleSheet(
@@ -1296,10 +1447,11 @@ class LeafSection(QWidget):
         outer.setContentsMargins(0 if compact else 3, 1, 0, 1)
         outer.setSpacing(1)
 
-        header_row, header = _build_header_row(self, node)
-        if compact:
-            header.setStyleSheet(f'padding:4px 0; border-bottom:1px solid #eef2f7;')
-        outer.addLayout(header_row)
+        if show_header:
+            header_row, header = _build_header_row(self, node)
+            if compact:
+                header.setStyleSheet(f'padding:4px 0; border-bottom:1px solid #eef2f7;')
+            outer.addLayout(header_row)
 
         if node.category_desc:
             cat = QLabel(html_escape(node.category_desc))
@@ -1408,7 +1560,9 @@ class TitleBar(QWidget):
         layout.setContentsMargins(14, 5, 8, 5)
         layout.setSpacing(12)
 
-        self.back_btn = QPushButton('←')
+        self.back_btn = QPushButton('')
+        self.back_btn.setIcon(draw_icon('arrow-left', 16))
+        self.back_btn.setIconSize(QSize(16, 16))
         self.back_btn.setFixedSize(32, 28)
         self.back_btn.setToolTip('Torna al menu iniziale')
         self.back_btn.clicked.connect(window._go_back_to_welcome)
@@ -1468,13 +1622,13 @@ class TitleBar(QWidget):
 
         self.lsp_menu_btn = self._menu_button('LSP')
         lsp_menu = self.lsp_menu_btn.menu()
-        self.lsp_hover_menu_action = lsp_menu.addAction('Hover')
+        self.lsp_hover_menu_action = lsp_menu.addAction('Hover (o passa il mouse su un simbolo)')
         self.lsp_hover_menu_action.triggered.connect(lambda: window._lsp_command('hover'))
-        self.lsp_definition_menu_action = lsp_menu.addAction('Vai alla definizione')
+        self.lsp_definition_menu_action = lsp_menu.addAction('Vai alla definizione (Ctrl+Click)')
         self.lsp_definition_menu_action.triggered.connect(lambda: window._lsp_command('definition'))
         self.lsp_references_menu_action = lsp_menu.addAction('References')
         self.lsp_references_menu_action.triggered.connect(lambda: window._lsp_command('references'))
-        self.lsp_rename_menu_action = lsp_menu.addAction('Rename symbol')
+        self.lsp_rename_menu_action = lsp_menu.addAction('Rename symbol (F2)')
         self.lsp_rename_menu_action.triggered.connect(lambda: window._lsp_command('rename'))
         self.lsp_format_menu_action = lsp_menu.addAction('Formatta documento')
         self.lsp_format_menu_action.triggered.connect(lambda: window._lsp_command('format'))
@@ -1501,8 +1655,8 @@ class TitleBar(QWidget):
 
         layout.addStretch(1)
         self.buttons = [
-            self.back_btn, self.file_menu_btn, self.search_menu_btn, self.appearance_menu_btn,
-            self.lsp_menu_btn, self.git_menu_btn,
+            self.back_btn, self.file_menu_btn, self.search_menu_btn,
+            self.appearance_menu_btn, self.lsp_menu_btn, self.git_menu_btn,
         ]
 
         for text, callback in (('−', window.showMinimized), ('□', self._toggle_maximized), ('×', window.close)):
@@ -1532,8 +1686,14 @@ class TitleBar(QWidget):
         self.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
         self.theme_menu_action.setText('Giorno' if self.window.night_mode else 'Notte')
         tool_button_style = theme.BUTTON_STYLE.replace('QPushButton', 'QToolButton')
+        # back_btn is icon-only now — theme.BUTTON_STYLE's 7px/13px padding (sized for a text
+        # label) was squeezing its 16px icon down to a sliver inside the fixed 32x28 button
+        icon_button_style = theme.BUTTON_STYLE.replace('padding:7px 13px;', 'padding:4px;')
         for btn in self.buttons:
-            btn.setStyleSheet(tool_button_style if isinstance(btn, QToolButton) else theme.BUTTON_STYLE)
+            if btn is self.back_btn:
+                btn.setStyleSheet(icon_button_style)
+            else:
+                btn.setStyleSheet(tool_button_style if isinstance(btn, QToolButton) else theme.BUTTON_STYLE)
         active = self.window.active_tab if hasattr(self.window, 'tabs') else None
         dirty = active.dirty if active else False
         self.filename_label.setStyleSheet(f'color:{theme.ACCENT if dirty else theme.DIM};')
@@ -2887,7 +3047,9 @@ class XrefMapDialog(QDialog):
         self.title_label.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
         self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)  # let drags pass through
         row.addWidget(self.title_label)
-        self.drill_back_btn = QPushButton('◀ Torna alla mappa completa')
+        self.drill_back_btn = QPushButton(' Torna alla mappa completa')
+        self.drill_back_btn.setIcon(draw_icon('arrow-left', 14))
+        self.drill_back_btn.setIconSize(QSize(14, 14))
         self.drill_back_btn.setFixedHeight(26)
         self.drill_back_btn.clicked.connect(self._exit_drill_mode)
         self.drill_back_btn.hide()  # only shown while drilled into one element's internals
@@ -2923,22 +3085,32 @@ class XrefMapDialog(QDialog):
         self.file_combo.currentIndexChanged.connect(self._on_file_filter)
         top.addWidget(self.file_combo)
 
-        self.expand_all_btn = QPushButton('Espandi tutti')
-        self.collapse_all_btn = QPushButton('Comprimi tutti')
+        self.expand_all_btn = QPushButton(' Espandi tutti')
+        self.expand_all_btn.setIcon(draw_icon('expand', 14))
+        self.expand_all_btn.setIconSize(QSize(14, 14))
+        self.collapse_all_btn = QPushButton(' Comprimi tutti')
+        self.collapse_all_btn.setIcon(draw_icon('collapse', 14))
+        self.collapse_all_btn.setIconSize(QSize(14, 14))
         self.expand_all_btn.clicked.connect(self._expand_all)
         self.collapse_all_btn.clicked.connect(self._collapse_all)
         top.addWidget(self.expand_all_btn)
         top.addWidget(self.collapse_all_btn)
-        self.relayout_btn = QPushButton('Riorganizza')
+        self.relayout_btn = QPushButton(' Riorganizza')
+        self.relayout_btn.setIcon(draw_icon('undo', 14))
+        self.relayout_btn.setIconSize(QSize(14, 14))
         self.relayout_btn.clicked.connect(self._reorganize)
         top.addWidget(self.relayout_btn)
 
-        self.isolate_btn = QPushButton('Isola selezionato')
+        self.isolate_btn = QPushButton(' Isola selezionato')
+        self.isolate_btn.setIcon(draw_icon('target', 14))
+        self.isolate_btn.setIconSize(QSize(14, 14))
         self.isolate_btn.setCheckable(True)
         self.isolate_btn.toggled.connect(self._on_isolate)
         top.addWidget(self.isolate_btn)
 
-        self.heatmap_btn = QPushButton('Heatmap')
+        self.heatmap_btn = QPushButton(' Heatmap')
+        self.heatmap_btn.setIcon(draw_icon('flame', 14))
+        self.heatmap_btn.setIconSize(QSize(14, 14))
         self.heatmap_btn.setCheckable(True)
         self.heatmap_btn.setToolTip('Colora i nodi per connettività (caldo = molti riferimenti) invece che per tag')
         self.heatmap_btn.toggled.connect(self._on_heatmap_toggle)
@@ -2946,7 +3118,9 @@ class XrefMapDialog(QDialog):
 
         # direction of the code flow (module rank + intra-cluster call depth): left-to-right by
         # default, this button flips the whole layout to right-to-left
-        self.direction_btn = QPushButton('Direzione: Sx → Dx')
+        self.direction_btn = QPushButton(' Direzione: Sx → Dx')
+        self.direction_btn.setIcon(draw_icon('swap', 14))
+        self.direction_btn.setIconSize(QSize(14, 14))
         self.direction_btn.setCheckable(True)
         self.direction_btn.setToolTip('Inverte la direzione del flusso logico del codice nella mappa')
         self.direction_btn.toggled.connect(self._on_direction_toggle)
@@ -2997,7 +3171,9 @@ class XrefMapDialog(QDialog):
             self.edge_tag_buttons[tag] = btn
             edge_tag_row.addWidget(btn)
         edge_tag_row.addSpacing(10)
-        self.containment_btn = QPushButton('Appartenenza')
+        self.containment_btn = QPushButton(' Appartenenza')
+        self.containment_btn.setIcon(draw_icon('nest', 14))
+        self.containment_btn.setIconSize(QSize(14, 14))
         self.containment_btn.setCheckable(True)
         self.containment_btn.setChecked(self._show_containment)
         self.containment_btn.setFixedHeight(26)
