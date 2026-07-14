@@ -1,5 +1,24 @@
 KANT IDE changelog
 
+2026-07-14 (27)
+- Fixed the AI chat text not handling special characters well: it was decoded with the OS locale codepage (Windows ANSI, not UTF-8) even though the claude/codex CLIs are UTF-8 regardless of locale, corrupting any accented letter, emoji, or box-drawing glyph. Also strips the ANSI color/cursor codes those CLIs emit (previously shown as garbage glyphs) and collapses \r progress-bar overwrites instead of leaving them in the text.
+- Moved the AI change review out of an inline chat card into its own large window (same framed-header look as the Git panel/MAPPA dialog), and added real red/green color coding to its diff view (DiffHighlighter) — previously the diff was flat, uncolored plain text.
+- Split panel now supports multiple simultaneous elements: double-clicking a different KANT element (even from the same parent module) opens its own tab alongside whatever's already open, instead of overwriting it. Double-clicking the same element again switches to its existing tab rather than duplicating it.
+- The filename label at the bottom-right of the coding panel is now bold and selectable/copyable (was plain, non-interactive text).
+- Added a confirmation dialog before closing the IDE.
+- Fixed a real dead-space regression in the KANT tree panel: its stylesheet was built independently in two places (initial construction and the day/night theme-toggle refresh) and had drifted apart — the theme-toggle version used much more generous padding and a hardcoded, night-mode-blind selection color. Both now go through one shared builder so they can't diverge again.
+
+2026-07-14 (26)
+- Reversed the AI chat box's send keys back to the standard convention: Return sends, Ctrl+Return inserts a newline (was the other way around as of round 23). QPlainTextEdit's own default handling isn't bound to Ctrl+Return at all, so the newline is now inserted explicitly rather than relying on a fallthrough that silently did nothing.
+- Polished the AI pane's buttons: the Send button got an icon and hover/pressed states instead of a single flat fill; the agent/model/effort selectors are now solid pill-shaped chips instead of blending flat into their own controls bar; the three permission-request buttons (Rifiuta / Consenti una volta / Consenti per la sessione) are now color-coded (deny=danger, allow=accept) instead of three identical plain buttons.
+
+2026-07-14 (25)
+- The File/Cerca/LSP/Git title-bar menus and the Save/Undo/Redo/Run/Find action toolbar are now hidden on the welcome screen (no project open, nothing for them to act on) and only appear once a project is opened. Aspetto (theme toggle + command palette) stays visible regardless, since a theme switch is meaningful even before a project is open.
+
+2026-07-14 (24)
+- Fixed a real crash: RuntimeError "Internal C++ object (CodeEdit) already deleted" from CodeEdit._auto_resize. A QTimer.singleShot(0, self._auto_resize) deferred callback (scheduled on horizontalScrollBar().rangeChanged) isn't auto-disconnected when its CodeEdit is destroyed the way a direct signal/slot connection is — if the tab closed between scheduling and firing, the callback still ran against a deleted C++ object. _auto_resize now checks shiboken6.isValid(self) first and no-ops if the widget is already gone.
+- The MAPPA tab now sits centered on the map dialog's own top edge while open (where its removed header row used to be), instead of the dialog's bottom edge — closed, it's unchanged on the shell's own bottom edge, since the top there is already the title bar/toolbar.
+
 2026-07-13 (23)
 - Added "Altro..." to the Git button's hover dropdown, opening the full Git panel — the same destination as clicking the button itself, now reachable from the quick-actions list too.
 - Improved the AI chat pane: agent/model/effort/auto-permission controls now sit in their own rounded "controls bar" instead of floating loose in the title row; the send button and prompt box got a visual refresh.

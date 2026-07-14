@@ -24,13 +24,15 @@ import time
 from html import escape as html_escape
 from pathlib import Path
 
+import shiboken6
+
 from PySide6.QtCore import (
     QElapsedTimer, QEvent, QFileSystemWatcher, QObject, QPointF, QProcess, QRect, QRectF, Qt, QSettings, QSize,
     QStringListModel, Signal, QTimer,
 )
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
-    QPainterPathStroker, QShortcut, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument,
+    QBrush, QColor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
+    QPainterPathStroker, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog, QFileDialog, QFrame,
@@ -101,6 +103,42 @@ class KantHighlighter(QSyntaxHighlighter):
             elif word and word in KEYWORDS:
                 self.setFormat(start, length, self.fmt_keyword)
 # [FN CLOSED] KantHighlighter
+
+
+# [FN CATEGORY] DiffHighlighter — colors whole unified-diff lines by their leading character
+# (+/-/@@), the same one-format-per-block shape as KantHighlighter but keyed on the line's start
+# instead of a token regex. Background is the foreground color at low alpha rather than a literal
+# hex tint, so it reads correctly against CODE_BG in both day and night theme without a second
+# color pair to keep in sync.
+# [FN] DiffHighlighter — green/red backgrounds for added/removed unified-diff lines
+# [FN OPEN] DiffHighlighter
+class DiffHighlighter(QSyntaxHighlighter):
+    def __init__(self, document):
+        super().__init__(document)
+        self.fmt_added = self._fmt(theme.OK)
+        self.fmt_removed = self._fmt(theme.TAG_COLORS['TST'])
+        self.fmt_header = self._fmt(theme.ACCENT, bold=True, tint=False)
+
+    @staticmethod
+    def _fmt(color, bold=False, tint=True):
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        if bold:
+            fmt.setFontWeight(QFont.Bold)
+        if tint:
+            bg = QColor(color)
+            bg.setAlpha(30)
+            fmt.setBackground(bg)
+        return fmt
+
+    def highlightBlock(self, text):
+        if text.startswith('+++') or text.startswith('---') or text.startswith('@@'):
+            self.setFormat(0, len(text), self.fmt_header)
+        elif text.startswith('+'):
+            self.setFormat(0, len(text), self.fmt_added)
+        elif text.startswith('-'):
+            self.setFormat(0, len(text), self.fmt_removed)
+# [FN CLOSED] DiffHighlighter
 
 
 # [FN CATEGORY] LineNumberArea — thin companion widget painted in CodeEdit's left viewport margin;
@@ -196,6 +234,13 @@ class CodeEdit(QPlainTextEdit):
         self.rename_provider = None
 
     def _auto_resize(self):
+        # the rangeChanged connection above defers this call via QTimer.singleShot(0, ...) — if
+        # this CodeEdit's tab closes between scheduling and firing, the C++ side is already gone
+        # by the time this runs (a bound-method QTimer.singleShot callback isn't auto-disconnected
+        # on target deletion the way a direct signal/slot connection is), and touching any Qt
+        # method below raises "Internal C++ object already deleted" instead of silently no-oping
+        if not shiboken6.isValid(self):
+            return
         lines = max(self.blockCount(), 1)
         padding = 10
         # only reserve the horizontal scrollbar's height when a line actually overflows the
@@ -640,6 +685,27 @@ def _agent_label(agent):
     return 'Codex' if agent == 'codex' else 'Claude Code'
 
 
+# [CST] _ANSI_ESCAPE_RE — matches CSI (color/cursor, "ESC[...letter"), OSC ("ESC]...BEL/ST"), and
+# other single-character ESC sequences — the claude/codex CLIs colorize their own stdout, and
+# those raw bytes rendered as plain text look like garbage glyphs instead of being invisible.
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[@-_]')
+
+
+# [FN CATEGORY] _normalize_ai_text — the claude/codex CLIs are UTF-8 regardless of the OS locale
+# (unlike TerminalPane's plain shell, where the locale codepage is the actually-correct encoding
+# for whatever's running in it), so decoding their output with locale.getpreferredencoding() — a
+# Windows ANSI codepage, not UTF-8 — corrupts any accented letter, emoji, or box-drawing glyph.
+# Also drops ANSI color/cursor codes and collapses bare \r (progress-bar/spinner overwrites, not
+# real content) into nothing.
+# [FN] _normalize_ai_text — decodes AI-CLI stdout/stderr bytes as UTF-8 and strips ANSI/control noise
+# [FN OPEN] _normalize_ai_text
+def _normalize_ai_text(raw_bytes):
+    text = bytes(raw_bytes).decode('utf-8', errors='replace')
+    text = _ANSI_ESCAPE_RE.sub('', text)
+    return text.replace('\r\n', '\n').replace('\r', '')
+# [FN CLOSED] _normalize_ai_text
+
+
 # [CST] _TYPING_FRAMES — cycled in the placeholder assistant bubble while a prompt is running and
 # no output has streamed back yet, so the chat shows the AI is working instead of sitting blank
 _TYPING_FRAMES = ('·', '· ·', '· · ·')
@@ -669,6 +735,27 @@ EFFORT_LEVELS = {
     'claude': (MODEL_DEFAULT, 'low', 'medium', 'high', 'xhigh', 'max'),
     'codex': (MODEL_DEFAULT, 'low', 'medium', 'high'),
 }
+
+
+# [FN CATEGORY] _PromptEdit — QPlainTextEdit's own default (Return inserts a newline) is the
+# opposite of a chat box's usual convention, so Return here emits send_requested instead. Ctrl+
+# Return inserts the newline explicitly rather than falling through to the default handler —
+# QPlainTextEdit's own Return handling isn't bound to Ctrl+Return at all (only bare Return), so
+# super().keyPressEvent(event) here would silently do nothing instead of inserting anything.
+# [FN] _PromptEdit — Return sends, Ctrl+Return inserts a newline
+# [FN OPEN] _PromptEdit
+class _PromptEdit(QPlainTextEdit):
+    send_requested = Signal()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if event.modifiers() & Qt.ControlModifier:
+                self.insertPlainText('\n')
+            else:
+                self.send_requested.emit()
+            return
+        super().keyPressEvent(event)
+# [FN CLOSED] _PromptEdit
 
 
 class ClaudePane(QWidget):
@@ -749,23 +836,22 @@ class ClaudePane(QWidget):
         self.output.setWidget(self.chat)
         layout.addWidget(self.output, 1)
 
-        self.prompt = QPlainTextEdit()
+        self.prompt = _PromptEdit()
         self.prompt.setFixedHeight(90)
         self.prompt.setFont(QFont('Consolas', theme.CODE_FONT_PT))
         self.prompt.setStyleSheet(
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:8px; padding:8px;'
         )
-        # Return alone still inserts a newline (QPlainTextEdit's own default); Ctrl+Return sends,
-        # so a multi-line prompt doesn't need the mouse to reach the button
-        self.send_shortcut = QShortcut(QKeySequence('Ctrl+Return'), self.prompt)
-        self.send_shortcut.setContext(Qt.WidgetShortcut)
-        self.send_shortcut.activated.connect(self._send)
-        self.prompt.setPlaceholderText('Prompt per claude -p... (Ctrl+Invio per inviare)')
+        # Return sends; Ctrl+Return inserts a newline instead (see _PromptEdit)
+        self.prompt.send_requested.connect(self._send)
+        self.prompt.setPlaceholderText('Prompt per claude -p... (Invio per inviare, Ctrl+Invio per andare a capo)')
         composer = QHBoxLayout()
         composer.addWidget(self.prompt, 1)
-        self.send_btn = QPushButton('Invia')
+        self.send_btn = QPushButton(' Invia')
+        self.send_btn.setIcon(draw_icon('arrow-right', 14))
+        self.send_btn.setIconSize(QSize(14, 14))
+        self.send_btn.setCursor(Qt.PointingHandCursor)
         self.send_btn.clicked.connect(self._send)
-        self.send_btn.setStyleSheet(theme.BUTTON_STYLE + f'QPushButton {{ color:{theme.WARN}; border-color:{theme.WARN}; }}')
         self.send_btn.setFixedHeight(42)
         composer.addWidget(self.send_btn, 0, Qt.AlignBottom)
         layout.addLayout(composer)
@@ -785,14 +871,25 @@ class ClaudePane(QWidget):
         self.prompt.setStyleSheet(
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:8px; padding:8px;'
         )
-        combo_style = theme.BUTTON_STYLE.replace('QPushButton', 'QComboBox')
+        # solid pill background (not just a bare border) so each combo reads as its own control
+        # against the controls bar's own CODE_BG fill, instead of blending flat into it
+        combo_style = (
+            f'QComboBox {{ background:{theme.PANEL}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:12px; padding:5px 10px; font-weight:600; }} '
+            f'QComboBox:hover {{ border-color:{theme.ACCENT}; color:{theme.ACCENT}; }} '
+            f'QComboBox:disabled {{ color:{theme.DIM}; border-color:#e2e8f0; background:#f1f5f9; }} '
+            f'QComboBox::drop-down {{ border:none; width:16px; }}'
+        )
         self.agent_select.setStyleSheet(combo_style)
         self.model_select.setStyleSheet(combo_style)
         self.effort_select.setStyleSheet(combo_style)
-        self.auto_permissions.setStyleSheet(f'color:{theme.WARN}; spacing:6px;')
+        self.auto_permissions.setStyleSheet(f'color:{theme.WARN}; font-weight:600; spacing:6px;')
         self.send_btn.setStyleSheet(
             f'QPushButton {{ background:{theme.WARN}; color:#ffffff; border:none; border-radius:9px; '
-            f'padding:7px 13px; font-weight:700; }}'
+            f'padding:7px 15px; font-weight:700; }} '
+            f'QPushButton:hover {{ background:{theme.ACCENT}; }} '
+            f'QPushButton:pressed {{ background:{theme.TEXT}; }} '
+            f'QPushButton:disabled {{ background:#cbd5e1; color:#ffffff; }}'
         )
         for role, frame, name, label in self._messages:
             self._style_message(role, frame, name, label)
@@ -808,7 +905,7 @@ class ClaudePane(QWidget):
     def _agent_changed(self):
         is_codex = self._agent() == 'codex'
         base_prompt = 'Prompt per codex exec...' if is_codex else 'Prompt per claude -p...'
-        self.prompt.setPlaceholderText(f'{base_prompt} (Ctrl+Invio per inviare)')
+        self.prompt.setPlaceholderText(f'{base_prompt} (Invio per inviare, Ctrl+Invio per andare a capo)')
         self.auto_permissions.setEnabled(self._agent() == 'claude')
         current = self.model_select.currentText().strip()
         models = CODEX_MODELS if is_codex else CLAUDE_MODELS
@@ -863,8 +960,17 @@ class ClaudePane(QWidget):
         content.addWidget(status)
         actions = QHBoxLayout()
         buttons = [QPushButton(label) for label in ('Rifiuta', 'Consenti una volta', 'Consenti per la sessione')]
-        for button in buttons:
-            button.setStyleSheet(theme.BUTTON_STYLE)
+        # color-coded (deny=danger, allow=accept) instead of three identical plain buttons — a
+        # permission decision is exactly the kind of choice a misclick shouldn't be easy to make
+        deny_color = theme.TAG_COLORS['TST']
+        for button, accent in zip(buttons, (deny_color, theme.OK, theme.OK)):
+            button.setCursor(Qt.PointingHandCursor)
+            button.setStyleSheet(
+                f'QPushButton {{ background:{theme.PANEL}; color:{accent}; border:1px solid {accent}; '
+                f'border-radius:8px; padding:6px 12px; font-weight:700; }} '
+                f'QPushButton:hover {{ background:{accent}; color:#ffffff; }} '
+                f'QPushButton:disabled {{ color:{theme.DIM}; border-color:#e2e8f0; background:#f1f5f9; }}'
+            )
             actions.addWidget(button)
         buttons[0].clicked.connect(lambda: self._decide_permission(request, status, buttons, 'deny'))
         buttons[1].clicked.connect(lambda: self._decide_permission(request, status, buttons, 'once'))
@@ -1086,10 +1192,10 @@ class ClaudePane(QWidget):
     # [FN CLOSED] run_prompt
 
     def _read_stdout(self):
-        self._append_stream(bytes(self.process.readAllStandardOutput()).decode(self.encoding, errors='replace'))
+        self._append_stream(_normalize_ai_text(self.process.readAllStandardOutput()))
 
     def _read_stderr(self):
-        self._append_stream(bytes(self.process.readAllStandardError()).decode(self.encoding, errors='replace'))
+        self._append_stream(_normalize_ai_text(self.process.readAllStandardError()))
 
     def _cleanup_temp_files(self):
         for attribute in ('system_prompt_file', 'permission_config_file'):
@@ -1129,53 +1235,80 @@ class ClaudePane(QWidget):
             self._append(f'\n[{_agent_label(self.current_agent)} completato]\n')
         self._reset_process()
 
-    # [FN CATEGORY] show_ai_review — embeds the AI change review directly in the chat transcript
-    # (same insert-into-chat_layout pattern as permission request cards) instead of opening it as a
-    # separate modal dialog, so it reads as part of the conversation and never blocks the rest of
-    # the IDE. on_resolved(action, accepted, manual_text) fires exactly once, when the user applies
-    # or cancels; the caller does the actual apply/rollback and reports the outcome as a follow-up
-    # chat message.
-    # [FN] show_ai_review — inserts an interactive AI review card into the chat
+    # [FN CATEGORY] show_ai_review — a large separate window (framed header, no native title bar —
+    # same look as the Git panel/MAPPA dialog) instead of embedding the card in the chat transcript,
+    # so a multi-file review gets real screen space instead of a 720px-wide bubble. Non-modal like
+    # the app's other internal windows, not blocking the rest of the IDE. on_resolved(action,
+    # accepted, manual_text) fires exactly once, when the user applies or cancels; the caller does
+    # the actual apply/rollback and reports the outcome as a follow-up chat message.
+    # [FN] show_ai_review — opens the AI review in its own window
     # [FN OPEN] show_ai_review
     def show_ai_review(self, review, render_text, on_resolved):
-        row = QWidget()
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        card = _AiReviewCard(review, render_text)
-        row_layout.addWidget(card, 0, Qt.AlignLeft)
-        row_layout.addStretch(1)
-        self.chat_layout.insertWidget(self.chat_layout.count() - 1, row)
-        QTimer.singleShot(0, lambda: self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum()))
+        dialog = QDialog(self)
+        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        dialog.resize(1100, 760)
+        dialog.setStyleSheet(f'QDialog {{ background:{theme.BG}; border:1px solid {theme.BORDER}; }}')
+
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        header = QWidget()
+        header.setFixedHeight(34)
+        header.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(14, 0, 8, 0)
+        title = QLabel(f"Revisione modifiche AI — {len(review)} file")
+        title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
+        title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:1px; border:none;')
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+        close_btn = QPushButton('×')
+        close_btn.setFixedSize(26, 24)
+        close_btn.setStyleSheet(theme.BUTTON_STYLE)
+        header_row.addWidget(close_btn)
+        outer.addWidget(header)
+
+        card = _AiReviewCard(review, render_text, in_dialog=True)
+        outer.addWidget(card, 1)
 
         def fire(action):
             card.set_resolved()
             on_resolved(action, card.accepted(), card.manual_text)
+            dialog.close()
 
         card.resolved.connect(fire)
+        close_btn.clicked.connect(lambda: card.resolved.emit('cancel'))
+        dialog.show()
     # [FN CLOSED] show_ai_review
 
 
-# [FN CATEGORY] _AiReviewCard — the AI change review UI, embedded as a chat card rather than a
-# modal dialog: a compact summary (file count, +/- totals, per-file rows) that "Controllo" expands
-# into a file/hunk checklist plus a diff/editable-result tab view. Emits resolved('apply'|'cancel')
-# exactly once and then locks its action buttons — the outcome message comes from the chat itself.
-# [FN] _AiReviewCard — inline AI review widget (file/hunk selection, diff, editable result)
+# [FN CATEGORY] _AiReviewCard — the AI change review UI: a compact summary (file count, +/- totals,
+# per-file rows) that "Controllo" expands into a file/hunk checklist plus a diff/editable-result
+# tab view. In its own window (in_dialog=True, the only way it's used now — see show_ai_review),
+# the summary's own Controllo/Annulla buttons are redundant with the details panel's own action row
+# and the window's own close button, so they're skipped and details are shown immediately instead
+# of waiting for a click. Emits resolved('apply'|'cancel') exactly once and then locks its action
+# buttons.
+# [FN] _AiReviewCard — AI review widget (file/hunk selection, diff, editable result)
 # [FN OPEN] _AiReviewCard
 class _AiReviewCard(QWidget):
     DATA_ROLE = Qt.UserRole
     resolved = Signal(str)
 
-    def __init__(self, review, render_text):
+    def __init__(self, review, render_text, in_dialog=False):
         super().__init__()
         self.review = review
         self.render_text = render_text
+        self.in_dialog = in_dialog
         self.by_path = {item['path']: item for item in review}
         self.file_items = {}
         self.manual_text = {}
         self._current_path = None
         self._loading_editor = False
         self._action_buttons = []
-        self.setMaximumWidth(720)
+        if not in_dialog:
+            self.setMaximumWidth(720)
         self.setStyleSheet(
             f'#aiReviewBubble, #aiReviewDetails {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:12px; }} '
             f'QLabel {{ color:{theme.TEXT}; }} QTreeWidget, QPlainTextEdit {{ background:{theme.CODE_BG}; '
@@ -1188,7 +1321,9 @@ class _AiReviewCard(QWidget):
         root.addWidget(self._build_summary())
         self.details = self._build_details()
         self.details.hide()
-        root.addWidget(self.details)
+        root.addWidget(self.details, 1)
+        if in_dialog:
+            self._show_details()
 
     def _button(self, text, slot, action=False):
         button = QPushButton(text)
@@ -1204,24 +1339,30 @@ class _AiReviewCard(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 8, 12, 9)
         layout.setSpacing(3)
-        # same name-label treatment as a normal assistant chat bubble (_style_message), so this
-        # reads as another message in the conversation rather than a separate card bolted on
-        sender = QLabel('Assistente AI')
-        sender.setStyleSheet(f'color:{theme.TEXT}; font-weight:600; background:transparent;')
-        layout.addWidget(sender)
+        if not self.in_dialog:
+            # same name-label treatment as a normal assistant chat bubble (_style_message), so this
+            # reads as another message in the conversation rather than a separate card bolted on
+            sender = QLabel('Assistente AI')
+            sender.setStyleSheet(f'color:{theme.TEXT}; font-weight:600; background:transparent;')
+            layout.addWidget(sender)
         header = QHBoxLayout()
         totals = QVBoxLayout()
-        title = QLabel(f"{len(self.review)} file {'modificato' if len(self.review) == 1 else 'modificati'}")
-        title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
-        totals.addWidget(title)
+        if not self.in_dialog:
+            # in a dialog this is redundant with the window's own title bar ("... — N file")
+            title = QLabel(f"{len(self.review)} file {'modificato' if len(self.review) == 1 else 'modificati'}")
+            title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
+            totals.addWidget(title)
         added = sum(item['additions'] for item in self.review)
         deleted = sum(item['deletions'] for item in self.review)
         counts = QLabel(f'<span style="color:{theme.OK}">+{added}</span>  <span style="color:#ef4444">-{deleted}</span>')
         totals.addWidget(counts)
         header.addLayout(totals)
         header.addStretch(1)
-        header.addWidget(self._button('Annulla ↶', lambda: self.resolved.emit('cancel'), action=True))
-        header.addWidget(self._button('Controllo', self._show_details))
+        if not self.in_dialog:
+            # redundant in a dialog: the window's own close button cancels, and details are
+            # already shown immediately instead of waiting for a "Controllo" click
+            header.addWidget(self._button('Annulla ↶', lambda: self.resolved.emit('cancel'), action=True))
+            header.addWidget(self._button('Controllo', self._show_details))
         layout.addLayout(header)
 
         self.summary_rows = []
@@ -1289,6 +1430,7 @@ class _AiReviewCard(QWidget):
         self.diff_view = QPlainTextEdit()
         self.diff_view.setReadOnly(True)
         self.diff_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.diff_highlighter = DiffHighlighter(self.diff_view.document())
         self.result_editor = QPlainTextEdit()
         self.result_editor.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.result_editor.textChanged.connect(self._editor_changed)

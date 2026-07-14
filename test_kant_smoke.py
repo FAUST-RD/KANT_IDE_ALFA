@@ -11,6 +11,8 @@ import time
 import unittest
 from pathlib import Path
 
+import shiboken6
+
 from PySide6.QtCore import Qt, QEvent, QPointF, QSettings
 from PySide6.QtGui import QKeyEvent, QKeySequence, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
@@ -27,8 +29,8 @@ from kant.lsp import file_uri, LspClient
 from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
 from kant.xref import build_xref, XrefElement
 from kant.widgets import (
-    CollapsibleSection, FileTab, LeafSection, RecentFolderCard, _AiReviewCard, _agent_command, CodeEdit,
-    MODEL_DEFAULT,
+    CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard, _AiReviewCard,
+    _agent_command, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
 )
 from kant.mappa import XrefMapDialog, XrefMapView, _force_layout_positions
 from kant import gitops as kant_gitops_module
@@ -92,6 +94,17 @@ class KantSmokeTest(unittest.TestCase):
     def setUpClass(cls):
         os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
         cls.app = QApplication.instance() or QApplication(sys.argv)
+        # closeEvent now confirms before quitting (a real modal .exec()) — default it to "yes" for
+        # every test's window.close() calls, since none of them are testing that dialog itself.
+        # A dedicated method (not _ide_yes_no, which plenty of tests already stub for unrelated
+        # dialogs) so this class-wide default can't silently collide with an individual test's own
+        # _ide_yes_no override and make its window.close() no-op instead of really closing.
+        cls._original_confirm_close = MainWindow._confirm_close
+        MainWindow._confirm_close = lambda self: True
+
+    @classmethod
+    def tearDownClass(cls):
+        MainWindow._confirm_close = cls._original_confirm_close
 
     def test_main_window_shell_claude_pane_and_agent_launch(self):
         window = MainWindow()
@@ -139,6 +152,12 @@ class KantSmokeTest(unittest.TestCase):
             'event': threading.Event(), 'response': None,
         }
         window.claude_pane._permission_requested(manual_request)
+        # color-coded so a misclick isn't as easy: deny is the danger color, both allow options
+        # share the accept color — checked via the same TAG_COLORS/OK theme constants the styling
+        # itself draws from, so a theme change can't silently desync this from the real palette
+        perm_buttons = window.claude_pane._permission_cards[-1][2]
+        assert theme.TAG_COLORS['TST'] in perm_buttons[0].styleSheet()
+        assert theme.OK in perm_buttons[1].styleSheet() and theme.OK in perm_buttons[2].styleSheet()
         window.claude_pane._permission_cards[-1][2][1].click()
         assert manual_request['response']['behavior'] == 'allow'
         cards_before = len(window.claude_pane._permission_cards)
@@ -172,16 +191,17 @@ class KantSmokeTest(unittest.TestCase):
         pane._send()
         assert calls and calls[0]['effort'] == 'high'  # the UI selection actually reaches run_prompt
 
-        # Ctrl+Return sends without needing the mouse on the button; plain Return still just
-        # inserts a newline (QPlainTextEdit's own default, left untouched — no override needed).
-        # Verified by the actual key sequence + signal wiring rather than a simulated OS-level key
-        # press: WidgetShortcut delivery needs real window activation/focus that offscreen Qt
-        # doesn't reliably grant, so a keyClick here would test platform focus plumbing, not this
-        # feature's own logic.
-        assert pane.send_shortcut.key() == QKeySequence('Ctrl+Return')
+        # Return sends; Ctrl+Return inserts a newline instead — a plain keyPressEvent override on
+        # _PromptEdit (not a QShortcut), so a direct QTest.keyClick reliably exercises it, unlike
+        # WidgetShortcut delivery which needs real window activation/focus offscreen Qt doesn't grant
         calls.clear()
-        pane.prompt.setPlainText('di nuovo')
-        pane.send_shortcut.activated.emit()
+        pane.prompt.setPlainText('')
+        QTest.keyClicks(pane.prompt, 'riga1')
+        QTest.keyClick(pane.prompt, Qt.Key_Return, Qt.ControlModifier)
+        QTest.keyClicks(pane.prompt, 'riga2')
+        assert calls == []  # Ctrl+Return must not have sent
+        assert pane.prompt.toPlainText() == 'riga1\nriga2'
+        QTest.keyClick(pane.prompt, Qt.Key_Return)  # plain Return sends
         assert calls and calls[0]['effort'] == 'high'
         window.close()
 
@@ -292,6 +312,22 @@ class KantSmokeTest(unittest.TestCase):
         assert label_dclicks == [dummy_item]
         assert window.title_bar.file_menu_btn.menu() is not None
         assert window.title_bar.file_menu_btn.popupMode() == QToolButton.DelayedPopup
+        window.close()
+
+    def test_tree_stylesheet_stays_tight_and_consistent_across_theme_toggle(self):
+        # regression: the tree's QSS used to be built independently at construction time and again
+        # in _apply_theme's theme-toggle refresh, and the two had drifted apart — a real dead-space
+        # regression (padding:6px 4px vs. a later padding:14px 10px) plus a hardcoded, night-blind
+        # selection color, both only visible after the first day/night toggle. One shared
+        # _tree_stylesheet() builder now backs both call sites, so they can't diverge again.
+        window = MainWindow()
+        before = window.tree.styleSheet()
+        assert 'padding:6px 4px' in before  # the tight, boxed style — not the old 14px/10px drift
+        window._toggle_theme()
+        after = window.tree.styleSheet()
+        assert after == window._tree_stylesheet()
+        assert 'padding:6px 4px' in after  # still tight after a real theme toggle, not just at boot
+        window._toggle_theme()  # back to the original theme, tidy for anything after this test
         window.close()
 
     def test_project_tree_build_read_label_and_fs_reload(self):
@@ -458,35 +494,57 @@ class KantSmokeTest(unittest.TestCase):
             fn_labels = ' '.join(l.text() for l in fn_widget.findChildren(QLabel))
             assert '[FN]' in fn_labels  # nested element still gets its own header
 
-            # split pane: identity is the KANT element, not a filename tab, and it must not disturb
-            # whatever the main pane currently has active
+            # split tabs: identity is the KANT element, not a filename tab, and it must not disturb
+            # whatever the main pane currently has active. A different element gets its OWN tab
+            # instead of overwriting whichever one is currently showing; double-clicking the SAME
+            # element again switches to its existing tab instead of duplicating it.
             alpha_section = None
+            beta_section = None
             it = tree_window.tree.invisibleRootItem()
             stack = [it.child(i) for i in range(it.childCount())]
             while stack:
                 candidate = stack.pop()
-                if candidate.data(0, ROLE_KIND) == 'section' and 'alpha' in tree_window.tree.itemWidget(candidate, 0).text():
-                    alpha_section = candidate
+                if candidate.data(0, ROLE_KIND) == 'section':
+                    text = tree_window.tree.itemWidget(candidate, 0).text()
+                    if 'alpha' in text:
+                        alpha_section = candidate
+                    elif 'beta' in text:
+                        beta_section = candidate
                 for i in range(candidate.childCount()):
                     stack.append(candidate.child(i))
-            assert alpha_section is not None
+            assert alpha_section is not None and beta_section is not None
             main_filter_before = legacy_tab.filter_uid
-            assert tree_window.split_panel.isHidden()  # tree_window is never shown, so isVisible() is unusable here
+            assert tree_window.split_tabs.isHidden()  # tree_window is never shown, so isVisible() is unusable here
             tree_window._on_tree_item_double_clicked(alpha_section, 0)
-            assert not tree_window.split_panel.isHidden()
-            assert tree_window.split_header_label.text() == '[FN] alpha'  # KANT identity, not "legacy.py"
+            assert not tree_window.split_tabs.isHidden()
+            assert tree_window.split_tabs.count() == 1
+            assert tree_window.split_tabs.tabText(0) == '[FN] alpha'  # KANT identity, not "legacy.py"
             assert legacy_tab.filter_uid == main_filter_before  # main pane untouched
-            split_codes = [c.toPlainText().strip() for c in tree_window.split_view_layout.itemAt(0).widget().findChildren(CodeEdit)]
+            alpha_page = tree_window.split_tabs.widget(0)
+            split_codes = [c.toPlainText().strip() for c in alpha_page.findChildren(CodeEdit)]
             assert split_codes == ['def alpha(): pass']
-            tree_window._close_split_pane()
-            assert tree_window.split_panel.isHidden() and tree_window.split_tab is None
 
-            # closing the tab the split pane is showing must close the split pane too, not leave it
-            # pointing at a tab that's been torn down
+            # double-clicking the SAME element again switches to its existing tab, no duplicate
             tree_window._on_tree_item_double_clicked(alpha_section, 0)
-            assert not tree_window.split_panel.isHidden()
+            assert tree_window.split_tabs.count() == 1
+
+            # a DIFFERENT element (same parent module) opens its own tab alongside the first
+            tree_window._on_tree_item_double_clicked(beta_section, 0)
+            assert tree_window.split_tabs.count() == 2
+            assert tree_window.split_tabs.tabText(1) == '[FN] beta'
+            beta_page = tree_window.split_tabs.widget(1)
+            beta_codes = [c.toPlainText().strip() for c in beta_page.findChildren(CodeEdit)]
+            assert beta_codes == ['def beta(): pass']
+            assert tree_window.split_tabs.widget(0) is alpha_page  # first tab untouched by the second
+
+            tree_window._close_split_tab(0)
+            assert tree_window.split_tabs.count() == 1
+            assert not tree_window.split_tabs.isHidden()  # one tab still open
+
+            # closing the tab the remaining split page is showing must close that page too, not
+            # leave it pointing at a tab that's been torn down
             tree_window._close_tab(tree_window.tabs.indexOf(legacy_tab), flush=False)
-            assert tree_window.split_panel.isHidden() and tree_window.split_tab is None
+            assert tree_window.split_tabs.isHidden() and tree_window.split_tabs.count() == 0
             tree_window.close()
 
     def test_mappa_geometry_drag_reorder_and_tab_label_leak(self):
@@ -519,12 +577,22 @@ class KantSmokeTest(unittest.TestCase):
             assert abs(dialog.geometry().bottom() - status_top) <= 1
             assert dialog.width() == window_width_at_show
 
+            # the MAPPA tab sits centered on the dialog's own top edge while open (pointing down
+            # at the map content below it), not the shell's bottom edge (already the title/toolbar)
+            assert mappa_window.map_tab_btn.parent() is dialog
+            assert mappa_window.map_tab_btn.y() == 0
+            expected_x = (dialog.width() - mappa_window.map_tab_btn.width()) // 2
+            assert abs(mappa_window.map_tab_btn.x() - expected_x) <= 1
+
             # regression: the alignment used to be computed once (a _positioned flag in
             # XrefMapDialog.showEvent) and never redone — resizing the main window, closing MAPPA,
             # and reopening it kept the stale old geometry. Positioning now lives in MainWindow
             # (_position_map_dialog), called on every open, not just the first.
             mappa_window._toggle_xref_window()  # close
             app.processEvents()
+            # closed, the tab goes back to the shell's own bottom edge instead
+            assert mappa_window.map_tab_btn.parent() is mappa_window.shell
+            assert mappa_window.map_tab_btn.y() == mappa_window.shell.height() - mappa_window.map_tab_btn.height()
             # must stay above the MAPPA toolbar's own minimum content width (many buttons), same
             # constraint as window_width_at_show above, or Qt can't honor the narrower resize
             mappa_window.resize(2300, 1000)
@@ -573,6 +641,19 @@ class KantSmokeTest(unittest.TestCase):
             final_idx_a = mappa_window.tabs.indexOf(tab_a)  # reorder above may have moved it
             assert mappa_window.tabs.tabBar().tabButton(final_idx_a, QTabBar.LeftSide) is None
             mappa_window.close()
+
+    def test_auto_resize_survives_deleted_cpp_object(self):
+        # regression: horizontalScrollBar().rangeChanged defers _auto_resize via
+        # QTimer.singleShot(0, self._auto_resize) — a bound-method singleShot callback, unlike a
+        # direct signal/slot connection, is NOT auto-disconnected when its target is destroyed. If
+        # the tab closes between scheduling and firing, the real crash was "RuntimeError: Internal
+        # C++ object (CodeEdit) already deleted" from inside _auto_resize. shiboken6.delete()
+        # reproduces that exact state (Python wrapper alive, C++ side gone) without needing a real
+        # deferred-timer race.
+        edit = CodeEdit('x = 1')
+        shiboken6.delete(edit)
+        assert not shiboken6.isValid(edit)
+        edit._auto_resize()  # must not raise
 
     def test_undo_redo_and_mark_dirty(self):
         with _temp_dir() as tmp:
@@ -781,6 +862,20 @@ class KantSmokeTest(unittest.TestCase):
             local_completion_edit.keyPressEvent(f2_event)
             assert gesture_calls == ['rename']
             lsp_window.close()
+
+    def test_normalize_ai_text_strips_ansi_and_decodes_utf8(self):
+        # the claude/codex CLIs are UTF-8 regardless of the OS locale, and colorize their own
+        # stdout — decoding with locale.getpreferredencoding() (a Windows ANSI codepage, not UTF-8)
+        # corrupted any accented letter, emoji, or box-drawing glyph; raw ANSI codes rendered as
+        # garbage glyphs instead of being invisible
+        accented = 'caffè è pronto ☕'.encode('utf-8')
+        assert _normalize_ai_text(accented) == 'caffè è pronto ☕'
+
+        colored = b'\x1b[32mOK\x1b[0m: \x1b[1mdone\x1b[0m'
+        assert _normalize_ai_text(colored) == 'OK: done'
+
+        # a lone \r (progress-bar/spinner overwrite) is dropped; \r\n is normalized to \n
+        assert _normalize_ai_text(b'line1\rline2\r\nline3') == 'line1line2\nline3'
 
     def test_xref_edges_ignore_comments_and_strings(self):
         xref_tree = parse_kant('\n'.join([
@@ -1316,6 +1411,46 @@ class KantSmokeTest(unittest.TestCase):
         window.close()
         QSettings('KANT', 'KANT Editor').remove('recentFolders')
 
+    def test_confirm_before_close(self):
+        # declining the confirmation must actually keep the window open (event.ignore()), not just
+        # skip past it — real closeEvent() call, not a direct _confirm_close() check in isolation.
+        # _closing only gets set True inside closeEvent, after the confirm+flush checks pass — the
+        # one reliable signal here, since isVisible()/isHidden() are meaningless on a never-shown window
+        window = MainWindow()
+        window._confirm_close = lambda: False
+        window.close()
+        assert not window._closing  # declined -> real cleanup never ran
+
+        window._confirm_close = lambda: True
+        window.close()
+        assert window._closing  # accepted -> closeEvent actually proceeded
+        window.deleteLater()
+
+    def test_project_chrome_hidden_on_welcome_shown_after_open(self):
+        # File/Cerca/LSP/Git act on tabs/files/the project tree — on the welcome screen (no project
+        # open yet) they used to be active menus with nothing useful inside. isHidden(), not
+        # isVisible(): window is never shown in this test, so isVisible() would be False regardless
+        # of these calls (it also accounts for the whole unshown ancestor chain).
+        window = MainWindow()
+        project_menus = (
+            window.title_bar.file_menu_btn, window.title_bar.search_menu_btn,
+            window.title_bar.lsp_menu_btn, window.title_bar.git_menu_btn,
+        )
+        assert all(btn.isHidden() for btn in project_menus)
+        assert window.action_toolbar.isHidden()
+        assert not window.title_bar.appearance_menu_btn.isHidden()  # theme/palette stay useful regardless
+
+        project_root = Path(tempfile.mkdtemp())
+        window._ide_yes_no = lambda *_args, **_kwargs: False  # decline the KANT-tagging prompts
+        window._open_project_folder(str(project_root))
+        assert all(not btn.isHidden() for btn in project_menus)
+        assert not window.action_toolbar.isHidden()
+
+        window._go_back_to_welcome()
+        assert all(btn.isHidden() for btn in project_menus)
+        assert window.action_toolbar.isHidden()
+        window.close()
+
     def test_crash_handler_writes_log_and_shows_dialog(self):
         # PySide6 routes an uncaught exception from a Qt slot through sys.excepthook same as any
         # other uncaught exception, so installing the hook and invoking it directly with a synthetic
@@ -1414,16 +1549,23 @@ class KantSmokeTest(unittest.TestCase):
             review_card.close()
 
             window = MainWindow()
-            rows_before = window.claude_pane.chat_layout.count()
+            chat_rows_before = window.claude_pane.chat_layout.count()
             review_outcomes = []
             window.claude_pane.show_ai_review(review, render_review_text, lambda *args: review_outcomes.append(args))
-            assert window.claude_pane.chat_layout.count() == rows_before + 1  # inserted inline, not a popup
-            inserted_row = window.claude_pane.chat_layout.itemAt(window.claude_pane.chat_layout.count() - 2).widget()
-            inline_card = inserted_row.findChild(_AiReviewCard)
-            assert inline_card is not None
-            inline_card.resolved.emit('apply')
+            # a separate window now (QDialog(self) still registers as a Qt child of claude_pane for
+            # ownership, findChildren finds it across that window boundary), not inserted into chat
+            assert window.claude_pane.chat_layout.count() == chat_rows_before
+            dialog_cards = window.claude_pane.findChildren(_AiReviewCard)
+            assert len(dialog_cards) == 1
+            dialog_card = dialog_cards[0]
+            assert dialog_card.in_dialog is True
+            assert not dialog_card.details.isHidden()  # shown immediately, no "Controllo" click needed
+            # DiffHighlighter colors +/- lines instead of the diff being flat plain text
+            assert isinstance(dialog_card.diff_highlighter, DiffHighlighter)
+            assert dialog_card.diff_view.toPlainText().strip()
+            dialog_card.resolved.emit('apply')
             assert review_outcomes and review_outcomes[0][0] == 'apply'
-            assert all(not button.isEnabled() for button in inline_card._action_buttons)  # locks after resolving
+            assert all(not button.isEnabled() for button in dialog_card._action_buttons)  # locks after resolving
             window.close()
             apply_ai_review(str(review_root), review, {'sample.txt': {0}})
             partial = review_file.read_text(encoding='utf-8')

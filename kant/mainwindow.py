@@ -232,6 +232,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.stack.addWidget(self._build_welcome_page())  # index 0: shown until a folder is opened
         self.stack.addWidget(self._build_main_page())      # index 1: project tree + view
         self.stack.setCurrentIndex(0)
+        self._set_project_chrome_visible(False)
         self.size_grip = QSizeGrip(self.shell)
         self.size_grip.setFixedSize(18, 18)
 
@@ -269,7 +270,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         QShortcut(QKeySequence('Shift+F12'), self, lambda: self._lsp_command('references'))
     # [FN CLOSED] _setup_shortcuts
 
+    # [FN] _confirm_close — asks before quitting; its own method (not inlined) so tests can stub
+    # just this decision without touching _ide_yes_no's other, unrelated uses elsewhere in the app
+    def _confirm_close(self):
+        return self._ide_yes_no('Chiudi KANT IDE', 'Sei sicuro di voler chiudere KANT IDE?')
+
     def closeEvent(self, event):
+        if not self._confirm_close():
+            event.ignore()
+            return
         if not self._flush_all_tabs():
             event.ignore()
             return
@@ -398,8 +407,38 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         parent = self.map_tab_btn.parentWidget()
         if parent is None:
             return
-        self.map_tab_btn.move((parent.width() - self.map_tab_btn.width()) // 2, parent.height() - self.map_tab_btn.height())
+        at_top = parent is self.map_dialog
+        x = (parent.width() - self.map_tab_btn.width()) // 2
+        # while closed the tab stays on the shell's bottom edge (the top is already the title bar
+        # and action toolbar); once MAPPA is open and it's reparented onto the dialog itself, it
+        # sits centered on the dialog's own top edge instead — where its removed header row used
+        # to be — pointing down at the map content below it
+        y = 0 if at_top else parent.height() - self.map_tab_btn.height()
+        self.map_tab_btn.move(x, y)
         self.map_tab_btn.raise_()
+        self._style_map_tab_button(at_top)
+
+    # [FN CATEGORY] _style_map_tab_button — the "sticking out of the edge" look flips with which
+    # edge the tab is actually on: rounded top / flat bottom when it sticks up from the shell's
+    # bottom edge, rounded bottom / flat top when it sticks down from the map dialog's top edge.
+    # [FN] _style_map_tab_button — rounds whichever corners face away from the edge it's stuck to
+    # [FN OPEN] _style_map_tab_button
+    def _style_map_tab_button(self, at_top):
+        if at_top:
+            self.map_tab_btn.setStyleSheet(
+                f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; '
+                f'border:1px solid {theme.BORDER}; border-top:none; '
+                f'border-bottom-left-radius:8px; border-bottom-right-radius:8px; font-weight:700; }} '
+                f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
+            )
+        else:
+            self.map_tab_btn.setStyleSheet(
+                f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; '
+                f'border:1px solid {theme.BORDER}; border-bottom:none; '
+                f'border-top-left-radius:8px; border-top-right-radius:8px; font-weight:700; }} '
+                f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
+            )
+    # [FN CLOSED] _style_map_tab_button
 
     # [FN CATEGORY] _position_map_dialog — the MAPPA dialog spans the full page: left/right edges
     # match this window's own, top sits just under the action toolbar (the Save row), bottom sits
@@ -449,6 +488,24 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         set_theme(self.night_mode)
         self._apply_theme()
 
+    # [FN CATEGORY] _tree_stylesheet — the ONE place the KANT tree's own QSS is built, called from
+    # both initial construction and _apply_theme's refresh pass. Those two used to duplicate this
+    # string independently and had drifted apart (padding:6px 4px boxed-look vs. a later padding:
+    # 14px 10px flat-look; a hardcoded #eef4ff selection color vs. a night-aware one) — real dead
+    # space and a wrong-color selection highlight that only showed up after a theme toggle. One
+    # shared builder means the two call sites can't diverge like that again.
+    # [FN] _tree_stylesheet — boxed KANT tree QSS with a theme-aware selection color
+    # [FN OPEN] _tree_stylesheet
+    def _tree_stylesheet(self):
+        selected_bg = '#1e293b' if self.night_mode else '#eef4ff'
+        return (
+            f'QTreeWidget {{ background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:8px; padding:6px 4px; }} '
+            f'QTreeWidget::item {{ padding:0px; }} '
+            f'QTreeWidget::item:selected {{ background:{selected_bg}; color:{theme.ACCENT}; border-radius:4px; }}'
+        )
+    # [FN CLOSED] _tree_stylesheet
+
     def _apply_theme(self):
         self.setStyleSheet(theme.APP_STYLE)
         self.shell.setStyleSheet(f'#appShell {{ border:1px solid {theme.BORDER}; background:{theme.BG}; }}')
@@ -458,11 +515,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.welcome_desc.setStyleSheet(f'color:{theme.DIM};')
             self.recent_title.setStyleSheet(f'color:{theme.DIM};')
         if hasattr(self, 'tree'):
-            self.tree.setStyleSheet(
-                f'QTreeWidget {{ background:{theme.PANEL}; color:{theme.TEXT}; border:none; border-right:1px solid {theme.BORDER}; padding:14px 10px; }} '
-                f'QTreeWidget::item {{ padding:3px 0; }} '
-                f'QTreeWidget::item:selected {{ background:{"#1e293b" if self.night_mode else "#eef4ff"}; color:{theme.ACCENT}; border-radius:6px; }}'
-            )
+            self.tree.setStyleSheet(self._tree_stylesheet())
             self._rebuild_tree()
         if hasattr(self, 'tabs'):
             self.terminal.setStyleSheet(
@@ -619,13 +672,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.tree.setMinimumWidth(160)
         self.tree.setIndentation(14)
         self.tree.setUniformRowHeights(False)  # rows can grow taller once labels wrap
-        # boxed like the code panels (CODE_BG + border), not flat against the white app background
-        self.tree.setStyleSheet(
-            f'QTreeWidget {{ background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:8px; padding:6px 4px; }} '
-            f'QTreeWidget::item {{ padding:0px; }} '
-            f'QTreeWidget::item:selected {{ background:#eef4ff; color:{theme.ACCENT}; border-radius:4px; }}'
-        )
+        self.tree.setStyleSheet(self._tree_stylesheet())
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_tree_context_menu)
@@ -674,13 +721,19 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.tabs.currentChanged.connect(self._on_active_tab_changed)
 
         self.tree.itemDoubleClicked.connect(self._on_tree_item_double_clicked)
-        self.split_tab = None   # FileTab currently rendered in the split pane, or None if closed
-        self.split_uid = None   # which of its KANT elements is isolated there (None = whole file)
-        self.split_panel, self.split_view_layout = self._build_split_panel()
+        # each double-clicked element gets its own split_tabs page, keyed by (file path, uid) —
+        # a second double-click on an already-open element switches to its existing page instead
+        # of duplicating it; a different element opens a new page alongside it, not over it
+        self._split_pages = {}
+        self.split_tabs = QTabWidget()
+        self.split_tabs.setTabsClosable(True)
+        self.split_tabs.setDocumentMode(True)
+        self.split_tabs.tabCloseRequested.connect(self._close_split_tab)
+        self.split_tabs.hide()  # only relevant once something has been opened into it
 
         self.editor_splitter = QSplitter(Qt.Horizontal)
         self.editor_splitter.addWidget(self.tabs)
-        self.editor_splitter.addWidget(self.split_panel)
+        self.editor_splitter.addWidget(self.split_tabs)
         self.editor_splitter.setStretchFactor(0, 1)
         self.editor_splitter.setStretchFactor(1, 1)
         saved_editor_sizes = self.settings.value('editorSplitterSizes')
@@ -915,36 +968,17 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         ):
             action.setEnabled(has_tab)
 
-    # [FN CATEGORY] _build_split_panel — the second coding-panel view, shown side-by-side with the
-    # main tabs. Its identity is a KANT element ("[FN] alpha — file.py"), not a filename tab: it
-    # has no tab strip of its own, just a header naming whatever is currently isolated in it. It
-    # renders straight from the SAME FileTab/Node tree as the main pane (via _build_node_widgets,
-    # already generic over which layout it targets), so editing here shares save/dirty/undo state
-    # with the main pane automatically — it's another view onto the same data, not a duplicate.
-    # Not live-synced against edits made to the same element in the main pane at the same time
-    # (each pane's CodeEdit widgets are separate instances); reopening the element refreshes it.
-    # [FN] _build_split_panel — builds the split pane widget and its content layout
-    # [FN OPEN] _build_split_panel
-    def _build_split_panel(self):
-        panel = QWidget()
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(0, 0, 0, 0)
-        panel_layout.setSpacing(0)
-
-        header = QWidget()
-        header.setFixedHeight(28)
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(8, 0, 4, 0)
-        self.split_header_label = QLabel('')
-        self.split_header_label.setFont(QFont('Consolas', theme.TREE_FONT_PT, QFont.DemiBold))
-        header_layout.addWidget(self.split_header_label, 1)
-        close_btn = QPushButton('×')
-        close_btn.setFixedSize(22, 20)
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.clicked.connect(self._close_split_pane)
-        header_layout.addWidget(close_btn)
-        panel_layout.addWidget(header)
-
+    # [FN CATEGORY] _build_split_page — one page of split_tabs. A page's identity is a KANT element
+    # ("[FN] alpha — file.py"), not a filename tab — the tab strip label carries that, this just
+    # builds the scrollable content area. Renders straight from the SAME FileTab/Node tree as the
+    # main pane (via _build_node_widgets, already generic over which layout it targets), so editing
+    # here shares save/dirty/undo state with the main pane automatically — it's another view onto
+    # the same data, not a duplicate. Not live-synced against edits made to the same element in the
+    # main pane at the same time (each page's CodeEdit widgets are separate instances); reopening
+    # the element refreshes it.
+    # [FN] _build_split_page — builds one split_tabs page's scroll area and content layout
+    # [FN OPEN] _build_split_page
+    def _build_split_page(self):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         container = QWidget()
@@ -953,11 +987,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(1)
         scroll.setWidget(container)
-        panel_layout.addWidget(scroll, 1)
-
-        panel.hide()  # only relevant once something has been opened into it
-        return panel, layout
-    # [FN CLOSED] _build_split_panel
+        return scroll, layout
+    # [FN CLOSED] _build_split_page
 
     # [FN CATEGORY] _build_find_bar — Ctrl+F search across every CodeEdit currently in the view (the
     # KANT view splits a file into many small editors, so search has to hop between them, not just
@@ -1298,7 +1329,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # the filename itself lives here, not in the title bar — that slot shows the KANT identity
         # of whatever's isolated instead (see _update_filename_label)
         self.file_path_label = QLabel('')
-        self.file_path_label.setStyleSheet(f'color:{theme.DIM};')
+        self.file_path_label.setStyleSheet(f'color:{theme.DIM}; font-weight:700;')
+        self.file_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.file_path_label.setCursor(Qt.IBeamCursor)
         label_layout.addWidget(self.file_path_label)
         layout.addWidget(label_bar)
 
@@ -1320,13 +1353,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.io_tabs.setStyleSheet(f'background:{theme.PANEL}; border-top:1px solid {theme.BORDER};')
         for btn in (self.incoming_label_btn, self.outgoing_label_btn):
             btn.setStyleSheet(theme.BUTTON_STYLE + 'QPushButton { padding:4px 12px; }')
-        # rounded top corners only, flat bottom — reads as a tab sticking up out of the window edge
-        self.map_tab_btn.setStyleSheet(
-            f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; '
-            f'border:1px solid {theme.BORDER}; border-bottom:none; '
-            f'border-top-left-radius:8px; border-top-right-radius:8px; font-weight:700; }} '
-            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
-        )
+        # map_tab_btn's own corner rounding flips with which edge it's on (bottom of the shell vs
+        # top of the map dialog) — handled by _style_map_tab_button, called from _position_map_tab
+        # since it already knows which edge, and runs whenever the tab is (re)shown or moved
+        self._position_map_tab()
         # same idea, rotated a quarter turn: rounded left corners only, flat right — sticks out of
         # the window's right edge instead of its bottom edge
         self.claude_tab_btn.setStyleSheet(
@@ -1676,6 +1706,21 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         self._open_project_folder(path)
 
+    # [FN CATEGORY] _set_project_chrome_visible — File/Cerca/LSP/Git act on tabs, files, or the
+    # project tree — on the welcome screen they were active menus with nothing useful inside them.
+    # Aspetto (theme toggle + command palette) stays visible regardless; a theme switch is
+    # meaningful even before a project is open.
+    # [FN] _set_project_chrome_visible — shows/hides the project-only title bar menus and toolbar
+    # [FN OPEN] _set_project_chrome_visible
+    def _set_project_chrome_visible(self, visible):
+        for btn in (
+            self.title_bar.file_menu_btn, self.title_bar.search_menu_btn,
+            self.title_bar.lsp_menu_btn, self.title_bar.git_menu_btn,
+        ):
+            btn.setVisible(visible)
+        self.action_toolbar.setVisible(visible)
+    # [FN CLOSED] _set_project_chrome_visible
+
     # [FN CATEGORY] _go_back_to_welcome — flushes any pending edit (nothing is discarded — autosave
     # means switching screens is always safe) and returns to the folder-picker/recent-folders screen
     # [FN] _go_back_to_welcome — the titlebar back arrow's action
@@ -1685,6 +1730,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         self._refresh_recent_folders()
         self.stack.setCurrentIndex(0)
+        self._set_project_chrome_visible(False)
         self.map_tab_btn.setParent(self.shell)
         self.map_tab_btn.setText(' MAPPA')
         self.map_tab_btn.setIcon(draw_icon('arrow-up', 12))
@@ -1736,6 +1782,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                         self._launch_kant_code_map(choice['agent'], choice['model'], choice['effort'])
         self._watch_project_tree()
         self.stack.setCurrentIndex(1)
+        self._set_project_chrome_visible(True)
         self.map_tab_btn.show()
         self._position_map_tab()
         self.claude_tab_btn.show()
@@ -2036,43 +2083,62 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN CLOSED] _on_tree_item_double_clicked
 
     # [FN CATEGORY] _show_in_split — renders one KANT element (or the whole file, if uid is None)
-    # into the split pane from the same FileTab/Node tree the main pane uses, via the same
-    # _build_node_widgets the main pane's _render_view calls — so editing there marks the same tab
-    # dirty and shares its undo stack. The header names the element itself ("[FN] alpha — a.py"),
-    # not the filename, since the split pane's identity is a KANT element, not a file.
-    # [FN] _show_in_split — displays a KANT element (or whole file) in the split pane
+    # into its own split_tabs page, keyed by (path, uid) — a second double-click on the SAME
+    # element switches to its existing page (self._split_pages already has it); a DIFFERENT element,
+    # even from the same parent module, gets its own new page instead of overwriting whatever page
+    # is currently showing. Renders via the same _build_node_widgets the main pane's _render_view
+    # calls, so editing there marks the same tab dirty and shares its undo stack. The tab strip
+    # label names the element itself ("[FN] alpha"), not the filename, since a page's identity is a
+    # KANT element, not a file.
+    # [FN] _show_in_split — opens (or switches to) one KANT element's own split_tabs page
     # [FN OPEN] _show_in_split
     def _show_in_split(self, tab, uid):
-        self.split_tab = tab
-        self.split_uid = uid
-        while self.split_view_layout.count():
-            taken = self.split_view_layout.takeAt(0)
-            widget = taken.widget()
-            if widget:
-                widget.deleteLater()
+        key = (tab.path, uid)
+        existing = self._split_pages.get(key)
+        if existing is not None:
+            self.split_tabs.setCurrentWidget(existing)
+            self.split_tabs.show()
+            return
+        page, layout = self._build_split_page()
         if uid is None:
             node = next((item for item in tab.tree.body if isinstance(item, Node)), None)
-            self._build_node_widgets(tab, tab.tree, self.split_view_layout, 0)
+            self._build_node_widgets(tab, tab.tree, layout, 0)
         else:
             node = self._find_node_by_uid(tab.tree, uid)
             if node is not None:
                 wrapper = Node(tag='ROOT', name='', open_raw=None, body=[node])
-                self._build_node_widgets(tab, wrapper, self.split_view_layout, 0)
+                self._build_node_widgets(tab, wrapper, layout, 0)
         label = f'[{node.tag}] {node.desc or node.name}' if node is not None else os.path.basename(tab.path)
-        self.split_header_label.setText(label)
-        self.split_header_label.setToolTip(tab.path)
-        self.split_panel.show()
+        page._split_key = key
+        page._split_tab = tab
+        index = self.split_tabs.addTab(page, label)
+        self.split_tabs.setTabToolTip(index, tab.path)
+        self._split_pages[key] = page
+        self.split_tabs.setCurrentIndex(index)
+        self.split_tabs.show()
     # [FN CLOSED] _show_in_split
 
-    def _close_split_pane(self):
-        while self.split_view_layout.count():
-            taken = self.split_view_layout.takeAt(0)
-            widget = taken.widget()
-            if widget:
-                widget.deleteLater()
-        self.split_tab = None
-        self.split_uid = None
-        self.split_panel.hide()
+    # [FN CATEGORY] _close_split_tab — tabCloseRequested's own index, not necessarily the page a
+    # caller has a reference to (closing an earlier tab shifts every later index) — always resolve
+    # through split_tabs.widget(index) rather than trusting a captured index to still be valid.
+    # [FN] _close_split_tab — closes one split_tabs page, hides the strip once none remain
+    # [FN OPEN] _close_split_tab
+    def _close_split_tab(self, index):
+        page = self.split_tabs.widget(index)
+        if page is None:
+            return
+        self._split_pages.pop(getattr(page, '_split_key', None), None)
+        self.split_tabs.removeTab(index)
+        page.deleteLater()
+        if self.split_tabs.count() == 0:
+            self.split_tabs.hide()
+    # [FN CLOSED] _close_split_tab
+
+    def _close_all_split_tabs_for(self, tab):
+        for index in range(self.split_tabs.count() - 1, -1, -1):
+            page = self.split_tabs.widget(index)
+            if getattr(page, '_split_tab', None) is tab:
+                self._close_split_tab(index)
 
     # ---- tabs (AI-NAV: active-tab ownership and close/flush lifecycle) ---
 
@@ -2109,8 +2175,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             del self.open_tabs[tab.path]
         if tab.path in self.fs_watcher.files():
             self.fs_watcher.removePath(tab.path)
-        if self.split_tab is tab:
-            self._close_split_pane()  # don't leave the split pane editing a tab that's gone
+        self._close_all_split_tabs_for(tab)  # don't leave a split page editing a tab that's gone
         self.tabs.removeTab(index)
         tab.deleteLater()
         return True
