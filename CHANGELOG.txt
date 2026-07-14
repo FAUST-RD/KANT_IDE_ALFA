@@ -1,5 +1,11 @@
 KANT IDE changelog
 
+2026-07-13 (23)
+- Added "Altro..." to the Git button's hover dropdown, opening the full Git panel — the same destination as clicking the button itself, now reachable from the quick-actions list too.
+- Improved the AI chat pane: agent/model/effort/auto-permission controls now sit in their own rounded "controls bar" instead of floating loose in the title row; the send button and prompt box got a visual refresh.
+- Added an effort selector (low/medium/high/xhigh/max for Claude, low/medium/high for Codex) next to the model selector — previously effort could only be set when launching /kant-code-map, not from a regular sent prompt.
+- Ctrl+Return now sends the prompt from the AI chat box; plain Return still just inserts a newline (unchanged), so a multi-line prompt no longer needs the mouse to reach Send.
+
 2026-07-13 (22)
 - Fixed the AI terminal tab: it now sits at the pane's own inner-left edge (tracking the splitter divider) instead of floating at the shell's outer-right edge over the pane's own content when expanded, and is smaller (16x60 vs 22x90). Its arrow now points right while expanded, left while collapsed.
 - Added a left sidebar inside the bottom terminal panel to switch between the real shell, a Python REPL (a second TerminalPane running `python -i -u`, started lazily on first switch), and a live list of the active file's errors (LSP diagnostics or local syntax check, whichever applies) — clicking an error jumps to that line.

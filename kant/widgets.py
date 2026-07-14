@@ -663,6 +663,13 @@ CODEX_MODELS = (
     MODEL_DEFAULT, 'gpt-5.1-codex-max', 'gpt-5.1-codex', 'gpt-5-codex', 'o4-mini',
 )
 
+# [CST] EFFORT_LEVELS — a real flag for claude (--effort), a config override for codex
+# (model_reasoning_effort) — both applied by _agent_command. Codex has no 'xhigh'/'max' tier.
+EFFORT_LEVELS = {
+    'claude': (MODEL_DEFAULT, 'low', 'medium', 'high', 'xhigh', 'max'),
+    'codex': (MODEL_DEFAULT, 'low', 'medium', 'high'),
+}
+
 
 class ClaudePane(QWidget):
     finished = Signal()
@@ -694,13 +701,22 @@ class ClaudePane(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
 
-        header = QHBoxLayout()
+        title_row = QHBoxLayout()
         self.title = QLabel('CHAT AI')
         self.title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
-        header.addWidget(self.title)
-        header.addStretch(1)
+        title_row.addWidget(self.title)
+        title_row.addStretch(1)
+        layout.addLayout(title_row)
+
+        # agent/model/effort/auto-permissions grouped as one visually distinct "controls chip"
+        # (own rounded background, own row) instead of loose combo boxes floating in the title row
+        self.controls_bar = QWidget()
+        self.controls_bar.setObjectName('claudeControlsBar')
+        header = QHBoxLayout(self.controls_bar)
+        header.setContentsMargins(8, 6, 8, 6)
+        header.setSpacing(6)
         self.agent_select = QComboBox()
         self.agent_select.addItem('Claude Code', 'claude')
         self.agent_select.addItem('Codex', 'codex')
@@ -710,11 +726,17 @@ class ClaudePane(QWidget):
         self.model_select.setToolTip("Modello per l'agente selezionato (modificabile: puoi scrivere un ID non in elenco)")
         self.model_select.addItems(CLAUDE_MODELS)
         header.addWidget(self.model_select)
+        self.effort_select = QComboBox()
+        self.effort_select.setEditable(True)
+        self.effort_select.setToolTip("Reasoning effort per l'agente selezionato")
+        self.effort_select.addItems(EFFORT_LEVELS['claude'])
+        header.addWidget(self.effort_select)
+        header.addStretch(1)
         self.auto_permissions = QCheckBox('Automatico')
         self.auto_permissions.setToolTip('Approva i permessi Claude; le modifiche restano soggette alla revisione finale.')
         self.auto_permissions.toggled.connect(self._automatic_permissions_changed)
         header.addWidget(self.auto_permissions)
-        layout.addLayout(header)
+        layout.addWidget(self.controls_bar)
 
         self.output = QScrollArea()
         self.output.setWidgetResizable(True)
@@ -731,8 +753,14 @@ class ClaudePane(QWidget):
         self.prompt.setFixedHeight(90)
         self.prompt.setFont(QFont('Consolas', theme.CODE_FONT_PT))
         self.prompt.setStyleSheet(
-            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:8px; padding:6px;'
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:8px; padding:8px;'
         )
+        # Return alone still inserts a newline (QPlainTextEdit's own default); Ctrl+Return sends,
+        # so a multi-line prompt doesn't need the mouse to reach the button
+        self.send_shortcut = QShortcut(QKeySequence('Ctrl+Return'), self.prompt)
+        self.send_shortcut.setContext(Qt.WidgetShortcut)
+        self.send_shortcut.activated.connect(self._send)
+        self.prompt.setPlaceholderText('Prompt per claude -p... (Ctrl+Invio per inviare)')
         composer = QHBoxLayout()
         composer.addWidget(self.prompt, 1)
         self.send_btn = QPushButton('Invia')
@@ -749,15 +777,23 @@ class ClaudePane(QWidget):
     def apply_style(self):
         self.setStyleSheet(f'background:{theme.PANEL}; border-left:1px solid {theme.BORDER};')
         self.title.setStyleSheet(f'color:{theme.WARN}; letter-spacing:2px;')
+        self.controls_bar.setStyleSheet(
+            f'#claudeControlsBar {{ background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; border-radius:9px; }}'
+        )
         self.output.setStyleSheet(f'QScrollArea {{ background:{theme.CODE_BG}; border:none; border-radius:12px; }}')
         self.chat.setStyleSheet(f'background:{theme.CODE_BG};')
         self.prompt.setStyleSheet(
-            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:8px; padding:6px;'
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:8px; padding:8px;'
         )
-        self.agent_select.setStyleSheet(theme.BUTTON_STYLE)
-        self.model_select.setStyleSheet(theme.BUTTON_STYLE)
+        combo_style = theme.BUTTON_STYLE.replace('QPushButton', 'QComboBox')
+        self.agent_select.setStyleSheet(combo_style)
+        self.model_select.setStyleSheet(combo_style)
+        self.effort_select.setStyleSheet(combo_style)
         self.auto_permissions.setStyleSheet(f'color:{theme.WARN}; spacing:6px;')
-        self.send_btn.setStyleSheet(theme.BUTTON_STYLE + f'QPushButton {{ color:{theme.WARN}; border-color:{theme.WARN}; }}')
+        self.send_btn.setStyleSheet(
+            f'QPushButton {{ background:{theme.WARN}; color:#ffffff; border:none; border-radius:9px; '
+            f'padding:7px 13px; font-weight:700; }}'
+        )
         for role, frame, name, label in self._messages:
             self._style_message(role, frame, name, label)
 
@@ -770,11 +806,11 @@ class ClaudePane(QWidget):
             self.agent_select.setCurrentIndex(idx)
 
     def _agent_changed(self):
-        prompt = 'Prompt per codex exec...' if self._agent() == 'codex' else 'Prompt per claude -p...'
-        self.prompt.setPlaceholderText(prompt)
+        is_codex = self._agent() == 'codex'
+        base_prompt = 'Prompt per codex exec...' if is_codex else 'Prompt per claude -p...'
+        self.prompt.setPlaceholderText(f'{base_prompt} (Ctrl+Invio per inviare)')
         self.auto_permissions.setEnabled(self._agent() == 'claude')
         current = self.model_select.currentText().strip()
-        is_codex = self._agent() == 'codex'
         models = CODEX_MODELS if is_codex else CLAUDE_MODELS
         other_models = CLAUDE_MODELS if is_codex else CODEX_MODELS
         self.model_select.clear()
@@ -785,6 +821,14 @@ class ClaudePane(QWidget):
             self.model_select.setEditText(current)  # a genuinely custom string — keep it
         else:
             self.model_select.setCurrentIndex(0)  # a preset from the other agent doesn't carry over
+        current_effort = self.effort_select.currentText().strip()
+        efforts = EFFORT_LEVELS['codex'] if is_codex else EFFORT_LEVELS['claude']
+        self.effort_select.clear()
+        self.effort_select.addItems(efforts)
+        if current_effort in efforts:
+            self.effort_select.setCurrentText(current_effort)
+        else:
+            self.effort_select.setCurrentIndex(0)  # e.g. xhigh/max don't carry over to codex
 
     def _automatic_permissions_changed(self, enabled):
         if enabled:
@@ -938,7 +982,10 @@ class ClaudePane(QWidget):
         if not prompt:
             return
         hint = self.context_hint() if self.context_hint else None
-        if self.run_prompt(prompt, context_hint=hint):
+        effort = self.effort_select.currentText().strip()
+        if effort == MODEL_DEFAULT:
+            effort = None
+        if self.run_prompt(prompt, effort=effort, context_hint=hint):
             self.prompt.clear()
 
     # [FN CATEGORY] run_prompt — the actual `claude -p` launch, shared by the prompt box's Invia
@@ -1698,6 +1745,10 @@ class TitleBar(QWidget):
         self.git_commit_menu_action.triggered.connect(window._git_commit)
         self.git_branch_menu_action = git_menu.addAction('Cambia branch...')
         self.git_branch_menu_action.triggered.connect(window._git_switch_branch)
+        git_menu.addSeparator()
+        self.git_more_menu_action = git_menu.addAction('Altro...')
+        self.git_more_menu_action.setToolTip('Apri il pannello Git completo')
+        self.git_more_menu_action.triggered.connect(window._open_git_panel)
         # clicking Git opens the one-window panel (branch/stage/diff/commit together, or the git-init
         # flow if this project has no repo yet) instead of this dropdown; hovering still shows the
         # dropdown's quick actions without needing a click, via the eventFilter below

@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QEvent, QPointF, QSettings
-from PySide6.QtGui import QKeyEvent, QMouseEvent, QTextCursor
+from PySide6.QtGui import QKeyEvent, QKeySequence, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication, QGraphicsItem, QLabel, QListWidget, QMenu, QMessageBox, QTabBar, QToolButton,
@@ -28,6 +28,7 @@ from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_lab
 from kant.xref import build_xref, XrefElement
 from kant.widgets import (
     CollapsibleSection, FileTab, LeafSection, RecentFolderCard, _AiReviewCard, _agent_command, CodeEdit,
+    MODEL_DEFAULT,
 )
 from kant.mappa import XrefMapDialog, XrefMapView, _force_layout_positions
 from kant import gitops as kant_gitops_module
@@ -150,6 +151,38 @@ class KantSmokeTest(unittest.TestCase):
         assert one_shot_request['response']['behavior'] == 'allow'
         assert len(window.claude_pane._permission_cards) == cards_before
         window.claude_pane._auto_permissions_once = False
+        window.close()
+
+    def test_claude_pane_effort_selector_and_send_shortcut(self):
+        window = MainWindow()
+        pane = window.claude_pane
+        # effort options sync per agent, same shape as the existing model selector
+        assert pane.effort_select.currentText() == MODEL_DEFAULT
+        claude_efforts = [pane.effort_select.itemText(i) for i in range(pane.effort_select.count())]
+        assert 'xhigh' in claude_efforts and 'max' in claude_efforts
+        pane.agent_select.setCurrentIndex(pane.agent_select.findData('codex'))
+        codex_efforts = [pane.effort_select.itemText(i) for i in range(pane.effort_select.count())]
+        assert 'xhigh' not in codex_efforts and 'high' in codex_efforts  # codex has no xhigh/max tier
+        pane.agent_select.setCurrentIndex(pane.agent_select.findData('claude'))
+
+        pane.effort_select.setCurrentText('high')
+        calls = []
+        pane.run_prompt = lambda *args, **kwargs: calls.append(kwargs) or False
+        pane.prompt.setPlainText('ciao')
+        pane._send()
+        assert calls and calls[0]['effort'] == 'high'  # the UI selection actually reaches run_prompt
+
+        # Ctrl+Return sends without needing the mouse on the button; plain Return still just
+        # inserts a newline (QPlainTextEdit's own default, left untouched — no override needed).
+        # Verified by the actual key sequence + signal wiring rather than a simulated OS-level key
+        # press: WidgetShortcut delivery needs real window activation/focus that offscreen Qt
+        # doesn't reliably grant, so a keyClick here would test platform focus plumbing, not this
+        # feature's own logic.
+        assert pane.send_shortcut.key() == QKeySequence('Ctrl+Return')
+        calls.clear()
+        pane.prompt.setPlainText('di nuovo')
+        pane.send_shortcut.activated.emit()
+        assert calls and calls[0]['effort'] == 'high'
         window.close()
 
     def test_terminal_dock_sidebar_and_errors_view(self):
@@ -1009,6 +1042,13 @@ class KantSmokeTest(unittest.TestCase):
         finally:
             menu.exec = original_exec
         assert len(calls) == 1
+
+        # "Altro..." (the dropdown's last item, after a separator) reaches the full Git panel —
+        # same destination as clicking the button itself, for whoever opens it via the dropdown
+        opened = []
+        window._open_git_panel = lambda: opened.append(True)
+        window.title_bar.git_more_menu_action.trigger()
+        assert opened == [True]
         window.close()
 
     def test_git_commit_and_branch_switch(self):
