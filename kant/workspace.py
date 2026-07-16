@@ -12,7 +12,9 @@ import tempfile
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QEasingCurve, QPropertyAnimation, QTimer
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import QGraphicsColorizeEffect
 
 from kant import theme
 from kant.fileio import file_fingerprint, is_safe_child_name, write_bytes_atomic, write_file_atomic
@@ -174,6 +176,11 @@ def apply_ai_review(root, review, accepted, manual_text=None):
 
 
 def rollback_snapshot(root, snapshot, ignored=()):
+    """Restores root to snapshot's state. Returns the list of directories that were expected to be
+    removed (present after the AI run, absent before it) but couldn't be — e.g. something else
+    wrote a file into one after this rollback started walking it. Non-fatal: the file-level restore
+    above already succeeded, so the rollback overall still worked, but the caller should say so
+    instead of the directory just silently surviving with no trace anywhere."""
     before = {rel: path for rel, path in iter_workspace_files(snapshot)}
     after = {rel: path for rel, path in iter_workspace_files(root, ignored)}
     before_dirs = {os.path.relpath(path, snapshot) for path, _dirs, _files in os.walk(snapshot)}
@@ -189,11 +196,13 @@ def rollback_snapshot(root, snapshot, ignored=()):
         shutil.copy2(source, target)
     for rel in before_dirs:
         os.makedirs(os.path.join(root, rel), exist_ok=True)
+    skipped_dirs = []
     for rel in sorted(after_dirs - before_dirs, key=lambda value: value.count(os.sep), reverse=True):
         try:
             os.rmdir(os.path.join(root, rel))
         except OSError:
-            pass
+            skipped_dirs.append(rel)
+    return skipped_dirs
 
 
 def discard_snapshot(snapshot):
@@ -271,6 +280,14 @@ class WorkspaceMixin:
         if tab.dirty:
             tab.remember_undo_state()
         tab.autosave_timer.stop()
+        # _render_view below tears down and rebuilds every CodeEdit/section widget from scratch —
+        # necessary (the tree changed), but it silently resets the scroll position to the top and
+        # gives no visual sign anything happened. Most callers of this are an external tool (most
+        # often an AI edit landing) rewriting the file the user is currently looking at, so losing
+        # their place and getting a silent swap both read as jarring. Preserve the former, flash the
+        # latter.
+        scroll_bar = tab.scroll_area.verticalScrollBar()
+        scroll_value = scroll_bar.value()
         tab.tree = tree
         tab.disk_fingerprint = file_fingerprint(tab.path)
         tab.dirty = False
@@ -278,7 +295,30 @@ class WorkspaceMixin:
         self._render_view(tab, tab.filter_uid)
         self._update_tab_title(tab)
         self._invalidate_xref()
+        QTimer.singleShot(0, lambda: scroll_bar.setValue(scroll_value))
+        self._flash_tab_update(tab)
         return True
+
+    # [FN] _flash_tab_update — a brief accent-colored fade over a tab's content, so an externally
+    # reloaded file (_reload_tab_from_disk above) reads as "this just updated" instead of a silent,
+    # unexplained content swap
+    # [FN OPEN] _flash_tab_update
+    def _flash_tab_update(self, tab):
+        effect = QGraphicsColorizeEffect(tab.view_container)
+        effect.setColor(QColor(theme.ACCENT))
+        effect.setStrength(0.0)
+        tab.view_container.setGraphicsEffect(effect)
+        animation = QPropertyAnimation(effect, b'strength', tab.view_container)
+        animation.setDuration(700)
+        animation.setStartValue(0.55)
+        animation.setEndValue(0.0)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.finished.connect(lambda: tab.view_container.setGraphicsEffect(None))
+        # PySide doesn't keep a QPropertyAnimation alive on its own — without a live reference it can
+        # be garbage-collected mid-flight, silently stopping the animation partway
+        tab._ai_flash_animation = animation
+        animation.start()
+    # [FN CLOSED] _flash_tab_update
 
     def _on_tab_save_conflict(self, tab):
         if getattr(tab, '_conflict_dialog_open', False):
@@ -308,6 +348,12 @@ class WorkspaceMixin:
     def _refresh_after_fs_change(self):
         if not self.project_root_path:
             return
+        # a caller that just made the change itself (create/rename/delete) calls this directly,
+        # right before the QFileSystemWatcher's own directoryChanged signal fires for that same
+        # change and arms fs_refresh_timer's 400ms debounce — without stopping it here, that
+        # debounced call still fires afterward and redoes the exact same full os.walk rebuild for
+        # nothing. Whichever path gets here first now cancels the other's redundant follow-up.
+        self.fs_refresh_timer.stop()
         self._invalidate_xref()
         self._rebuild_tree()
         self._check_kant_map(self.project_root_path)
@@ -367,12 +413,16 @@ class WorkspaceMixin:
                 self._ai_snapshot = None
                 self._clear_ai_snapshot_marker()
             return
-        self.tabs.setEnabled(True)
+        # kept disabled (not re-enabled yet) through the diff-building pass below — same "don't let
+        # someone edit a file mid-comparison" reasoning _prepare_ai_snapshot already applies to the
+        # snapshot copy, just extended to cover the read side of the diff too
         try:
             review = build_ai_review(self.project_root_path, snapshot, ignored)
         except OSError as error:
+            self.tabs.setEnabled(True)
             self._ide_message('Verifica modifiche AI', str(error))
             return
+        self.tabs.setEnabled(True)
         if stray_symlinks:
             self.claude_pane.write_info(
                 '\nSimlink creati durante la sessione AI rimossi per sicurezza: ' + ', '.join(stray_symlinks)
@@ -386,16 +436,25 @@ class WorkspaceMixin:
         self.claude_pane.write_info(f'\nModifiche AI pronte per il controllo:\n{summary}')
 
         def resolved(action, accepted, manual_text):
+            skipped_dirs = []
+            self.tabs.setEnabled(False)
             try:
                 if action == 'apply':
                     apply_ai_review(self.project_root_path, review, accepted, manual_text)
                     result_message = 'Modifiche AI revisionate e applicate'
                 else:
-                    rollback_snapshot(self.project_root_path, snapshot, ignored)
+                    skipped_dirs = rollback_snapshot(self.project_root_path, snapshot, ignored)
                     result_message = 'Modifiche AI annullate e snapshot ripristinato'
             except OSError as error:
+                self.tabs.setEnabled(True)
                 self._ide_message('Revisione AI', f'Operazione incompleta: {error}\nSnapshot conservato in {snapshot}')
                 return
+            self.tabs.setEnabled(True)
+            if skipped_dirs:
+                self.claude_pane.write_info(
+                    '\nAlcune cartelle non sono state rimosse durante l\'annullamento (probabilmente non vuote): '
+                    + ', '.join(skipped_dirs)
+                )
             discard_snapshot(snapshot)
             self._ai_snapshot = None
             self._clear_ai_snapshot_marker()
@@ -403,7 +462,15 @@ class WorkspaceMixin:
                 self._on_fs_file_changed(tab.path)
             self.claude_pane.write_info(result_message)
 
-        self.claude_pane.show_ai_review(review, render_review_text, resolved)
+        # automatic mode means the user asked not to be interrupted for permission decisions either
+        # — extending that to the review step too: accept everything silently instead of offering a
+        # decision nobody's going to make by hand. Non-automatic mode gets a small inline chat card
+        # (offer_ai_review) instead of the full review window popping up unasked; the window is only
+        # one click away via that card's "Rivedi" button.
+        if self.claude_pane.auto_permissions.isChecked():
+            resolved('apply', {item['path']: set(range(len(item['hunks']))) for item in review}, {})
+            return
+        self.claude_pane.offer_ai_review(review, render_review_text, resolved)
 
     def _create_new_file(self, target_dir):
         if not target_dir:
@@ -426,6 +493,39 @@ class WorkspaceMixin:
             return
         self._refresh_after_fs_change()
         self._open_file(path)
+
+    # [FN CATEGORY] _prompt_add_file — the "+" button below the project tree in file view: a richer
+    # alternative to _create_new_file above (bare filename, empty content) that asks what KIND of
+    # file first — see _ide_new_file_form/build_new_file_content (kant/dialogs.py, kant/model.py).
+    # Always targets the project root, unlike _create_new_file's context-menu target_dir, since the
+    # "+" button isn't attached to any particular folder selection.
+    # [FN] _prompt_add_file — the tree's "+ Nuovo file" button click handler
+    # [FN OPEN] _prompt_add_file
+    def _prompt_add_file(self):
+        target_dir = self.project_root_path
+        if not target_dir:
+            self._ide_message('Nuovo file', 'Apri prima una cartella di progetto.')
+            return
+        default_language = 'Python'
+        result = self._ide_new_file_form(default_language=default_language)
+        if result is None:
+            return
+        name, content = result
+        if not is_safe_child_name(name):
+            self._ide_message('Nuovo file', 'Usa solo un nome file, senza percorsi.')
+            return
+        path = os.path.join(target_dir, name)
+        if os.path.exists(path):
+            self._ide_message('Nuovo file', 'Esiste gia un file o una cartella con questo nome.')
+            return
+        try:
+            write_file_atomic(path, content)
+        except OSError as error:
+            self._ide_message('Nuovo file', f'Impossibile creare il file: {error}')
+            return
+        self._refresh_after_fs_change()
+        self._open_file(path)
+    # [FN CLOSED] _prompt_add_file
 
     def _create_new_folder(self, target_dir):
         if not target_dir:

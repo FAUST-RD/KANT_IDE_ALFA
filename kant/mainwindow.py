@@ -26,14 +26,17 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton, QScrollArea,
-    QSizeGrip, QSplitter, QStackedWidget, QTabBar, QTabWidget, QToolButton, QToolTip,
+    QSizeGrip, QSplitter, QStackedWidget, QTabBar, QTabWidget, QToolButton,
     QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
 from kant import theme
 from kant.theme import set_theme
 from kant.icons import draw_icon
-from kant.model import Run, Node, parse_kant, serialize_kant, read_top_level_label, read_top_level_label_result, KantParseError
+from kant.model import (
+    Run, Node, parse_kant, serialize_kant, read_top_level_label, read_top_level_label_result,
+    KantParseError, ELEMENT_LANGUAGES, build_new_element_node,
+)
 from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending
 from kant.syntax import check_file_syntax, run_command_for_path, _quote_arg
 from kant.xref import build_xref, _walk_nodes
@@ -52,8 +55,8 @@ from kant.workspace import ROLE_PATH, WorkspaceMixin, discard_snapshot, rollback
 from kant.widgets import (
     CodeEdit, TerminalPane, ClaudePane, CollapsibleSection, LeafSection,
     ProjectTree, make_star_icon, RecentFolderCard, TitleBar, FileTab,
-    MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS, _tag_header_html,
-    set_vim_mode, vim_mode_enabled,
+    MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS, _tag_header_html, _markdown_to_html,
+    set_vim_mode, vim_mode_enabled, show_code_hover_popup, hide_code_hover_popup,
 )
 from kant.mappa import XrefMapDialog
 
@@ -381,10 +384,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         if choice == 'rollback':
             try:
-                rollback_snapshot(project, snapshot, theme.IGNORE_DIRS | {'.kant-trash'})
+                skipped_dirs = rollback_snapshot(project, snapshot, theme.IGNORE_DIRS | {'.kant-trash'})
             except OSError as error:
                 self._ide_message('Revisione AI in sospeso', f'Impossibile ripristinare: {error}')
                 return
+            if skipped_dirs:
+                self._ide_message(
+                    'Revisione AI in sospeso',
+                    'Ripristinato, ma alcune cartelle non sono state rimosse (probabilmente non vuote): '
+                    + ', '.join(skipped_dirs),
+                )
         discard_snapshot(snapshot)
         self._clear_ai_snapshot_marker()
     # [FN CLOSED] _check_pending_ai_snapshot
@@ -716,6 +725,17 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         tree_panel_layout.setSpacing(6)
         tree_panel_layout.addWidget(self._build_view_mode_bar())
         tree_panel_layout.addWidget(self.tree, 1)
+
+        self.add_file_btn = QPushButton('+  Nuovo file')
+        self.add_file_btn.setCursor(Qt.PointingHandCursor)
+        self.add_file_btn.setToolTip('Crea un nuovo file nella cartella del progetto')
+        self.add_file_btn.setStyleSheet(
+            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.BORDER}; '
+            f'border-radius:8px; padding:8px; font-weight:600; }} '
+            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
+        )
+        self.add_file_btn.clicked.connect(self._prompt_add_file)
+        tree_panel_layout.addWidget(self.add_file_btn)
 
         # MAPPA opens from a small tab stuck to the bottom-center edge of the window (like a
         # drawer handle) rather than a button buried in the tree panel; clicking it again while
@@ -3390,20 +3410,26 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         return symbol if re.fullmatch(r'[A-Za-z_]\w*', symbol) else ''
 
     def _show_hover_tooltip(self, edit, global_pos, result):
+        # the LSP response is markdown (real docstrings/type signatures from pyright/pylsp), so it
+        # goes through the same markdown->HTML renderer the AI chat uses for fenced code/inline
+        # code, instead of showing literal "**"/backtick syntax
         text = self._lsp_hover_text(result)
         try:
             if text:
-                QToolTip.showText(global_pos, text, edit)
+                show_code_hover_popup(global_pos, _markdown_to_html(text))
             else:
-                QToolTip.hideText()
+                hide_code_hover_popup()
         except RuntimeError:
             pass  # the widget was closed while the request was in flight
 
     def _local_hover(self, edit, global_pos, symbol):
         definitions = self._local_definition_locations(symbol, limit=1)
-        where = f'\nDefinizione probabile: {definitions[0][1]}:{definitions[0][2]}' if definitions else ''
+        where = (
+            f'<br><span style="color:{theme.DIM}">Definizione probabile: '
+            f'{html_escape(definitions[0][1])}:{definitions[0][2]}</span>'
+        ) if definitions else ''
         try:
-            QToolTip.showText(global_pos, f'{symbol}{where}', edit)
+            show_code_hover_popup(global_pos, f'<b>{html_escape(symbol)}</b>{where}')
         except RuntimeError:
             pass
 
@@ -3684,11 +3710,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if only_uid is None:
             self._build_node_widgets(tab, tab.tree, tab.view_layout, 0)
             self._ensure_empty_file_is_editable(tab)
+            self._add_add_element_block(tab)
             return
         node = self._find_node_by_uid(tab.tree, only_uid)
         if node is None:
             self._build_node_widgets(tab, tab.tree, tab.view_layout, 0)
             self._ensure_empty_file_is_editable(tab)
+            self._add_add_element_block(tab)
             return
         wrapper = Node(tag='ROOT', name='', open_raw=None, body=[node])
         self._build_node_widgets(tab, wrapper, tab.view_layout, 0)
@@ -3710,6 +3738,59 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         edit.rename_provider = lambda _edit: self._lsp_command('rename')
         edit.vim_action = self._vim_dispatch
         tab.view_layout.addWidget(edit)
+
+    # [FN CATEGORY] _add_add_element_block — the "+" card at the bottom of the whole-file KANT
+    # outline (scroll all the way down to find it). Deliberately a QPushButton, not a hand-rolled
+    # clickable QFrame — free keyboard focus/Enter-activation and hover state instead of
+    # reimplementing them.
+    # [FN] _add_add_element_block — appends the "add a new element" card to a file's outline
+    # [FN OPEN] _add_add_element_block
+    def _add_add_element_block(self, tab):
+        block = QPushButton('+  Aggiungi un elemento')
+        block.setCursor(Qt.PointingHandCursor)
+        block.setToolTip('Crea un nuovo modulo, classe, funzione o altro elemento in questo file')
+        block.setMinimumHeight(56)
+        block.setStyleSheet(
+            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.BORDER}; '
+            f'border-radius:10px; font-size:{theme.CODE_FONT_PT + 2}pt; font-weight:600; margin-top:8px; }} '
+            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
+        )
+        block.clicked.connect(lambda: self._prompt_add_element(tab))
+        tab.view_layout.addWidget(block)
+    # [FN CLOSED] _add_add_element_block
+
+    def _default_element_language(self, tab):
+        ext = os.path.splitext(tab.path)[1].lower()
+        for language, info in ELEMENT_LANGUAGES.items():
+            if info['ext'] == ext:
+                return language
+        return 'Python'
+
+    # [FN CATEGORY] _prompt_add_element — opens _ide_new_element_form, and on confirmation appends
+    # the resulting Node straight to the tab's own tree — the same in-memory model every edit
+    # already mutates, so save/undo/xref all pick it up exactly like a hand-typed element would,
+    # nothing new to wire for those.
+    # [FN] _prompt_add_element — the "+" card's click handler
+    # [FN OPEN] _prompt_add_element
+    def _prompt_add_element(self, tab):
+        result = self._ide_new_element_form(default_tag='FN', default_language=self._default_element_language(tab))
+        if result is None:
+            return
+        tag, name, desc, language = result
+        tab.remember_undo_state()
+        node = build_new_element_node(tag, name, desc, language)
+        tab.tree.body.append(node)
+        tab.mark_dirty()
+        self._invalidate_xref()
+        self._render_view(tab, tab.filter_uid)
+        self._update_tab_title(tab)
+        new_widget = tab.section_widgets.get(node.uid)
+        if new_widget is not None:
+            QTimer.singleShot(0, lambda: tab.scroll_area.ensureWidgetVisible(new_widget, 50, 80))
+            first_edit = new_widget.findChild(CodeEdit)
+            if first_edit is not None:
+                first_edit.setFocus()
+    # [FN CLOSED] _prompt_add_element
 
     def _find_node_by_uid(self, node, uid):
         for item in node.body:

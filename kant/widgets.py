@@ -27,8 +27,8 @@ from pathlib import Path
 import shiboken6
 
 from PySide6.QtCore import (
-    QElapsedTimer, QFileSystemWatcher, QObject, QPointF, QProcess, QRect, QRectF, Qt, QSettings, QSize,
-    QStringListModel, Signal, QTimer,
+    QElapsedTimer, QFileSystemWatcher, QObject, QPoint, QPointF, QProcess, QRect, QRectF, Qt, QSettings,
+    QSize, QStringListModel, Signal, QTimer,
 )
 from PySide6.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView,
     QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMenu, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QTabWidget, QToolButton, QToolTip,
+    QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QTabWidget, QToolButton,
     QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
@@ -245,7 +245,8 @@ class CodeEdit(QPlainTextEdit):
 
         # PyCharm-style quick-doc-on-hover: mainwindow sets hover_provider to a callable(edit,
         # cursor, global_pos) that fires an async LSP textDocument/hover (or a local fallback) and
-        # shows the result as a QToolTip — same 450ms delay already used for MAPPA's own hover popups
+        # shows the result via show_code_hover_popup (a themed popup, not the native QToolTip) —
+        # same 450ms delay already used for MAPPA's own hover popups
         self.hover_provider = None
         self.setMouseTracking(True)
         self._hover_pos = None
@@ -773,7 +774,7 @@ class CodeEdit(QPlainTextEdit):
     # [FN OPEN] mouseMoveEvent
     def mouseMoveEvent(self, event):
         super().mouseMoveEvent(event)
-        QToolTip.hideText()
+        hide_code_hover_popup()
         self._hover_pos = event.position().toPoint()
         self._hover_timer.start(450)
     # [FN CLOSED] mouseMoveEvent
@@ -782,7 +783,7 @@ class CodeEdit(QPlainTextEdit):
         super().leaveEvent(event)
         self._hover_timer.stop()
         self._hover_pos = None
-        QToolTip.hideText()
+        hide_code_hover_popup()
 
     def _trigger_hover(self):
         if self.hover_provider is None or self._hover_pos is None:
@@ -1201,6 +1202,65 @@ def _format_permission_input_html(tool_input):
 # [FN CLOSED] _format_permission_input_html
 
 
+# [FN CATEGORY] _CodeHoverPopup — quick-doc-on-hover (CodeEdit.hover_provider) used to show its text
+# via QToolTip, the OS's own native tooltip — unstyled, unthemeable, visibly foreign next to every
+# other panel/popup in this IDE (all of which share theme.PANEL/BORDER, see e.g. mappa.py's
+# EdgeFlowPopup). This is a themed replacement: same rounded-panel look as the rest of the app, and
+# renders the LSP hover response as real markdown (_markdown_to_html) instead of raw text with
+# literal "**"/backtick syntax showing through.
+# [FN] _CodeHoverPopup — a themed floating popup for code-element documentation-on-hover
+# [FN OPEN] _CodeHoverPopup
+class _CodeHoverPopup(QFrame):
+    def __init__(self):
+        super().__init__(None, Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setObjectName('codeHoverPopup')
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        # never steals a click/focus from the editor underneath — same reasoning a native tooltip
+        # already gets "for free" from the OS, which a custom top-level widget doesn't by default
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setWindowFlag(Qt.WindowDoesNotAcceptFocus, True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 9, 12, 10)
+        self.label = QLabel()
+        self.label.setTextFormat(Qt.RichText)
+        self.label.setWordWrap(True)
+        self.label.setMaximumWidth(480)
+        layout.addWidget(self.label)
+        self.apply_style()
+        self.hide()
+
+    def apply_style(self):
+        self.setStyleSheet(
+            f'#codeHoverPopup {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:10px; }}'
+        )
+        self.label.setStyleSheet(f'color:{theme.TEXT}; border:none; font-size:{theme.CODE_FONT_PT}pt;')
+
+    def show_at(self, global_pos, html_text):
+        self.apply_style()
+        self.label.setText(html_text)
+        self.adjustSize()
+        self.move(global_pos + QPoint(14, 18))
+        self.show()
+        self.raise_()
+# [FN CLOSED] _CodeHoverPopup
+
+
+# [CST] _code_hover_popup_instance — one shared popup for the whole app (only one hover can ever be
+# showing at a time), built lazily since it needs a live QApplication before it can construct
+_code_hover_popup_instance = [None]
+
+
+def show_code_hover_popup(global_pos, html_text):
+    if _code_hover_popup_instance[0] is None:
+        _code_hover_popup_instance[0] = _CodeHoverPopup()
+    _code_hover_popup_instance[0].show_at(global_pos, html_text)
+
+
+def hide_code_hover_popup():
+    if _code_hover_popup_instance[0] is not None:
+        _code_hover_popup_instance[0].hide()
+
+
 # [CST] _TYPING_FRAMES — cycled in the placeholder assistant bubble while a prompt is running and
 # no output has streamed back yet, so the chat shows the AI is working instead of sitting blank
 _TYPING_FRAMES = ('·', '· ·', '· · ·')
@@ -1278,6 +1338,21 @@ class ClaudePane(QWidget):
         self._typing_timer = QTimer(self)
         self._typing_timer.timeout.connect(self._typing_tick)
         self._typing_frame = 0
+        # a hung claude/codex process used to freeze this pane indefinitely — Stop was the only way
+        # out, and a user who stepped away wouldn't know to click it. Same 600s ceiling permission
+        # requests already time out at (aipermissions.py), for consistency; a real agentic turn can
+        # legitimately run long, so this is a "something's actually stuck" backstop, not a soft limit
+        self._process_timeout_timer = QTimer(self)
+        self._process_timeout_timer.setSingleShot(True)
+        self._process_timeout_timer.timeout.connect(self._on_process_timeout)
+        # a long streamed response used to re-render the ENTIRE accumulated text through
+        # _markdown_to_html on every single stdout chunk — O(n) work per chunk, O(n^2) over a full
+        # response, and QProcess often delivers a fast burst of tiny reads for one logical write.
+        # This throttles actual render+scroll passes to ~25/s (still reads as real-time streaming)
+        # instead of one per chunk, without touching the rendering logic itself.
+        self._stream_render_timer = QTimer(self)
+        self._stream_render_timer.setSingleShot(True)
+        self._stream_render_timer.timeout.connect(self._flush_stream_render)
         self._session_allowed_tools = set()
         self._auto_permissions_once = False
         self._permission_cards = []
@@ -1595,13 +1670,20 @@ class ClaudePane(QWidget):
     def _append_stream(self, text):
         if not text:
             return
+        self._process_timeout_timer.start(600_000)  # real output = not stuck, push the deadline out
         self._typing_timer.stop()  # real output arrived — stop the "still working" placeholder
         if self._stream_label is None:
             self._stream_label = self._add_message('', 'assistant')
             self._stream_text = ''
         self._stream_text += text
-        self._stream_label.setText(_markdown_to_html(self._stream_text.strip()))
         self._write_log(text)
+        if not self._stream_render_timer.isActive():
+            self._stream_render_timer.start(40)
+
+    def _flush_stream_render(self):
+        if self._stream_label is None:
+            return
+        self._stream_label.setText(_markdown_to_html(self._stream_text.strip()))
         QTimer.singleShot(0, lambda: self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum()))
 
     def write_info(self, text):
@@ -1753,6 +1835,7 @@ class ClaudePane(QWidget):
         self.send_btn.setText('Stop')
         self.send_btn.setEnabled(True)
         self._stream_text = ''
+        self._process_timeout_timer.start(600_000)
         self.process.start(executable, args)
         # claude -p reads its prompt from -p, never stdin; without this it waits ~3s for piped input
         # that never comes ("no stdin data received in 3s") before proceeding — closing the write
@@ -1783,8 +1866,19 @@ class ClaudePane(QWidget):
                 pass
             setattr(self, attribute, None)
 
+    def _on_process_timeout(self):
+        if self.process is None:
+            return
+        self._cancel_pending_permissions()
+        self.process.kill()
+        self._append(f'\n[{_agent_label(self.current_agent)} interrotto: nessuna attivita da 10 minuti]\n')
+
     def _reset_process(self):
+        self._process_timeout_timer.stop()
         self._typing_timer.stop()
+        if self._stream_render_timer.isActive():
+            self._stream_render_timer.stop()
+            self._flush_stream_render()  # a pending throttled render must land before the label is dropped below
         if self._stream_label is not None and not self._stream_text:
             self._stream_label.setText('')  # no output ever arrived — drop the typing placeholder
         self._cancel_pending_permissions()
@@ -1809,6 +1903,67 @@ class ClaudePane(QWidget):
         else:
             self._append(f'\n[{_agent_label(self.current_agent)} completato]\n')
         self._reset_process()
+
+    # [FN CATEGORY] offer_ai_review — a small inline chat card (same shape as a permission-request
+    # card) instead of popping the full review window unasked: an AI turn that changed files just
+    # gets a quiet "N file changed, want to look?" — "Rivedi" opens show_ai_review's full window,
+    # "Accetta tutto"/"Rifiuta tutto" resolve immediately without ever opening it. Never called at
+    # all when auto_permissions is on (see workspace._finish_ai_review) — automatic mode means the
+    # user asked not to be interrupted for this either.
+    # [FN] offer_ai_review — posts the review as a dismissible chat card instead of a popped window
+    # [FN OPEN] offer_ai_review
+    def offer_ai_review(self, review, render_text, on_resolved):
+        total_add = sum(item.get('additions', 0) for item in review)
+        total_del = sum(item.get('deletions', 0) for item in review)
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        frame = QFrame()
+        frame.setMaximumWidth(540)
+        frame.setStyleSheet(f'QFrame {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:12px; }}')
+        content = QVBoxLayout(frame)
+        content.setContentsMargins(12, 9, 12, 10)
+        title = QLabel(f'Modifiche AI pronte per la revisione — {len(review)} file (+{total_add} −{total_del})')
+        title.setStyleSheet(f'color:{theme.TEXT}; font-weight:600; border:none;')
+        file_list = QLabel('\n'.join(f"{item['status']}: {item['path']}" for item in review)[:600])
+        file_list.setWordWrap(True)
+        file_list.setStyleSheet(f'color:{theme.DIM}; border:none;')
+        content.addWidget(title)
+        content.addWidget(file_list)
+        actions = QHBoxLayout()
+        buttons = [QPushButton(label) for label in ('Rifiuta tutto', 'Rivedi', 'Accetta tutto')]
+        button_tooltips = (
+            'Annulla tutte le modifiche di questo turno e ripristina lo snapshot',
+            "Apri la revisione completa (diff per file/blocco, risultato modificabile)",
+            'Applica tutte le modifiche cosi come sono, senza aprire la revisione',
+        )
+        for button, accent, tooltip in zip(buttons, (theme.TAG_COLORS['TST'], theme.ACCENT, theme.OK), button_tooltips):
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip(tooltip)
+            button.setStyleSheet(
+                f'QPushButton {{ background:{theme.PANEL}; color:{accent}; border:1px solid {accent}; '
+                f'border-radius:8px; padding:6px 12px; font-weight:700; }} '
+                f'QPushButton:hover {{ background:{accent}; color:#ffffff; }}'
+            )
+            actions.addWidget(button)
+        content.addLayout(actions)
+        row_layout.addWidget(frame, 0, Qt.AlignLeft)
+        row_layout.addStretch(1)
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, row)
+        QTimer.singleShot(0, lambda: self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum()))
+
+        def resolve_inline(action):
+            row.setParent(None)
+            if action == 'apply':
+                accepted = {item['path']: set(range(len(item['hunks']))) for item in review}
+                on_resolved('apply', accepted, {})
+            else:
+                on_resolved('cancel', {}, {})
+
+        buttons[0].clicked.connect(lambda: resolve_inline('cancel'))
+        buttons[1].clicked.connect(lambda: (row.setParent(None), self.show_ai_review(review, render_text, on_resolved)))
+        buttons[2].clicked.connect(lambda: resolve_inline('apply'))
+    # [FN CLOSED] offer_ai_review
 
     # [FN CATEGORY] show_ai_review — a large separate window (framed header, no native title bar —
     # same look as the Git panel/MAPPA dialog) instead of embedding the card in the chat transcript,

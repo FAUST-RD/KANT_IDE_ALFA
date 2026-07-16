@@ -252,6 +252,238 @@ def _assign_uids(root):
 # [FN CLOSED] _assign_uids
 
 
+# [CST] ELEMENT_LANGUAGES — the "create new element" dialog's language choices, each mapped to the
+# comment leader used for the marker lines (OPEN/CLOSED/CATEGORY). Every leader here is one
+# MARKER_PREFIX/MARKER_SUFFIX already accepts, so a generated node round-trips through
+# parse_kant/serialize_kant exactly like a hand-written one — no new marker syntax invented.
+ELEMENT_LANGUAGES = {
+    'Python':     {'comment': '#', 'suffix': '', 'ext': '.py'},
+    'JavaScript': {'comment': '//', 'suffix': '', 'ext': '.js'},
+    'TypeScript': {'comment': '//', 'suffix': '', 'ext': '.ts'},
+    'Go':         {'comment': '//', 'suffix': '', 'ext': '.go'},
+    'Java':       {'comment': '//', 'suffix': '', 'ext': '.java'},
+    'C++':        {'comment': '//', 'suffix': '', 'ext': '.cpp'},
+    'C#':         {'comment': '//', 'suffix': '', 'ext': '.cs'},
+    'Rust':       {'comment': '//', 'suffix': '', 'ext': '.rs'},
+    'SQL':        {'comment': '--', 'suffix': '', 'ext': '.sql'},
+    'HTML':       {'comment': '<!--', 'suffix': '-->', 'ext': '.html'},
+    'Generico':   {'comment': '#', 'suffix': '', 'ext': '.txt'},
+}
+
+# [CST] ELEMENT_TAG_LABELS — human-readable name for each of the 8 KANT tags, for the "create new
+# element" dialog's tag picker (the bare codes MOD/CLS/... aren't self-explanatory to someone
+# adding their first element).
+ELEMENT_TAG_LABELS = {
+    'MOD': 'Modulo / file', 'CLS': 'Classe', 'FN': 'Funzione', 'TYP': 'Tipo',
+    'CST': 'Costante', 'VAR': 'Variabile', 'CFG': 'Configurazione', 'TST': 'Test',
+}
+
+# [CST] _ELEMENT_SKELETONS — starter code body per (language, tag), formatted with {name}/{Name}/
+# {NAME} (as-typed / PascalCase / UPPER_SNAKE). Deliberately real, idiomatic-for-that-language
+# skeletons (a Python FN gets `def f(): pass`, a Go FN gets `func f() {}`, an HTML "FN" gets a
+# labeled <div> since HTML has no function concept) rather than one generic template reused
+# everywhere — the whole point of asking for a language is that the result looks native to it.
+_ELEMENT_SKELETONS = {
+    'Python': {
+        'MOD': '"""Modulo {name}."""',
+        'CLS': 'class {Name}:\n    pass',
+        'FN': 'def {name}():\n    pass',
+        'TYP': '{name} = None  # alias di tipo',
+        'CST': '{NAME} = None',
+        'VAR': '{name} = None',
+        'CFG': '{name} = None',
+        'TST': 'def test_{name}():\n    assert True',
+    },
+    'JavaScript': {
+        'MOD': '// modulo {name}',
+        'CLS': 'class {Name} {{\n}}',
+        'FN': 'function {name}() {{\n}}',
+        'TYP': 'const {name} = null;',
+        'CST': 'const {NAME} = null;',
+        'VAR': 'let {name} = null;',
+        'CFG': 'const {name} = {{}};',
+        'TST': "test('{name}', () => {{\n  expect(true).toBe(true);\n}});",
+    },
+    'TypeScript': {
+        'MOD': '// modulo {name}',
+        'CLS': 'class {Name} {{\n}}',
+        'FN': 'function {name}(): void {{\n}}',
+        'TYP': 'type {Name} = unknown;',
+        'CST': 'const {NAME} = null;',
+        'VAR': 'let {name}: unknown = null;',
+        'CFG': 'const {name}: Record<string, unknown> = {{}};',
+        'TST': "test('{name}', () => {{\n  expect(true).toBe(true);\n}});",
+    },
+    'Go': {
+        'MOD': 'package {name}',
+        'CLS': 'type {Name} struct {{\n}}',
+        'FN': 'func {name}() {{\n}}',
+        'TYP': 'type {Name} interface{{}}',
+        'CST': 'const {NAME} = 0',
+        'VAR': 'var {name} interface{{}}',
+        'CFG': 'var {name} = struct{{}}{{}}',
+        'TST': 'func Test{Name}(t *testing.T) {{\n}}',
+    },
+    'Java': {
+        'MOD': '// modulo {name}',
+        'CLS': 'public class {Name} {{\n}}',
+        'FN': 'public void {name}() {{\n}}',
+        'TYP': 'public interface {Name} {{\n}}',
+        'CST': 'public static final int {NAME} = 0;',
+        'VAR': 'private Object {name};',
+        'CFG': 'private Object {name};',
+        'TST': '@Test\npublic void {name}() {{\n}}',
+    },
+    'C++': {
+        'MOD': '// modulo {name}',
+        'CLS': 'class {Name} {{\n}};',
+        'FN': 'void {name}() {{\n}}',
+        'TYP': 'using {Name} = void*;',
+        'CST': 'const int {NAME} = 0;',
+        'VAR': 'auto {name} = nullptr;',
+        'CFG': 'auto {name} = nullptr;',
+        'TST': 'TEST({name}) {{\n}}',
+    },
+    'C#': {
+        'MOD': '// modulo {name}',
+        'CLS': 'public class {Name}\n{{\n}}',
+        'FN': 'public void {name}()\n{{\n}}',
+        'TYP': 'public interface {Name}\n{{\n}}',
+        'CST': 'public const int {NAME} = 0;',
+        'VAR': 'private object {name};',
+        'CFG': 'private object {name};',
+        'TST': '[Test]\npublic void {name}()\n{{\n}}',
+    },
+    'Rust': {
+        'MOD': '// modulo {name}',
+        'CLS': 'struct {Name} {{\n}}',
+        'FN': 'fn {name}() {{\n}}',
+        'TYP': 'type {Name} = ();',
+        'CST': 'const {NAME}: i32 = 0;',
+        'VAR': 'let mut {name} = ();',
+        'CFG': 'let {name} = ();',
+        'TST': '#[test]\nfn {name}() {{\n    assert!(true);\n}}',
+    },
+    'SQL': {
+        'MOD': '-- modulo {name}',
+        'CLS': 'CREATE TABLE {name} (\n);',
+        'FN': 'CREATE FUNCTION {name}() RETURNS void AS $$\nBEGIN\nEND;\n$$ LANGUAGE plpgsql;',
+        'TYP': 'CREATE TYPE {name} AS (\n);',
+        'CST': '-- {name}: costante logica',
+        'VAR': '-- {name}: variabile logica',
+        'CFG': '-- {name}: configurazione',
+        'TST': '-- test {name}',
+    },
+    'HTML': {
+        'MOD': '<!-- {name} -->',
+        'CLS': '<section id="{name}">\n</section>',
+        'FN': '<div id="{name}">\n</div>',
+        'TYP': '<!-- tipo {name} -->',
+        'CST': '<!-- costante {name} -->',
+        'VAR': '<!-- variabile {name} -->',
+        'CFG': '<!-- config {name} -->',
+        'TST': '<!-- test {name} -->',
+    },
+    'Generico': {
+        'MOD': '{name}', 'CLS': '{name}', 'FN': '{name}', 'TYP': '{name}',
+        'CST': '{name}', 'VAR': '{name}', 'CFG': '{name}', 'TST': '{name}',
+    },
+}
+
+
+# [FN] element_skeleton — the starter code body for a (language, tag, name), formatted and ready to
+# drop into a Run — also used by the "create new element" dialog to render a live preview before
+# the user commits to it
+# [FN OPEN] element_skeleton
+def element_skeleton(tag, name, language):
+    table = _ELEMENT_SKELETONS.get(language, _ELEMENT_SKELETONS['Generico'])
+    template = table.get(tag, '{name}')
+    safe_name = name or 'nome'
+    return template.format(name=safe_name, Name=safe_name[:1].upper() + safe_name[1:], NAME=safe_name.upper())
+# [FN CLOSED] element_skeleton
+
+
+# [FN CATEGORY] build_new_element_node — the "create new element" dialog's actual output: a real
+# Node with language-correct open_raw/closed_raw marker lines (the ponytail note on serialize_kant
+# below flagged this as future work when no caller needed it yet — this is that caller), ready to
+# append to a tree and immediately round-trip through serialize_kant/parse_kant like any
+# hand-written element.
+# [FN] build_new_element_node — constructs a new top-level (or nested) Node from a dialog's answers
+# [FN OPEN] build_new_element_node
+def build_new_element_node(tag, name, desc, language):
+    leader = ELEMENT_LANGUAGES.get(language, ELEMENT_LANGUAGES['Generico'])
+    prefix, suffix = leader['comment'], leader['suffix']
+
+    def marker(bracket_text):
+        tail = f' {suffix}' if suffix else ''
+        return f'{prefix} {bracket_text}{tail}'
+
+    uid = secrets.token_hex(4)
+    code = element_skeleton(tag, name, language)
+    return Node(
+        tag=tag, name=name,
+        open_raw=marker(f'[{tag} OPEN #{uid}] {name}'),
+        closed_raw=marker(f'[{tag} CLOSED #{uid}] {name}'),
+        category_raw=marker(f'[{tag} CATEGORY] {desc}') if desc else None,
+        desc=desc, category_desc=desc or None, uid=uid,
+        body=[Run(lines=code.split('\n'))] if code.strip() else [],
+    )
+# [FN CLOSED] build_new_element_node
+
+
+# [CST] FILE_KIND_LABELS — the "+" new-file dialog's kind picker, in the order shown. Order matters
+# here: the three KANT-tagged kinds first (what most files in this project actually are), then the
+# common non-code files every project eventually needs, then the escape hatch.
+FILE_KIND_LABELS = {
+    'module': 'Modulo vuoto (con tag KANT)',
+    'test': 'File di test (con tag KANT)',
+    'config': 'File di configurazione (con tag KANT)',
+    'readme': 'README',
+    'gitignore': '.gitignore',
+    'empty': 'File vuoto',
+}
+
+_GITIGNORE_TEMPLATES = {
+    'Python': '__pycache__/\n*.pyc\n.venv/\nvenv/\n.pytest_cache/\n*.egg-info/\ndist/\nbuild/\n.env\n',
+    'JavaScript': 'node_modules/\ndist/\nbuild/\n.env\nnpm-debug.log*\n',
+    'TypeScript': 'node_modules/\ndist/\nbuild/\n.env\n*.tsbuildinfo\n',
+    'Go': '/bin/\n/dist/\n*.exe\n*.test\n*.out\n',
+    'Java': 'target/\n*.class\n.gradle/\nbuild/\n',
+    'C++': 'build/\n*.o\n*.obj\n*.exe\nCMakeCache.txt\n',
+    'C#': 'bin/\nobj/\n*.user\n',
+    'Rust': '/target/\nCargo.lock\n',
+    'SQL': '*.bak\n',
+    'HTML': 'node_modules/\ndist/\n',
+    'Generico': '*.log\n*.tmp\n',
+}
+
+
+# [FN CATEGORY] build_new_file_content — the "+" new-file dialog's actual output: source text for
+# one of FILE_KIND_LABELS's kinds. The three KANT-tagged kinds reuse build_new_element_node (a new
+# file's first element is exactly the same construction as adding one to an existing file, just
+# wrapped so the file itself carries no separate MOD wrapper unless the kind IS 'module'), so the
+# same language-correctness/round-trip guarantee applies here too.
+# [FN] build_new_file_content — starter text for a new file, by kind/language/name
+# [FN OPEN] build_new_file_content
+def build_new_file_content(kind, language, name):
+    safe_name = name or 'nuovo'
+    if kind == 'module':
+        node = build_new_element_node('MOD', safe_name, f'modulo {safe_name}', language)
+        return serialize_kant(Node(tag='ROOT', name='', open_raw=None, body=[node])) + '\n'
+    if kind == 'test':
+        node = build_new_element_node('TST', safe_name, f'test per {safe_name}', language)
+        return serialize_kant(Node(tag='ROOT', name='', open_raw=None, body=[node])) + '\n'
+    if kind == 'config':
+        node = build_new_element_node('CFG', safe_name, f'configurazione {safe_name}', language)
+        return serialize_kant(Node(tag='ROOT', name='', open_raw=None, body=[node])) + '\n'
+    if kind == 'readme':
+        return f'# {safe_name}\n\nDescrizione del progetto.\n\n## Installazione\n\n## Utilizzo\n'
+    if kind == 'gitignore':
+        return _GITIGNORE_TEMPLATES.get(language, _GITIGNORE_TEMPLATES['Generico'])
+    return ''  # empty
+# [FN CLOSED] build_new_file_content
+
+
 # [FN CATEGORY] serialize_kant — walks the tree in original order, using edited run text where
 # present, to reconstruct the full source text byte-for-byte. Marker lines are never rebuilt from
 # (tag, name, uid) — they're emitted verbatim from open_raw/closed_raw, which already carry

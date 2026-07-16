@@ -351,6 +351,7 @@ class GitOpsMixin:
             if error or result is None or result.returncode:
                 message = str(error) if error else ((result.stderr or result.stdout) if result else 'Git non disponibile')
                 self.terminal.write_info(f'\n# git {action} {rel}\n{message}\n')
+                self._ide_message('Git', f'{"Stage" if staged else "Unstage"} non riuscito per {rel}:\n{message.strip()[:400]}')
                 return
             self._refresh_after_fs_change()
             self.terminal.write_info(f'\n# git {action} {rel}: OK\n')
@@ -397,6 +398,10 @@ class GitOpsMixin:
         if result is None or result.returncode:
             error = (result.stderr or result.stdout) if result else 'Git non disponibile'
             self.terminal.write_info(f'\n# git commit\n{error}\n')
+            # a terminal line alone is easy to miss for something that actually failed — every
+            # other failure in this app (file I/O, AI review, ...) gets a real dialog, git commit
+            # shouldn't be the one exception just because it also happens to log to the terminal
+            self._ide_message('Git commit', f'Commit non riuscito:\n{error.strip()[:400]}')
             return
         self._refresh_after_fs_change()
         self.terminal.write_info(f'\n# git commit: OK\n{result.stdout}\n')
@@ -421,6 +426,7 @@ class GitOpsMixin:
         if result is None or result.returncode:
             error = (result.stderr or result.stdout) if result else 'Git non disponibile'
             self.terminal.write_info(f'\n# git checkout {branch}\n{error}\n')
+            self._ide_message('Cambia branch', f'Checkout non riuscito:\n{error.strip()[:400]}')
             return
         self._refresh_after_fs_change()
         self.terminal.write_info(f'\n# git checkout {branch}: OK\n')

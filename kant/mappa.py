@@ -175,8 +175,8 @@ def _seed_file_cluster(elements_in_file, center_x, center_y, radius, seeds, rtl=
 # additionally narrows by the connections filter, the same rule that decides whether an edge is
 # drawn, so size/heatmap/geography react to that filter too, not just to node visibility.
 def _element_degree(el, elements=None, active_edge_tags=None):
-    incoming = getattr(el, 'incoming_detail', None) or el.incoming
-    outgoing = getattr(el, 'outgoing_detail', None) or el.outgoing
+    incoming = el.incoming_detail or el.incoming
+    outgoing = el.outgoing_detail or el.outgoing
     if active_edge_tags is None or elements is None:
         return len(incoming) + len(outgoing)
     if el.tag not in active_edge_tags:
@@ -200,7 +200,7 @@ def _element_size(el, max_degree, elements=None, active_edge_tags=None):
     """Box (width, height) for one element, scaled by its share of the busiest node's traffic.
     A common-origin anchor is always the small fixed circle size regardless of how many
     siblings connect to it — it's a marker, not a traffic hub."""
-    if getattr(el, 'is_anchor', False):
+    if el.is_anchor:
         return ANCHOR_SIZE, ANCHOR_SIZE
     degree = _element_degree(el, elements, active_edge_tags)
     t = (degree / max_degree) if max_degree else 0.0
@@ -703,7 +703,7 @@ class XrefMapView(QGraphicsView):
         self._laying_out = True
         for el in elements.values():
             width, height, font_pt = self._node_dims(el)
-            is_anchor = getattr(el, 'is_anchor', False)
+            is_anchor = el.is_anchor
             path = QPainterPath()
             if is_anchor:
                 path.addEllipse(0, 0, width, height)
@@ -724,7 +724,7 @@ class XrefMapView(QGraphicsView):
                 rect.setToolTip('Origine comune (elemento radice non visualizzato)')
                 label = QGraphicsSimpleTextItem('', rect)
             else:
-                collapsed = getattr(el, 'collapsed', None)
+                collapsed = el.collapsed
                 prefix = '▸ ' if collapsed is True else ('▾ ' if collapsed is False else '')
                 tooltip = f'{el.file}\n{el.category_desc or el.desc or el.name}'
                 rect.setToolTip(tooltip)
@@ -824,7 +824,7 @@ class XrefMapView(QGraphicsView):
     # [FN] _node_colors — returns (pen_color, fill_color) for one displayed node
     # [FN OPEN] _node_colors
     def _node_colors(self, el):
-        if getattr(el, 'is_anchor', False):
+        if el.is_anchor:
             black = QColor(0, 0, 0)
             return black, black  # unmarked: same black whether heatmap or tag coloring is active
         if self._heatmap:
@@ -1607,7 +1607,7 @@ class XrefMapDialog(QDialog):
     # [FN OPEN] _show_node_popup
     def _show_node_popup(self, key, scene_point, pinned):
         element = self._display.get(key)
-        if element is None or getattr(element, 'is_anchor', False):
+        if element is None or element.is_anchor:
             return  # a common-origin anchor has no real data of its own to explain
         incoming = [self._element_label(k) for k in (element.incoming_detail or element.incoming)]
         outgoing = [self._element_label(k) for k in (element.outgoing_detail or element.outgoing)]
@@ -1901,7 +1901,7 @@ class XrefMapDialog(QDialog):
             self._pinned_edge = None
             self.edge_popup.hide()
         self.view.set_pinned([k for k in self._pinned_nodes if k in self._display])
-        modules = sum(1 for e in self._display.values() if getattr(e, 'collapsed', None) is not None)
+        modules = sum(1 for e in self._display.values() if e.collapsed is not None)
         self.count_label.setText(
             f'{len(self._display)} nodi · {len(self.view._edges)} collegamenti'
             + (f' · {modules} moduli comprimibili' if modules else '')
@@ -1998,7 +1998,7 @@ class XrefMapDialog(QDialog):
     # [FN OPEN] _on_node_activated
     def _on_node_activated(self, key):
         node = self._display.get(key)
-        if node is not None and getattr(node, 'collapsed', None) is not None:
+        if node is not None and node.collapsed is not None:
             self._expanded.symmetric_difference_update({node.file})
             self._refresh(relayout=True)
         else:

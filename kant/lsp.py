@@ -6,6 +6,7 @@ UI actions, local fallbacks, and workspace-edit application remain in ``MainWind
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -104,6 +105,13 @@ class LspClient(QObject):
         self.opened = {}
         self.pending = []
         self.requests = {}
+        # a server that crashes right after starting used to just sit dead until the user happened
+        # to type again — restart WAS automatic (update_document's process-is-None check), but with
+        # no backoff, meaning a server that crashes immediately on every launch (bad config, wrong
+        # interpreter) would retry on every single keystroke. Exponential backoff (capped at 30s),
+        # reset once a server actually reaches 'initialized' — see _handle_message.
+        self._crash_count = 0
+        self._restart_backoff_until = 0.0
 
     def shutdown(self):
         process, self.process = self.process, None
@@ -136,6 +144,8 @@ class LspClient(QObject):
         return True
 
     def _start(self, executable, args, server_name, root):
+        if time.monotonic() < self._restart_backoff_until:
+            return False  # still in backoff from a recent crash — don't hammer a server that just died
         self.shutdown()
         self.process = QProcess(self)
         self.process.readyReadStandardOutput.connect(self._read_stdout)
@@ -169,14 +179,20 @@ class LspClient(QObject):
         if self.process is not None:
             self.process.readAllStandardError()  # drain the pipe; servers often log verbosely here
 
+    def _record_crash(self):
+        self._crash_count += 1
+        self._restart_backoff_until = time.monotonic() + min(2 ** self._crash_count, 30)
+
     def _process_error(self, _error):
         if self.process is not None:
             self.serverError.emit(self.process.errorString())
+        self._record_crash()
         self.shutdown()
 
     def _process_finished(self, _exit_code, _status):
         if self.process is not None:
             self.serverError.emit(f'{self.server_name or "LSP"} terminato')
+        self._record_crash()
         self.shutdown()
 
     def close_document(self, path):
@@ -259,6 +275,7 @@ class LspClient(QObject):
                 self.shutdown()
                 return
             self.ready = True
+            self._crash_count = 0  # a real successful init means this server config actually works
             self._send_notification('initialized', {})
             pending, self.pending = self.pending, []
             for job in pending:

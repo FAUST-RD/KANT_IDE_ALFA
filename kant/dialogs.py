@@ -9,6 +9,9 @@ from PySide6.QtWidgets import (
 )
 
 from kant import theme
+from kant.model import (
+    ELEMENT_LANGUAGES, ELEMENT_TAG_LABELS, element_skeleton, FILE_KIND_LABELS, build_new_file_content,
+)
 
 
 # [FN CATEGORY] _PaletteInput — a QLineEdit that forwards Up/Down to the command palette's result
@@ -60,12 +63,52 @@ class IdeDialogsMixin:
         cancel.setToolTip('Chiudi senza applicare')
         ok = QPushButton('OK')
         ok.setToolTip('Conferma e applica')
+        ok.setDefault(True)  # Enter in a field submits, matching every native dialog's convention
         for button in (cancel, ok):
             button.setStyleSheet(theme.BUTTON_STYLE)
             row.addWidget(button)
         cancel.clicked.connect(dialog.reject)
         ok.clicked.connect(dialog.accept)
         layout.addLayout(row)
+
+    # [FN CATEGORY] _internal_window — the shared chrome every "internal window" dialog in this
+    # file builds: a frameless modal with its own Consolas title + × (rejects), not the OS's native
+    # title bar — same look as the Git panel/MAPPA dialog (kant/gitops.py, kant/mappa.py). Was
+    # hand-duplicated in 6 places (each with the exact same 25 lines, differing only in title/
+    # width/tooltip) before this existed.
+    # [FN] _internal_window — builds the header chrome; returns (dialog, outer_layout, body_layout)
+    # [FN OPEN] _internal_window
+    def _internal_window(self, title, width, close_tooltip='Chiudi senza salvare'):
+        dialog = QDialog(self)
+        dialog.setModal(True)
+        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        dialog.setFixedWidth(width)
+        dialog.setStyleSheet(f'QDialog {{ background:{theme.BG}; border:1px solid {theme.BORDER}; }}')
+
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        header = QWidget()
+        header.setFixedHeight(34)
+        header.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(14, 0, 8, 0)
+        title_label = QLabel(title)
+        title_label.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
+        title_label.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:2px; border:none;')
+        header_row.addWidget(title_label)
+        header_row.addStretch(1)
+        close_btn = QPushButton('×')
+        close_btn.setFixedSize(26, 24)
+        close_btn.setToolTip(close_tooltip)
+        close_btn.setStyleSheet(theme.BUTTON_STYLE)
+        close_btn.clicked.connect(dialog.reject)
+        header_row.addWidget(close_btn)
+        outer.addWidget(header)
+
+        return dialog, outer, QVBoxLayout()
+    # [FN CLOSED] _internal_window
 
     def _ide_choice(self, title, message, choices):
         """choices: (label, value) pairs, or (label, value, tooltip) triples for a consequential
@@ -116,35 +159,7 @@ class IdeDialogsMixin:
     # [FN] _ide_metadata_form — tag/name/short-description editor in a single dialog
     # [FN OPEN] _ide_metadata_form
     def _ide_metadata_form(self, tag, name, desc):
-        dialog = QDialog(self)
-        dialog.setModal(True)
-        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
-        dialog.setFixedWidth(420)
-        dialog.setStyleSheet(f'QDialog {{ background:{theme.BG}; border:1px solid {theme.BORDER}; }}')
-
-        outer = QVBoxLayout(dialog)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        header = QWidget()
-        header.setFixedHeight(34)
-        header.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
-        header_row = QHBoxLayout(header)
-        header_row.setContentsMargins(14, 0, 8, 0)
-        title = QLabel('Metadati KANT')
-        title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
-        title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:2px; border:none;')
-        header_row.addWidget(title)
-        header_row.addStretch(1)
-        close_btn = QPushButton('×')
-        close_btn.setFixedSize(26, 24)
-        close_btn.setToolTip('Chiudi senza salvare')
-        close_btn.setStyleSheet(theme.BUTTON_STYLE)
-        close_btn.clicked.connect(dialog.reject)
-        header_row.addWidget(close_btn)
-        outer.addWidget(header)
-
-        body = QVBoxLayout()
+        dialog, outer, body = self._internal_window('Metadati KANT', 420, 'Chiudi senza salvare')
         body.setContentsMargins(18, 16, 18, 16)
         body.setSpacing(10)
 
@@ -170,6 +185,7 @@ class IdeDialogsMixin:
         cancel.setToolTip('Chiudi senza salvare le modifiche ai metadati')
         ok = QPushButton('OK')
         ok.setToolTip('Salva tag, nome e descrizione')
+        ok.setDefault(True)
         for button in (cancel, ok):
             button.setStyleSheet(theme.BUTTON_STYLE)
             buttons.addWidget(button)
@@ -185,6 +201,208 @@ class IdeDialogsMixin:
         return tag_field.text(), name_field.text(), desc_field.text()
     # [FN CLOSED] _ide_metadata_form
 
+    # [FN CATEGORY] _ide_new_element_form — the "+" block at the bottom of a KANT outline (and the
+    # equivalent one for whole new files) asks four things: what kind of element (the 8 KANT tags,
+    # shown by name not bare code), what language (determines both the comment leader for the
+    # marker lines and the generated code's actual syntax), name, and a short description. A live
+    # preview re-renders on every keystroke/selection change so the user sees exactly what they're
+    # about to get before committing — this is deliberately not a bare name prompt.
+    # [FN] _ide_new_element_form — tag/language/name/description picker with a live code preview
+    # [FN OPEN] _ide_new_element_form
+    def _ide_new_element_form(self, default_tag='FN', default_language='Python'):
+        dialog, outer, body = self._internal_window('Nuovo elemento', 520, 'Chiudi senza creare')
+        body.setContentsMargins(18, 16, 18, 16)
+        body.setSpacing(8)
+
+        field_style = (
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:6px; padding:6px;'
+        )
+
+        def field_label(text):
+            label = QLabel(text)
+            label.setStyleSheet(f'color:{theme.TEXT}; border:none; margin-top:4px;')
+            body.addWidget(label)
+
+        field_label('Tipo di elemento:')
+        tag_box = QComboBox()
+        for tag, label in ELEMENT_TAG_LABELS.items():
+            tag_box.addItem(f'{label}  ·  {tag}', tag)
+        tag_box.setCurrentIndex(max(0, tag_box.findData(default_tag)))
+        tag_box.setStyleSheet(field_style)
+        body.addWidget(tag_box)
+
+        field_label('Linguaggio (determina la sintassi generata):')
+        lang_box = QComboBox()
+        lang_box.addItems(list(ELEMENT_LANGUAGES))
+        lang_box.setCurrentText(default_language)
+        lang_box.setStyleSheet(field_style)
+        body.addWidget(lang_box)
+
+        field_label('Nome tecnico:')
+        name_field = QLineEdit()
+        name_field.setPlaceholderText('es. calcola_totale')
+        name_field.setStyleSheet(field_style)
+        body.addWidget(name_field)
+
+        field_label('Descrizione breve:')
+        desc_field = QLineEdit()
+        desc_field.setPlaceholderText('cosa fa questo elemento, in poche parole')
+        desc_field.setStyleSheet(field_style)
+        body.addWidget(desc_field)
+
+        field_label('Anteprima:')
+        preview = QTextEdit()
+        preview.setReadOnly(True)
+        preview.setFixedHeight(110)
+        preview.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+        preview.setStyleSheet(field_style)
+        body.addWidget(preview)
+
+        def refresh_preview():
+            tag = tag_box.currentData()
+            language = lang_box.currentText()
+            name = name_field.text().strip() or 'nome'
+            preview.setPlainText(element_skeleton(tag, name, language))
+
+        tag_box.currentIndexChanged.connect(refresh_preview)
+        lang_box.currentIndexChanged.connect(refresh_preview)
+        name_field.textChanged.connect(refresh_preview)
+        refresh_preview()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton('Annulla')
+        cancel.setToolTip('Chiudi senza creare nulla')
+        ok = QPushButton('Crea')
+        ok.setToolTip('Crea il nuovo elemento con questi parametri')
+        ok.setDefault(True)
+        for button in (cancel, ok):
+            button.setStyleSheet(theme.BUTTON_STYLE)
+            buttons.addWidget(button)
+        cancel.clicked.connect(dialog.reject)
+        ok.clicked.connect(dialog.accept)
+        body.addLayout(buttons)
+        outer.addLayout(body)
+
+        name_field.setFocus()
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        name = name_field.text().strip()
+        if not name:
+            return None
+        return tag_box.currentData(), name, desc_field.text().strip(), lang_box.currentText()
+    # [FN CLOSED] _ide_new_element_form
+
+    # [FN CATEGORY] _ide_new_file_form — the "+" button at the bottom of the project tree's file
+    # view. Same shape as _ide_new_element_form (kind, language, name, live preview) one level up:
+    # instead of picking a KANT tag for an element inside an already-open file, this picks a KIND
+    # of file to create from scratch (FILE_KIND_LABELS) — the three KANT-tagged kinds reuse the
+    # exact same element machinery, plus README/.gitignore/empty for what a project needs besides
+    # tagged source.
+    # [FN] _ide_new_file_form — kind/language/filename picker with a live content preview
+    # [FN OPEN] _ide_new_file_form
+    def _ide_new_file_form(self, default_language='Python'):
+        dialog, outer, body = self._internal_window('Nuovo file', 520, 'Chiudi senza creare')
+        body.setContentsMargins(18, 16, 18, 16)
+        body.setSpacing(8)
+
+        field_style = (
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:6px; padding:6px;'
+        )
+
+        def field_label(text):
+            label = QLabel(text)
+            label.setStyleSheet(f'color:{theme.TEXT}; border:none; margin-top:4px;')
+            body.addWidget(label)
+
+        field_label('Tipo di file:')
+        kind_box = QComboBox()
+        for kind, label in FILE_KIND_LABELS.items():
+            kind_box.addItem(label, kind)
+        kind_box.setStyleSheet(field_style)
+        body.addWidget(kind_box)
+
+        field_label('Linguaggio (determina sintassi/estensione consigliata):')
+        lang_box = QComboBox()
+        lang_box.addItems(list(ELEMENT_LANGUAGES))
+        lang_box.setCurrentText(default_language)
+        lang_box.setStyleSheet(field_style)
+        body.addWidget(lang_box)
+
+        field_label('Nome del file:')
+        name_field = QLineEdit()
+        name_field.setStyleSheet(field_style)
+        body.addWidget(name_field)
+
+        field_label('Anteprima:')
+        preview = QTextEdit()
+        preview.setReadOnly(True)
+        preview.setFixedHeight(130)
+        preview.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+        preview.setStyleSheet(field_style)
+        body.addWidget(preview)
+
+        _name_is_default = [True]  # whether the user has hand-edited the filename yet
+
+        def suggested_name():
+            kind = kind_box.currentData()
+            language = lang_box.currentText()
+            ext = ELEMENT_LANGUAGES.get(language, ELEMENT_LANGUAGES['Generico'])['ext']
+            if kind == 'readme':
+                return 'README.md'
+            if kind == 'gitignore':
+                return '.gitignore'
+            if kind == 'empty':
+                return f'nuovo{ext}'
+            return f'nuovo_modulo{ext}' if kind == 'module' else f'{kind}{ext}'
+
+        def refresh_preview():
+            if _name_is_default[0]:
+                name_field.blockSignals(True)
+                name_field.setText(suggested_name())
+                name_field.blockSignals(False)
+            kind = kind_box.currentData()
+            language = lang_box.currentText()
+            stem = os.path.splitext(name_field.text().strip() or 'nuovo')[0]
+            preview.setPlainText(build_new_file_content(kind, language, stem) or '(file vuoto)')
+
+        def name_hand_edited():
+            _name_is_default[0] = False
+            refresh_preview()
+
+        kind_box.currentIndexChanged.connect(refresh_preview)
+        lang_box.currentIndexChanged.connect(refresh_preview)
+        name_field.textEdited.connect(name_hand_edited)
+        refresh_preview()
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton('Annulla')
+        cancel.setToolTip('Chiudi senza creare nulla')
+        ok = QPushButton('Crea')
+        ok.setToolTip('Crea il file con questi parametri')
+        ok.setDefault(True)
+        for button in (cancel, ok):
+            button.setStyleSheet(theme.BUTTON_STYLE)
+            buttons.addWidget(button)
+        cancel.clicked.connect(dialog.reject)
+        ok.clicked.connect(dialog.accept)
+        body.addLayout(buttons)
+        outer.addLayout(body)
+
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        name = name_field.text().strip()
+        if not name:
+            return None
+        kind = kind_box.currentData()
+        language = lang_box.currentText()
+        stem = os.path.splitext(name)[0]
+        return name, build_new_file_content(kind, language, stem)
+    # [FN CLOSED] _ide_new_file_form
+
     # [FN CATEGORY] _ide_agent_choice_form — the /kant-code-map launch prompt: provider, specific
     # model, and reasoning effort together in one internal window instead of a plain 3-button
     # choice, with an explicit Cancel. Model lists and the "no override" sentinel are passed in by
@@ -193,35 +411,7 @@ class IdeDialogsMixin:
     # [FN] _ide_agent_choice_form — provider/model/effort picker with Cancel
     # [FN OPEN] _ide_agent_choice_form
     def _ide_agent_choice_form(self, claude_models, codex_models, model_default):
-        dialog = QDialog(self)
-        dialog.setModal(True)
-        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
-        dialog.setFixedWidth(420)
-        dialog.setStyleSheet(f'QDialog {{ background:{theme.BG}; border:1px solid {theme.BORDER}; }}')
-
-        outer = QVBoxLayout(dialog)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        header = QWidget()
-        header.setFixedHeight(34)
-        header.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
-        header_row = QHBoxLayout(header)
-        header_row.setContentsMargins(14, 0, 8, 0)
-        title = QLabel('Applica /kant-code-map')
-        title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
-        title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:1px; border:none;')
-        header_row.addWidget(title)
-        header_row.addStretch(1)
-        close_btn = QPushButton('×')
-        close_btn.setFixedSize(26, 24)
-        close_btn.setToolTip('Annulla senza avviare')
-        close_btn.setStyleSheet(theme.BUTTON_STYLE)
-        close_btn.clicked.connect(dialog.reject)
-        header_row.addWidget(close_btn)
-        outer.addWidget(header)
-
-        body = QVBoxLayout()
+        dialog, outer, body = self._internal_window('Applica /kant-code-map', 420, 'Annulla senza avviare')
         body.setContentsMargins(18, 16, 18, 16)
         body.setSpacing(10)
         combo_style = (
@@ -276,6 +466,7 @@ class IdeDialogsMixin:
         cancel.setToolTip('Annulla senza avviare')
         ok = QPushButton('Avvia')
         ok.setToolTip('Avvia /kant-code-map con il provider, modello ed effort scelti')
+        ok.setDefault(True)
         for button in (cancel, ok):
             button.setStyleSheet(theme.BUTTON_STYLE)
             buttons.addWidget(button)
@@ -302,35 +493,7 @@ class IdeDialogsMixin:
     # [FN] _ide_git_commit_form — staged-file list + message box, with a stage-all shortcut
     # [FN OPEN] _ide_git_commit_form
     def _ide_git_commit_form(self, staged_files):
-        dialog = QDialog(self)
-        dialog.setModal(True)
-        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
-        dialog.setFixedWidth(460)
-        dialog.setStyleSheet(f'QDialog {{ background:{theme.BG}; border:1px solid {theme.BORDER}; }}')
-
-        outer = QVBoxLayout(dialog)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        header = QWidget()
-        header.setFixedHeight(34)
-        header.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
-        header_row = QHBoxLayout(header)
-        header_row.setContentsMargins(14, 0, 8, 0)
-        title = QLabel('Git commit')
-        title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
-        title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:2px; border:none;')
-        header_row.addWidget(title)
-        header_row.addStretch(1)
-        close_btn = QPushButton('×')
-        close_btn.setFixedSize(26, 24)
-        close_btn.setToolTip('Annulla senza fare commit')
-        close_btn.setStyleSheet(theme.BUTTON_STYLE)
-        close_btn.clicked.connect(dialog.reject)
-        header_row.addWidget(close_btn)
-        outer.addWidget(header)
-
-        body = QVBoxLayout()
+        dialog, outer, body = self._internal_window('Git commit', 460, 'Annulla senza fare commit')
         body.setContentsMargins(18, 16, 18, 16)
         body.setSpacing(10)
 
@@ -375,6 +538,7 @@ class IdeDialogsMixin:
         cancel.setToolTip('Annulla senza fare commit')
         commit_btn = QPushButton('Commit')
         commit_btn.setToolTip('Crea un commit con i file in stage e questo messaggio')
+        commit_btn.setDefault(True)
         for button in (cancel, commit_btn):
             button.setStyleSheet(theme.BUTTON_STYLE)
             buttons.addWidget(button)
@@ -397,35 +561,7 @@ class IdeDialogsMixin:
     # [FN] _ide_command_palette — fuzzy-filtered command list, returns the picked payload or None
     # [FN OPEN] _ide_command_palette
     def _ide_command_palette(self, entries):
-        dialog = QDialog(self)
-        dialog.setModal(True)
-        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
-        dialog.setFixedWidth(460)
-        dialog.setStyleSheet(f'QDialog {{ background:{theme.BG}; border:1px solid {theme.BORDER}; }}')
-
-        outer = QVBoxLayout(dialog)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        header = QWidget()
-        header.setFixedHeight(34)
-        header.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
-        header_row = QHBoxLayout(header)
-        header_row.setContentsMargins(14, 0, 8, 0)
-        title = QLabel('Comandi')
-        title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
-        title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:2px; border:none;')
-        header_row.addWidget(title)
-        header_row.addStretch(1)
-        close_btn = QPushButton('×')
-        close_btn.setFixedSize(26, 24)
-        close_btn.setToolTip('Chiudi la palette comandi (Esc)')
-        close_btn.setStyleSheet(theme.BUTTON_STYLE)
-        close_btn.clicked.connect(dialog.reject)
-        header_row.addWidget(close_btn)
-        outer.addWidget(header)
-
-        body = QVBoxLayout()
+        dialog, outer, body = self._internal_window('Comandi', 460, 'Chiudi la palette comandi (Esc)')
         body.setContentsMargins(12, 12, 12, 12)
         body.setSpacing(8)
 

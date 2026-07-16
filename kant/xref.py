@@ -38,6 +38,14 @@ class XrefElement:
     outgoing: list = field(default_factory=list)  # keys of elements this one references
     incoming: list = field(default_factory=list)  # keys of elements that reference this one
     parent: str = None  # key of the immediate containing element (module/class), or None at the top
+    # MAPPA-only display state — build_xref never sets these; XrefMapDialog stamps them onto the
+    # elements it displays (mappa.py's _display_elements/_collapse pass) once a graph is actually
+    # rendered. Declared here (not just set ad hoc) so every reader sees the real shape of the data
+    # from one place instead of an getattr(..., default) scattered across mappa.py.
+    is_anchor: bool = False  # True for the synthetic node representing a collapsed module
+    collapsed: bool = None  # None: not a collapsible module node; True/False: collapsed state
+    outgoing_detail: list = None  # every real underlying edge a collapsed module's arrow summarizes
+    incoming_detail: list = None  # same, for incoming
 # [TYP CLOSED] XrefElement
 
 

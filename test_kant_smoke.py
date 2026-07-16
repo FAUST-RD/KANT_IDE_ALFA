@@ -18,7 +18,7 @@ from PySide6.QtGui import QKeyEvent, QKeySequence, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication, QGraphicsItem, QLabel, QListWidget, QMenu, QMessageBox, QTabBar, QToolButton,
-    QToolTip, QTreeWidget, QTreeWidgetItem,
+    QTreeWidget, QTreeWidgetItem,
 )
 
 import kant_editor
@@ -36,6 +36,7 @@ from kant.xref import build_xref, XrefElement
 from kant.widgets import (
     ClaudePane, CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard,
     _AiReviewCard, _agent_command, _markdown_to_html, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
+    _code_hover_popup_instance,
 )
 from kant.mappa import MIN_NODE_GAP, XrefMapDialog, XrefMapView, _force_layout_positions, _element_degree, _element_size
 from kant import gitops as kant_gitops_module
@@ -1123,12 +1124,14 @@ class KantSmokeTest(unittest.TestCase):
             app.processEvents()
             lsp_window.lsp_hover_requests[999] = (lsp_completion_edit, lsp_completion_edit.mapToGlobal(lsp_completion_edit.rect().center()))
             lsp_window._on_lsp_response(999, 'textDocument/hover', {'contents': {'value': 'def f() -> None'}})
-            assert QToolTip.text() == 'def f() -> None'
+            # the hover popup is a themed widget now (_CodeHoverPopup), not the OS-native QToolTip —
+            # see kant/widgets.py's show_code_hover_popup/hide_code_hover_popup
+            assert 'def f()' in _code_hover_popup_instance[0].label.text()
             assert 999 not in lsp_window.lsp_hover_requests
 
             # local fallback: no LSP server configured -> definition-location lookup shown as tooltip
             lsp_window._local_hover(local_completion_edit, local_completion_edit.mapToGlobal(local_completion_edit.rect().center()), 'alpha_function')
-            assert 'alpha_function' in QToolTip.text()
+            assert 'alpha_function' in _code_hover_popup_instance[0].label.text()
 
             # a real mouse move restarts the hover debounce, which then calls hover_provider
             hover_calls = []
@@ -2350,6 +2353,182 @@ class KantSmokeTest(unittest.TestCase):
             close_btn.click()
             assert str(paths['f3']) not in window.open_tabs
             window.close()
+
+    def test_add_element_block_appends_language_correct_node(self):
+        # regression for the "+" card at the bottom of the KANT outline: confirms the button
+        # exists, the dialog's answers actually land in tab.tree (not just some scratch buffer),
+        # and the generated marker/code round-trips through serialize_kant/parse_kant.
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            source = project / 'sample.py'
+            source.write_text('\n'.join([
+                '# [MOD OPEN] sample.py',
+                '# [FN OPEN] alpha', 'def alpha(): pass', '# [FN CLOSED] alpha',
+                '# [MOD CLOSED] sample.py',
+            ]), encoding='utf-8')
+            window = MainWindow()
+            window.project_root_path = str(project)
+            assert window._open_file(str(source))
+            tab = window.open_tabs[str(source)]
+
+            add_buttons = [
+                b for b in tab.view_container.findChildren(type(window.add_file_btn))
+                if 'Aggiungi' in b.text()
+            ]
+            assert len(add_buttons) == 1
+
+            window._ide_new_element_form = lambda **kwargs: ('FN', 'nuova_funzione', 'fa qualcosa', 'Python')
+            body_count_before = len(tab.tree.body)
+            add_buttons[0].click()
+            assert len(tab.tree.body) == body_count_before + 1
+            new_node = tab.tree.body[-1]
+            assert new_node.tag == 'FN' and new_node.name == 'nuova_funzione'
+            assert tab.dirty
+
+            text = serialize_kant(tab.tree)
+            assert 'def nuova_funzione():' in text
+            reparsed = parse_kant(text)
+            assert reparsed.body[-1].name == 'nuova_funzione'
+            window.close()
+
+    def test_add_file_block_creates_and_opens_language_aware_file(self):
+        # regression for the "+ Nuovo file" button under the project tree
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            window = MainWindow()
+            window.project_root_path = str(project)
+            window.git_root = None
+            window.git_status = {}
+
+            window._ide_new_file_form = lambda **kwargs: ('utils.py', 'x = 1\n')
+            window.add_file_btn.click()
+            created = project / 'utils.py'
+            assert created.exists()
+            assert created.read_text(encoding='utf-8') == 'x = 1\n'
+            assert str(created) in window.open_tabs
+            window.close()
+
+    def test_ai_review_offered_as_chat_card_and_skipped_in_automatic_mode(self):
+        # regression: the AI review used to pop a full window unasked on every AI turn that
+        # touched files. Non-automatic mode now gets a small inline chat card instead
+        # (ClaudePane.offer_ai_review); automatic mode skips asking entirely and auto-accepts.
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            source = project / 'app.py'
+            source.write_text('x = 1\n', encoding='utf-8')
+            window = MainWindow()
+            window.project_root_path = str(project)
+            window._ai_snapshot = str(project.parent / 'snap')
+            window._closing = False
+            import shutil as _shutil
+            _shutil.copytree(str(project), window._ai_snapshot)
+            window._clear_ai_snapshot_marker = lambda: None
+            source.write_text('x = 2\n', encoding='utf-8')
+
+            offered = []
+            window.claude_pane.offer_ai_review = lambda review, render_text, resolved: offered.append((review, resolved))
+            window.claude_pane.auto_permissions.setChecked(False)
+            window._finish_ai_review()
+            assert len(offered) == 1  # non-automatic mode: offered as a card, not applied yet
+            assert source.read_text(encoding='utf-8') == 'x = 2\n'  # already on disk, review is just bookkeeping
+
+            # automatic mode: no card offered at all, changes silently accepted (snapshot cleared)
+            _shutil.rmtree(window._ai_snapshot, ignore_errors=True)
+            _shutil.copytree(str(project), window._ai_snapshot)
+            source.write_text('x = 3\n', encoding='utf-8')
+            offered.clear()
+            window.claude_pane.auto_permissions.setChecked(True)
+            window._finish_ai_review()
+            assert offered == []
+            assert window._ai_snapshot is None
+            window.close()
+
+    def test_lsp_client_backoff_after_crash_resets_on_successful_init(self):
+        # regression: a server that crashes right after starting used to be retried on every single
+        # keystroke (update_document's "process is None -> restart" check has no cooldown of its
+        # own). _start now refuses to launch while inside the backoff window; the window is cleared
+        # once a real 'initialize' response comes back, not just once a process object exists.
+        client = LspClient()
+        assert client._crash_count == 0 and client._restart_backoff_until == 0.0
+
+        client._record_crash()
+        assert client._crash_count == 1
+        assert client._restart_backoff_until > time.monotonic()
+        # still within backoff: _start must refuse without even trying to spawn a process
+        assert client._start('nonexistent-binary', [], 'fake', os.getcwd()) is False
+        assert client.process is None
+
+        client._record_crash()
+        assert client._crash_count == 2
+        second_backoff = client._restart_backoff_until
+        assert second_backoff > time.monotonic()  # exponential: still growing, not reset
+
+        # simulate a real successful initialize response
+        client._restart_backoff_until = 0.0
+        client._handle_message({'id': 'stamp-init-id', 'result': {}})  # id mismatch -> ignored
+        assert client._crash_count == 2  # confirms the mismatched-id message above was a no-op
+        client.init_id = 'real-id'
+        client._handle_message({'id': 'real-id', 'result': {'capabilities': {}}})
+        assert client.ready is True
+        assert client._crash_count == 0
+
+    def test_refresh_after_fs_change_dedupes_pending_watcher_debounce(self):
+        # regression: a direct _refresh_after_fs_change() call (create/rename/delete) and the
+        # QFileSystemWatcher's own ~400ms-debounced follow-up for that same disk change used to
+        # both fire, doing the full os.walk project-tree rebuild twice for one operation.
+        with _temp_dir() as tmp:
+            window = MainWindow()
+            window.project_root_path = str(tmp)
+            window.fs_refresh_timer.start(400)
+            assert window.fs_refresh_timer.isActive()
+            window._refresh_after_fs_change()
+            assert not window.fs_refresh_timer.isActive()
+            window.close()
+
+    def test_rollback_snapshot_reports_undeletable_directories_instead_of_swallowing(self):
+        # regression: rollback_snapshot's directory-cleanup pass used to `except OSError: pass`
+        # silently — a leftover directory nobody could see any trace of. It now returns the list of
+        # directories it couldn't remove, and _finish_ai_review's resolved() reports them.
+        with _temp_dir() as tmp:
+            root = Path(tmp) / 'root'
+            snapshot = Path(tmp) / 'snap'
+            root.mkdir()
+            snapshot.mkdir()
+            (root / 'leftover_dir').mkdir()
+            (root / 'leftover_dir' / 'file.txt').write_text('x', encoding='utf-8')
+
+            original_rmdir = os.rmdir
+
+            def failing_rmdir(path):
+                if 'leftover_dir' in path:
+                    raise OSError('simulated: directory not empty')
+                original_rmdir(path)
+
+            os.rmdir = failing_rmdir
+            try:
+                skipped = rollback_snapshot(str(root), str(snapshot), set())
+            finally:
+                os.rmdir = original_rmdir
+            assert skipped == ['leftover_dir']
+
+    def test_ai_chat_stream_render_is_throttled_but_never_drops_the_tail(self):
+        # regression: every stdout chunk re-rendered the ENTIRE accumulated response through
+        # _markdown_to_html — O(n^2) over a long streamed reply. Rendering is now throttled to
+        # ~25/s via _stream_render_timer, but the final chunk must still land: _reset_process force-
+        # flushes any pending throttled render instead of dropping it when the process finishes.
+        pane = ClaudePane(os.getcwd())
+        try:
+            pane._add_message('domanda', 'user')
+            pane._append_stream('parte 1 ')
+            pane._append_stream('parte 2 ')
+            pane._append_stream('parte 3')
+            stream_label = pane._stream_label
+            # nothing rendered yet — still inside the 40ms throttle window
+            assert 'parte 3' not in stream_label.text()
+            pane._reset_process()  # simulates the process finishing right after a burst
+            assert 'parte 1' in stream_label.text() and 'parte 3' in stream_label.text()
+        finally:
+            pane.deleteLater()
 # [TST CLOSED] KantSmokeTest
 
 
