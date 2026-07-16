@@ -1,5 +1,8 @@
 KANT IDE changelog
 
+2026-07-17 (51)
+- Removed the 10-minute inactivity timeout on the AI chat pane's claude/codex process (added in entry 50), on request. ClaudePane no longer kills a long-running turn on its own; Stop remains the only way to interrupt one. The streaming re-render throttle from the same entry (_stream_render_timer) is unrelated and stays.
+
 2026-07-17 (50)
 - Worked through the full findings list from the system-by-system UX/code audit (see the earlier "kant_audit" artifact). Skipped two on purpose: MAPPA's O(n^2) force-directed layout and its name-based (not scope-aware) xref resolution — both are explicitly flagged in their own code comments as deliberate simplicity tradeoffs ("use Barnes-Hut only if thousand-node maps actually lag"), not oversights; reopening either without a demonstrated real problem would be exactly the kind of speculative rework this project's own conventions warn against.
 - Chat AI: a hung claude/codex process no longer freezes the pane forever — ClaudePane._process_timeout_timer kills it after 10 minutes of no new output (matching the existing 600s permission-request timeout), reset on every chunk received so a long but genuinely active turn is never cut short.

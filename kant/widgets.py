@@ -1338,13 +1338,6 @@ class ClaudePane(QWidget):
         self._typing_timer = QTimer(self)
         self._typing_timer.timeout.connect(self._typing_tick)
         self._typing_frame = 0
-        # a hung claude/codex process used to freeze this pane indefinitely — Stop was the only way
-        # out, and a user who stepped away wouldn't know to click it. Same 600s ceiling permission
-        # requests already time out at (aipermissions.py), for consistency; a real agentic turn can
-        # legitimately run long, so this is a "something's actually stuck" backstop, not a soft limit
-        self._process_timeout_timer = QTimer(self)
-        self._process_timeout_timer.setSingleShot(True)
-        self._process_timeout_timer.timeout.connect(self._on_process_timeout)
         # a long streamed response used to re-render the ENTIRE accumulated text through
         # _markdown_to_html on every single stdout chunk — O(n) work per chunk, O(n^2) over a full
         # response, and QProcess often delivers a fast burst of tiny reads for one logical write.
@@ -1670,7 +1663,6 @@ class ClaudePane(QWidget):
     def _append_stream(self, text):
         if not text:
             return
-        self._process_timeout_timer.start(600_000)  # real output = not stuck, push the deadline out
         self._typing_timer.stop()  # real output arrived — stop the "still working" placeholder
         if self._stream_label is None:
             self._stream_label = self._add_message('', 'assistant')
@@ -1835,7 +1827,6 @@ class ClaudePane(QWidget):
         self.send_btn.setText('Stop')
         self.send_btn.setEnabled(True)
         self._stream_text = ''
-        self._process_timeout_timer.start(600_000)
         self.process.start(executable, args)
         # claude -p reads its prompt from -p, never stdin; without this it waits ~3s for piped input
         # that never comes ("no stdin data received in 3s") before proceeding — closing the write
@@ -1866,15 +1857,7 @@ class ClaudePane(QWidget):
                 pass
             setattr(self, attribute, None)
 
-    def _on_process_timeout(self):
-        if self.process is None:
-            return
-        self._cancel_pending_permissions()
-        self.process.kill()
-        self._append(f'\n[{_agent_label(self.current_agent)} interrotto: nessuna attivita da 10 minuti]\n')
-
     def _reset_process(self):
-        self._process_timeout_timer.stop()
         self._typing_timer.stop()
         if self._stream_render_timer.isActive():
             self._stream_render_timer.stop()
