@@ -24,7 +24,7 @@ from PySide6.QtGui import (
     QColor, QFont, QKeySequence, QMouseEvent, QShortcut, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton, QScrollArea,
     QSizeGrip, QSplitter, QStackedWidget, QTabBar, QTabWidget, QToolButton, QToolTip,
     QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
@@ -53,6 +53,7 @@ from kant.widgets import (
     CodeEdit, TerminalPane, ClaudePane, CollapsibleSection, LeafSection,
     ProjectTree, make_star_icon, RecentFolderCard, TitleBar, FileTab,
     MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS, _tag_header_html,
+    set_vim_mode, vim_mode_enabled,
 )
 from kant.mappa import XrefMapDialog
 
@@ -560,7 +561,25 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.setContentsMargins(10, 5, 10, 5)
         layout.setSpacing(4)
         self.action_toolbar_buttons = {}
-        # Run/Debug live in the title bar's corner (under minimize/maximize/close), not here
+        # Run/Debug first and visibly bigger than the rest — they used to share the title bar's
+        # own corner (under minimize/maximize/close) at a cramped 28x24/16px, easy to miss
+        for key, tooltip, callback in (
+            ('run', 'Esegui (Ctrl+R)', self._run_current_file),
+            ('debug', 'Debug (F5)', self._debug_current_file),
+        ):
+            btn = QToolButton()
+            btn.setIcon(draw_icon(key, 26))
+            btn.setIconSize(QSize(26, 26))
+            btn.setToolTip(tooltip)
+            btn.setFixedSize(40, 36)
+            btn.clicked.connect(callback)
+            layout.addWidget(btn)
+            self.action_toolbar_buttons[key] = btn
+        separator = QFrame()
+        separator.setFrameShape(QFrame.VLine)
+        separator.setFixedHeight(22)
+        self._action_toolbar_separator = separator
+        layout.addWidget(separator)
         for key, tooltip, callback in (
             ('save', 'Salva (Ctrl+S)', self._save_file),
             ('undo', 'Annulla file (Ctrl+Z)', self._undo_file),
@@ -586,6 +605,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         style = theme.BUTTON_STYLE.replace('QPushButton', 'QToolButton').replace('padding:7px 13px;', 'padding:4px;')
         for btn in self.action_toolbar_buttons.values():
             btn.setStyleSheet(style)
+        self._action_toolbar_separator.setStyleSheet(f'color:{theme.BORDER};')
 
     # [FN CATEGORY] _build_welcome_page — a centered card (not widgets floating directly on the
     # raw background) holds title/description/CTA, with the recent-projects list as its own
@@ -747,6 +767,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         view_panel_layout.setContentsMargins(0, 0, 0, 0)
         view_panel_layout.setSpacing(0)
         view_panel_layout.addWidget(self._build_find_bar())
+        view_panel_layout.addWidget(self._build_vim_command_bar())
         view_panel_layout.addWidget(self.tabs, 1)
         self.io_tabs = self._build_io_tabs()
         view_panel_layout.addWidget(self.io_tabs)
@@ -820,6 +841,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         bar.addWidget(self.kant_map_label)  # addWidget (not addPermanentWidget): left-aligned
         self.cursor_pos_label = QLabel('')
         self.encoding_label = QLabel('')
+        # shows the focused CodeEdit's vim mode (NORMAL/INSERT/VISUAL); empty whenever vim mode is
+        # off or no code block has focus — see _on_focus_changed and _update_vim_mode_label
+        self.vim_mode_label = QLabel('')
+        self.vim_mode_label.setFont(QFont('Consolas', theme.TREE_FONT_PT, QFont.DemiBold))
+        bar.addPermanentWidget(self.vim_mode_label)
         # a flat QPushButton, not a QLabel: it needs to be click-to-reopen-the-picker, and a
         # QPushButton gets that natively instead of needing the tree row labels' click-forwarding
         self.python_env_label = QPushButton('')
@@ -837,6 +863,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.statusBar().setStyleSheet(
             f'QStatusBar {{ background:{theme.PANEL}; color:{theme.DIM}; border-top:1px solid {theme.BORDER}; }}'
         )
+        self.vim_mode_label.setStyleSheet(f'color:{theme.ACCENT}; padding:0 8px;')
         self.python_env_label.setStyleSheet(
             f'QPushButton {{ border:none; background:transparent; color:{theme.DIM}; padding:0 8px; }} '
             f'QPushButton:hover {{ color:{theme.ACCENT}; }}'
@@ -845,6 +872,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _on_focus_changed(self, _old, new):
         if isinstance(new, CodeEdit):
             self._update_cursor_position_label(new)
+            self._update_vim_mode_label(new)
             page = new
             while page is not None and not isinstance(page, FileTab) and not hasattr(page, '_element_key'):
                 page = page.parentWidget()
@@ -855,6 +883,23 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             if not hasattr(new, '_status_bar_wired'):
                 new._status_bar_wired = True
                 new.cursorPositionChanged.connect(lambda e=new: self._update_cursor_position_label(e))
+                new.vim_mode_changed.connect(lambda _mode, e=new: self._update_vim_mode_label(e))
+        else:
+            self.vim_mode_label.setText('')
+
+    # [FN] _update_vim_mode_label — status-bar indicator for the focused CodeEdit's vim mode; blank
+    # whenever vim mode is globally off, matching how the rest of the toggle stays invisible-by-off
+    # [FN OPEN] _update_vim_mode_label
+    def _update_vim_mode_label(self, edit):
+        if not vim_mode_enabled():
+            self.vim_mode_label.setText('')
+            return
+        labels = {
+            'normal': '-- NORMAL --', 'insert': '-- INSERT --',
+            'visual': '-- VISUAL --', 'visual_line': '-- VISUAL LINE --',
+        }
+        self.vim_mode_label.setText(labels.get(edit.vim_state, ''))
+    # [FN CLOSED] _update_vim_mode_label
 
     def _update_cursor_position_label(self, edit):
         cursor = edit.textCursor()
@@ -1046,8 +1091,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.action_toolbar_buttons['undo'].setEnabled(bool(has_tab and self.active_tab.undo_stack))
         self.action_toolbar_buttons['redo'].setEnabled(bool(has_tab and self.active_tab.redo_stack))
         self.action_toolbar_buttons['find'].setEnabled(has_tab)
-        self.title_bar.run_btn.setEnabled(has_tab)
-        self.title_bar.debug_btn.setEnabled(has_tab)
+        self.action_toolbar_buttons['run'].setEnabled(has_tab)
+        self.action_toolbar_buttons['debug'].setEnabled(has_tab)
         self.title_bar.project_search_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.project_replace_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.git_refresh_menu_action.setEnabled(bool(self.git_root))
@@ -1152,6 +1197,75 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
     def _hide_find_bar(self):
         self.find_bar.setVisible(False)
+
+    # [FN CATEGORY] _build_vim_command_bar — the : command line vim mode opens (CodeEdit's ':' key,
+    # routed through vim_action('open_command_bar')): a bare "line 1" of ex-mode, not a general
+    # command interpreter — only the handful of commands worth having without a real command
+    # language (:w save, :q close tab, :wq/:x save+close, :qa close all).
+    # [FN] _build_vim_command_bar — builds the ":" command-line widget
+    # [FN OPEN] _build_vim_command_bar
+    def _build_vim_command_bar(self):
+        bar = QWidget()
+        self.vim_command_bar = bar
+        bar.setVisible(False)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(6)
+
+        prefix = QLabel(':')
+        prefix.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
+        layout.addWidget(prefix)
+
+        self.vim_command_input = QLineEdit()
+        self.vim_command_input.setPlaceholderText('w, q, wq, x, qa…')
+        self.vim_command_input.setFont(QFont('Consolas', theme.CODE_FONT_PT))
+        self.vim_command_input.returnPressed.connect(self._run_vim_command)
+        layout.addWidget(self.vim_command_input, 1)
+
+        escape = QShortcut(QKeySequence(Qt.Key_Escape), self.vim_command_input)
+        escape.setContext(Qt.WidgetShortcut)
+        escape.activated.connect(self._hide_vim_command_bar)
+
+        self._style_vim_command_bar()
+        return bar
+    # [FN CLOSED] _build_vim_command_bar
+
+    def _style_vim_command_bar(self):
+        self.vim_command_bar.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
+        self.vim_command_input.setStyleSheet(
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:6px; padding:5px 8px;'
+        )
+
+    def _show_vim_command_bar(self):
+        self.vim_command_bar.setVisible(True)
+        self.vim_command_input.clear()
+        self.vim_command_input.setFocus()
+
+    def _hide_vim_command_bar(self):
+        self.vim_command_bar.setVisible(False)
+        page = self.active_page
+        if page is not None:
+            focus_target = page.findChild(CodeEdit) or page
+            focus_target.setFocus()
+
+    # [FN] _run_vim_command — parses and executes the : command line, then hides the bar; an
+    # unrecognized command is silently ignored, same as real vim's "E492 Not an editor command"
+    # being just a status-line message rather than anything disruptive
+    # [FN OPEN] _run_vim_command
+    def _run_vim_command(self):
+        command = self.vim_command_input.text().strip()
+        self._hide_vim_command_bar()
+        if command in ('w', 'write'):
+            self._save_file()
+        elif command in ('q', 'quit'):
+            self._close_active_tab()
+        elif command in ('wq', 'x'):
+            self._save_file()
+            self._close_active_tab()
+        elif command == 'qa':
+            self._close_all_tabs()
+    # [FN CLOSED] _run_vim_command
 
     # [FN CATEGORY] _find_in_view — searches every CodeEdit in the current center view in document
     # order, continuing from the currently focused widget's cursor and wrapping across widget
@@ -2546,7 +2660,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._invalidate_xref()
         idx = self.tabs.addTab(tab, os.path.basename(path))
         self.tabs.setTabToolTip(idx, path)
-        self._render_view(tab)
+        # setCurrentWidget below fires currentChanged -> _on_active_tab_changed, which renders
+        # this tab already (whether via addTab's implicit switch when it's the first tab, or via
+        # this explicit switch otherwise) — a second _render_view() here used to double-build the
+        # widget tree, leaving stale deleteLater()-pending CodeEdits mixed into findChildren(CodeEdit)
+        # results (broke vim's j/k structural motion, among anything else scanning that list).
         self.tabs.setCurrentWidget(tab)
         self._set_ai_context_page(tab)
         self._update_lsp_diagnostics()
@@ -3344,6 +3462,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if command is None:
             self._ide_message('Run', 'Nessun comando run configurato per questo tipo di file.')
             return
+        # the run output always goes to the shell TerminalPane, but nothing forced the dock to
+        # actually show it — pressing Run while looking at the Python REPL or Errori tab silently
+        # started the command out of view, reading as "Run doesn't do anything"
+        self._switch_terminal_tab(0)
         self.terminal.run_command(command, os.path.dirname(tab.path) or None)
 
     # [FN CATEGORY] _debug_current_file — F5: Python only (the only language this IDE can start a
@@ -3371,8 +3493,92 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 continue
             offset = self._line_count_before_run(tab.tree, item) or 0
             lines.extend(offset + number + 1 for number in edit.breakpoints)
+        # same fix as _run_current_file: pdb's output lands in the shell TerminalPane regardless
+        # of which terminal-dock tab is currently showing, so force it into view here too — this
+        # is very likely why debug "seemed to not work": F5 fired and pdb genuinely started, just
+        # out of sight on the REPL/Errori tab.
+        self._switch_terminal_tab(0)
         self.terminal.run_debug_python(tab.path, lines, os.path.dirname(tab.path) or None, self._active_python())
     # [FN CLOSED] _debug_current_file
+
+    # [FN CATEGORY] _vim_dispatch — the single callback every CodeEdit's vim engine (kant/widgets.py)
+    # routes structural/cross-widget actions through: moving to an adjacent element, jumping to the
+    # file's first/last element, folding, search, undo/redo, and the : command bar. Kept as one
+    # dispatcher (not one callback per action) so CodeEdit only needs a single attribute for
+    # everything vim needs from the rest of the app.
+    # [FN] _vim_dispatch — CodeEdit.vim_action callback
+    # [FN OPEN] _vim_dispatch
+    def _vim_dispatch(self, edit, name, **_kwargs):
+        if name == 'next_element':
+            self._vim_move_to_element(edit, 1)
+        elif name == 'prev_element':
+            self._vim_move_to_element(edit, -1)
+        elif name == 'first_element':
+            self._vim_move_to_edge(True)
+        elif name == 'last_element':
+            self._vim_move_to_edge(False)
+        elif name == 'toggle_fold':
+            self._vim_toggle_fold(edit)
+        elif name == 'search':
+            self._show_find_bar()
+        elif name == 'find_next':
+            self._find_next()
+        elif name == 'find_prev':
+            self._find_prev()
+        elif name == 'undo':
+            self._undo_file()
+        elif name == 'redo':
+            self._redo_file()
+        elif name == 'open_command_bar':
+            self._show_vim_command_bar()
+    # [FN CLOSED] _vim_dispatch
+
+    # [FN] _vim_move_to_element — j/k at a block boundary: focuses the next/previous CodeEdit in
+    # the active page (same findChildren(CodeEdit) scope _debug_current_file already uses for
+    # breakpoints), cursor landing at its start (moving down) or end (moving up) — matching the
+    # feel of a continuous buffer where element boundaries are just more lines.
+    # [FN OPEN] _vim_move_to_element
+    def _vim_move_to_element(self, edit, direction):
+        page = self.active_page
+        if page is None:
+            return
+        edits = page.findChildren(CodeEdit)
+        if edit not in edits:
+            return
+        target_index = edits.index(edit) + direction
+        if not 0 <= target_index < len(edits):
+            return
+        target = edits[target_index]
+        cursor = target.textCursor()
+        cursor.movePosition(QTextCursor.Start if direction > 0 else QTextCursor.End)
+        target.setTextCursor(cursor)
+        target.setFocus()
+    # [FN CLOSED] _vim_move_to_element
+
+    def _vim_move_to_edge(self, first):
+        page = self.active_page
+        if page is None:
+            return
+        edits = page.findChildren(CodeEdit)
+        if not edits:
+            return
+        target = edits[0] if first else edits[-1]
+        cursor = target.textCursor()
+        cursor.movePosition(QTextCursor.Start if first else QTextCursor.End)
+        target.setTextCursor(cursor)
+        target.setFocus()
+
+    # [FN] _vim_toggle_fold — za: walks up from the edit to its enclosing CollapsibleSection (a
+    # LeafSection, the other section widget, has no fold state to toggle) and clicks its existing
+    # fold button, reusing the same toggle path a mouse click already goes through.
+    # [FN OPEN] _vim_toggle_fold
+    def _vim_toggle_fold(self, edit):
+        widget = edit.parent()
+        while widget is not None and not isinstance(widget, CollapsibleSection):
+            widget = widget.parent()
+        if widget is not None and widget.toggle_btn is not None:
+            widget.toggle_btn.click()
+    # [FN CLOSED] _vim_toggle_fold
 
     # ---- section view (AI-NAV: Node/Run tree -> editable Qt widgets) -----
 
@@ -3416,6 +3622,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         edit.hover_provider = self._request_hover
         edit.definition_provider = lambda _edit: self._lsp_command('definition')
         edit.rename_provider = lambda _edit: self._lsp_command('rename')
+        edit.vim_action = self._vim_dispatch
         tab.view_layout.addWidget(edit)
 
     def _find_node_by_uid(self, node, uid):
@@ -3447,6 +3654,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 edit.hover_provider = self._request_hover
                 edit.definition_provider = lambda _edit: self._lsp_command('definition')
                 edit.rename_provider = lambda _edit: self._lsp_command('rename')
+                edit.vim_action = self._vim_dispatch
                 layout.addWidget(edit)
                 i += 1
             else:

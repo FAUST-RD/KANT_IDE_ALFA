@@ -35,7 +35,7 @@ from kant.pyenv import (
 from kant.xref import build_xref, XrefElement
 from kant.widgets import (
     ClaudePane, CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard,
-    _AiReviewCard, _agent_command, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
+    _AiReviewCard, _agent_command, _markdown_to_html, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
 )
 from kant.mappa import MIN_NODE_GAP, XrefMapDialog, XrefMapView, _force_layout_positions, _element_degree, _element_size
 from kant import gitops as kant_gitops_module
@@ -129,10 +129,27 @@ class KantSmokeTest(unittest.TestCase):
         # _ide_yes_no override and make its window.close() no-op instead of really closing.
         cls._original_confirm_close = MainWindow._confirm_close
         MainWindow._confirm_close = lambda self: True
+        # _check_crash_recovery reads/writes session/cleanExit in QSettings — real, persistent,
+        # machine-wide state, not anything scoped to this test process. It's set False at the
+        # START of every MainWindow() and only set True again by a clean closeEvent; any run that
+        # doesn't reach that (a killed process, a crashed test, Ctrl+C) leaves it False, and the
+        # NEXT MainWindow() constructed on this machine — in ANY process, this test suite or the
+        # real app — then blocks in _check_crash_recovery's modal "resume session?" QDialog.exec(),
+        # hanging forever with nothing present to click it. Never exercise that against real
+        # QSettings here: one interrupted run must not be able to wedge every future test run.
+        cls._original_check_crash_recovery = MainWindow._check_crash_recovery
+        MainWindow._check_crash_recovery = lambda self: None
+        # same hazard, same fix, for the other unconditional-on-startup QSettings check: a pending
+        # AI-review snapshot left over from an interrupted test/run also pops a blocking modal
+        # (_ide_choice) on every later MainWindow() until someone answers it.
+        cls._original_check_pending_ai_snapshot = MainWindow._check_pending_ai_snapshot
+        MainWindow._check_pending_ai_snapshot = lambda self: None
 
     @classmethod
     def tearDownClass(cls):
         MainWindow._confirm_close = cls._original_confirm_close
+        MainWindow._check_crash_recovery = cls._original_check_crash_recovery
+        MainWindow._check_pending_ai_snapshot = cls._original_check_pending_ai_snapshot
 
     def test_main_window_shell_claude_pane_and_agent_launch(self):
         window = MainWindow()
@@ -717,6 +734,12 @@ class KantSmokeTest(unittest.TestCase):
             cls_node = next(n for n in nested_tab.tree.body if hasattr(n, 'body'))
             fn_node = next(c for c in cls_node.body if getattr(c, 'tag', None) == 'FN')
             tree_window._render_view(nested_tab, cls_node.uid)
+            # _visible_ai_context_uid below picks the CodeEdit with the largest on-screen overlap
+            # with the viewport — needs a real layout pass (show + processEvents), not just widget
+            # construction, or every edit's mapTo()/width()/height() reports stale/zero geometry
+            tree_window.tabs.setCurrentWidget(nested_tab)
+            tree_window.show()
+            self.app.processEvents()
             cls_widget = nested_tab.section_widgets[cls_node.uid]
             fn_widget = nested_tab.section_widgets[fn_node.uid]
             assert isinstance(cls_widget, CollapsibleSection) and cls_widget.toggle_btn is None
@@ -768,6 +791,12 @@ class KantSmokeTest(unittest.TestCase):
             tree_window._on_tree_item_double_clicked(alpha_section, 0)
             assert tree_window.tabs.count() == tab_count_before + 1
             assert tree_window.tabs.currentWidget() is alpha_page
+
+            # alpha's tab is still the one reusable "preview" tab (VS Code-style: a single click
+            # opens a page in a reused, unpinned preview slot instead of piling up a new tab per
+            # click) until it's explicitly pinned — pin it here so the next different element
+            # below genuinely opens its own tab instead of retargeting this same preview page
+            tree_window._pin_element_page(alpha_page)
 
             # a DIFFERENT element (same parent module) opens its own tab alongside the first
             tree_window._on_tree_item_clicked(beta_section, 0)
@@ -1133,6 +1162,25 @@ class KantSmokeTest(unittest.TestCase):
 
         # a lone \r (progress-bar/spinner overwrite) is dropped; \r\n is normalized to \n
         assert _normalize_ai_text(b'line1\rline2\r\nline3') == 'line1line2\nline3'
+
+    def test_markdown_to_html_renders_chat_formatting(self):
+        assert _markdown_to_html('**bold** and *italic* and `code`') == (
+            '<b>bold</b> and <i>italic</i> and '
+            f'<code style="background:{theme.CODE_BG}; padding:1px 4px; border-radius:3px;">code</code>'
+        )
+        fenced = _markdown_to_html('before\n```python\nx < 1 and y & 2\n```\nafter')
+        assert '<pre' in fenced and 'x &lt; 1 and y &amp; 2' in fenced
+        assert 'before<br>' in fenced and '<br>after' in fenced
+        # bullet lines get a visible marker; both `-` and `*` list markers are recognized
+        bullets = _markdown_to_html('- uno\n* due')
+        assert bullets.count('•') == 2
+        # raw HTML in the message text must render literally, never as live markup — this is AI
+        # output rendered as rich text, so unescaped `<`/`&` must not be interpreted as HTML
+        assert _markdown_to_html('<script>alert(1)</script> & "x"') == '&lt;script&gt;alert(1)&lt;/script&gt; &amp; &quot;x&quot;'
+        # markdown syntax INSIDE a fenced/inline code span must render literally, not be
+        # re-interpreted as bold/italic
+        assert '<b>' not in _markdown_to_html('```\n**not bold**\n```')
+        assert '<i>' not in _markdown_to_html('`*not italic*`')
 
     def test_xref_edges_ignore_comments_and_strings(self):
         xref_tree = parse_kant('\n'.join([
@@ -2147,6 +2195,44 @@ class KantSmokeTest(unittest.TestCase):
             assert 'failed' in root_item.text(0), root_item.text(0)
             assert root_item.childCount() == 1  # only the targeted test ran, not test_ok
             assert 'test_should_fail' in root_item.child(0).text(0)
+
+    def test_vim_j_crosses_to_next_element(self):
+        # regression for two bugs found together: (1) _open_file used to render the tab twice
+        # (once explicitly, once via the setCurrentWidget-triggered currentChanged), leaving stale
+        # deleteLater()-pending CodeEdits mixed into findChildren(CodeEdit) results; (2) a CRLF
+        # source file leaves a literal trailing \r on each parsed line (by design — see
+        # fileio.detect_line_ending), which QPlainTextEdit turns into an extra trailing empty
+        # block, so the vim 'j' motion's last-block boundary check never fired.
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            source = project / 'sample.py'
+            with open(source, 'w', encoding='utf-8', newline='') as f:
+                f.write('\r\n'.join([
+                    '# [MOD OPEN] sample.py',
+                    '# [FN OPEN] alpha', 'def alpha(): pass', '# [FN CLOSED] alpha',
+                    '# [FN OPEN] beta', 'def beta(): pass', '# [FN CLOSED] beta',
+                    '# [MOD CLOSED] sample.py',
+                ]))
+
+            app = self.app
+            window = MainWindow()
+            window.show()
+            window.project_root_path = str(project)
+            assert window._open_file(str(source))
+
+            edits = window.active_page.findChildren(CodeEdit)
+            assert len(edits) == 2, f'expected 2 CodeEdits, got {len(edits)} (stale duplicates from a double render?)'
+
+            edits[0].setFocus()
+            app.processEvents()
+            QTest.keyClicks(edits[0], 'j')
+            app.processEvents()
+            assert QApplication.focusWidget() is edits[1]
+
+            QTest.keyClicks(edits[1], 'k')
+            app.processEvents()
+            assert QApplication.focusWidget() is edits[0]
+            window.close()
 # [TST CLOSED] KantSmokeTest
 
 

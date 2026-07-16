@@ -162,11 +162,38 @@ class LineNumberArea(QWidget):
 # [FN CLOSED] LineNumberArea
 
 
+# [CST] _VIM_MODE_ENABLED — module-level (not per-instance) so one Aspetto-menu toggle flips modal
+# editing for every CodeEdit at once, the same way theme.py's own day/night globals work. List-
+# wrapped so set_vim_mode can rebind the value from anywhere without a `global` statement.
+_VIM_MODE_ENABLED = [True]
+
+
+def set_vim_mode(enabled):
+    _VIM_MODE_ENABLED[0] = enabled
+
+
+def vim_mode_enabled():
+    return _VIM_MODE_ENABLED[0]
+
+
+# [CST] _VIM_REGISTER — the default (unnamed) yank/delete register, shared across every CodeEdit
+# instance exactly like real vim's default register is shared across buffers — yanking in one KANT
+# element and pasting into another must work, so this can't live on a single widget.
+_VIM_REGISTER = {'text': '', 'linewise': False}
+
+
 # [FN CATEGORY] CodeEdit — an editable, syntax-highlighted code block that auto-grows to fit its
-# content instead of scrolling internally, mirroring the HTML version's contenteditable blocks
+# content instead of scrolling internally, mirroring the HTML version's contenteditable blocks.
+# VIM-style modal editing (see set_vim_mode/vim_mode_enabled) is layered on top of the normal
+# QPlainTextEdit behavior: Normal mode intercepts keys as commands, Insert mode is the original
+# always-was-there typing behavior. When vim mode is off, keyPressEvent skips the vim dispatch
+# entirely — every keystroke behaves exactly as before, so this can't change the experience for
+# anyone not using it.
 # [FN] CodeEdit — QPlainTextEdit wired with the highlighter and auto-resize
 # [FN OPEN] CodeEdit
 class CodeEdit(QPlainTextEdit):
+    vim_mode_changed = Signal(str)  # emitted on every vim_state transition, for a status-bar indicator
+
     def __init__(self, text):
         super().__init__()
         self.setPlainText(text)
@@ -233,6 +260,20 @@ class CodeEdit(QPlainTextEdit):
         # above)
         self.definition_provider = None
         self.rename_provider = None
+
+        # VIM state — 'normal' is where vim mode always starts (matching real vim); irrelevant
+        # whenever vim_mode_enabled() is False, since keyPressEvent skips the vim dispatch entirely
+        # in that case rather than checking this. Structural actions this widget can't resolve on
+        # its own (moving to an adjacent element, folding, search, the : command bar, undo/redo)
+        # go through ONE callback set by mainwindow — vim_action(edit, name) — instead of one
+        # callback per action, keeping this module's own "callback not import" decoupling from
+        # mainwindow intact despite vim touching much more of the app than completion/hover do.
+        self.vim_state = 'normal'
+        self._vim_count = ''
+        self._vim_pending_operator = None
+        self._vim_pending_prefix = None
+        self._vim_visual_anchor = None
+        self.vim_action = None
 
     def _auto_resize(self):
         # the rangeChanged connection above defers this call via QTimer.singleShot(0, ...) — if
@@ -322,8 +363,351 @@ class CodeEdit(QPlainTextEdit):
         if event.key() == Qt.Key_F2 and self.rename_provider is not None:
             self.rename_provider(self)
             return
+        if vim_mode_enabled() and self._vim_key_press(event):
+            return
         super().keyPressEvent(event)
     # [FN CLOSED] keyPressEvent
+
+    # [FN CATEGORY] _vim_key_press — the modal dispatch: Insert mode only intercepts Escape (every
+    # other key falls through to normal QPlainTextEdit typing, unchanged); Normal/Visual intercept
+    # everything, since letting an unmapped key insert text there would break the whole point of a
+    # modal editor. Returns True when the event was consumed (caller must not call super()), False
+    # to fall through to the original QPlainTextEdit handling.
+    # [FN] _vim_key_press — routes one key event through the current vim mode
+    # [FN OPEN] _vim_key_press
+    def _vim_key_press(self, event):
+        key = event.key()
+        text = event.text()
+
+        if self.vim_state == 'insert':
+            if key == Qt.Key_Escape:
+                self._vim_enter_normal(move_left=True)
+                return True
+            return False
+
+        # navigation/editing convenience keys always pass through untouched, in every vim state —
+        # intercepting them would only be annoying, not more "vim", since they don't insert text
+        if key in (
+            Qt.Key_Home, Qt.Key_End, Qt.Key_PageUp, Qt.Key_PageDown,
+            Qt.Key_Backspace, Qt.Key_Delete,
+        ):
+            return False
+
+        if key == Qt.Key_Escape:
+            self._vim_pending_operator = None
+            self._vim_pending_prefix = None
+            self._vim_count = ''
+            if self.vim_state in ('visual', 'visual_line'):
+                self._vim_visual_anchor = None
+                cursor = self.textCursor()
+                cursor.clearSelection()
+                self.setTextCursor(cursor)
+                self._vim_enter_normal()
+            return True
+
+        # a pending g/z prefix consumes exactly the next key (gg, G already has its own key so
+        # only 'g' needs the prefix; za is the only z-command supported)
+        if self._vim_pending_prefix is not None:
+            prefix, self._vim_pending_prefix = self._vim_pending_prefix, None
+            self._vim_count = ''
+            if prefix == 'g' and text == 'g':
+                self._vim_dispatch_action('first_element')
+            elif prefix == 'z' and text == 'a':
+                self._vim_dispatch_action('toggle_fold')
+            return True
+
+        # numeric count prefix — a leading '0' is the start-of-line motion, not a count digit
+        if text.isdigit() and not (text == '0' and not self._vim_count):
+            self._vim_count += text
+            return True
+        count = int(self._vim_count) if self._vim_count else 1
+
+        if self._vim_pending_operator is not None:
+            operator, self._vim_pending_operator = self._vim_pending_operator, None
+            self._vim_count = ''
+            self._vim_apply_operator(operator, key, text, count)
+            return True
+
+        if key in (Qt.Key_D, Qt.Key_Y, Qt.Key_C) and text in ('d', 'y', 'c') and self.vim_state == 'normal':
+            self._vim_pending_operator = text
+            return True
+
+        if self.vim_state in ('visual', 'visual_line') and text in ('d', 'x', 'y', 'c'):
+            self._vim_apply_visual_operator('d' if text == 'x' else text)
+            self._vim_count = ''
+            return True
+
+        if self._vim_simple_command(key, text, count):
+            self._vim_count = ''
+            return True
+
+        cursor = self.textCursor()
+        mode = QTextCursor.KeepAnchor if self.vim_state in ('visual', 'visual_line') else QTextCursor.MoveAnchor
+        if self._vim_move(cursor, key, text, count, mode):
+            self.setTextCursor(cursor)
+        self._vim_count = ''
+        return True
+    # [FN CLOSED] _vim_key_press
+
+    def _vim_dispatch_action(self, name, **kwargs):
+        if self.vim_action is not None:
+            self.vim_action(self, name, **kwargs)
+
+    # [FN CATEGORY] _vim_move — the shared motion table for plain cursor movement, operator ranges
+    # (called with QTextCursor.KeepAnchor), and visual-selection extension (same). j/k fall through
+    # to the adjacent element at a block boundary ONLY for plain movement (MoveAnchor) — jumping
+    # widgets mid-operator or mid-selection has no sensible meaning, so that case is disabled.
+    # [FN] _vim_move — applies one motion key to `cursor`, `count` times, in the given selection mode
+    # [FN OPEN] _vim_move
+    def _vim_move(self, cursor, key, text, count, mode):
+        if key in (Qt.Key_H, Qt.Key_Left) and text in ('h', ''):
+            cursor.movePosition(QTextCursor.Left, mode, count)
+            return True
+        if key in (Qt.Key_L, Qt.Key_Right) and text in ('l', ''):
+            cursor.movePosition(QTextCursor.Right, mode, count)
+            return True
+        if key in (Qt.Key_J, Qt.Key_Down) and text in ('j', ''):
+            # QTextDocument always materializes a trailing empty block for any text ending in a
+            # line terminator (single \n, or a CRLF-preserved \r with nothing after it — see
+            # fileio.detect_line_ending's docstring for why CR bytes can end up embedded verbatim).
+            # Real vim doesn't treat a file's single trailing newline as its own landable last
+            # line, so drop one trailing empty block here to match — a second consecutive blank
+            # block (a genuinely blank last line) still counts, same as real vim.
+            last_block = self.document().blockCount() - 1
+            if last_block > 0 and not self.document().findBlockByNumber(last_block).text():
+                last_block -= 1
+            for _ in range(count):
+                if cursor.blockNumber() >= last_block:
+                    if mode == QTextCursor.MoveAnchor:
+                        self._vim_dispatch_action('next_element')
+                    break
+                cursor.movePosition(QTextCursor.Down, mode)
+            return True
+        if key in (Qt.Key_K, Qt.Key_Up) and text in ('k', ''):
+            for _ in range(count):
+                if cursor.blockNumber() == 0:
+                    if mode == QTextCursor.MoveAnchor:
+                        self._vim_dispatch_action('prev_element')
+                    break
+                cursor.movePosition(QTextCursor.Up, mode)
+            return True
+        if key == Qt.Key_W and text == 'w':
+            cursor.movePosition(QTextCursor.NextWord, mode, count)
+            return True
+        if key == Qt.Key_B and text == 'b':
+            cursor.movePosition(QTextCursor.PreviousWord, mode, count)
+            return True
+        if key == Qt.Key_E and text == 'e':
+            # EndOfWord alone correctly reaches the end of the word the cursor is already inside
+            # (including sitting on its first character) — NextWord is only needed when the cursor
+            # is ALREADY at a word's end (or on whitespace with nothing after it on this line),
+            # otherwise unconditionally skipping to the next word first would jump clean over the
+            # current one, e.g. landing on "bar"'s end instead of "foo"'s when starting on "foo"
+            for _ in range(count):
+                before = cursor.position()
+                cursor.movePosition(QTextCursor.EndOfWord, mode)
+                if cursor.position() == before:
+                    cursor.movePosition(QTextCursor.NextWord, mode)
+                    cursor.movePosition(QTextCursor.EndOfWord, mode)
+            return True
+        if key == Qt.Key_0 and text == '0':
+            cursor.movePosition(QTextCursor.StartOfLine, mode)
+            return True
+        if key == Qt.Key_Dollar and text == '$':
+            cursor.movePosition(QTextCursor.EndOfLine, mode)
+            return True
+        return False
+    # [FN CLOSED] _vim_move
+
+    # [FN CATEGORY] _vim_apply_operator — d/y/c followed by either a motion (charwise range) or a
+    # repeat of the operator's own letter (dd/yy/cc, linewise — the whole line including its
+    # newline, matching real vim). An unrecognized motion after an operator cancels silently, same
+    # as real vim rather than falling through to inserting the motion key as text.
+    # [FN] _vim_apply_operator — deletes/yanks/changes the text an operator+motion covers
+    # [FN OPEN] _vim_apply_operator
+    def _vim_apply_operator(self, operator, key, text, count):
+        cursor = self.textCursor()
+        is_linewise_repeat = (
+            (operator == 'd' and text == 'd') or (operator == 'y' and text == 'y') or (operator == 'c' and text == 'c')
+        )
+        if is_linewise_repeat:
+            cursor.movePosition(QTextCursor.StartOfLine)
+            cursor.movePosition(QTextCursor.Down, QTextCursor.KeepAnchor, max(0, count - 1))
+            cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
+            cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)  # sweep up the newline too
+            linewise = True
+        else:
+            # vim's own special case: "cw" changes only to the end of the current word (like "ce"),
+            # not through the start of the next one like "dw"/"yw" would — otherwise the trailing
+            # space before the next word gets eaten too, which is never what "change this word" means
+            if operator == 'c' and key == Qt.Key_W and text == 'w' and not cursor.atBlockEnd():
+                key, text = Qt.Key_E, 'e'
+            moved = self._vim_move(cursor, key, text, count, QTextCursor.KeepAnchor)
+            if not moved:
+                return  # unrecognized motion: cancel, like real vim
+            linewise = False
+        if not cursor.hasSelection():
+            return
+        _VIM_REGISTER['text'] = cursor.selectedText().replace(' ', '\n')
+        _VIM_REGISTER['linewise'] = linewise
+        if operator in ('d', 'c'):
+            cursor.removeSelectedText()
+            self.setTextCursor(cursor)
+        if operator == 'c':
+            self._vim_enter_insert()
+    # [FN CLOSED] _vim_apply_operator
+
+    # [FN] _vim_apply_visual_operator — d/x/y/c on the current visual selection, then back to Normal
+    # (or Insert, for c) — same register/linewise bookkeeping as _vim_apply_operator
+    # [FN OPEN] _vim_apply_visual_operator
+    def _vim_apply_visual_operator(self, operator):
+        cursor = self.textCursor()
+        linewise = self.vim_state == 'visual_line'
+        if linewise and cursor.hasSelection():
+            start, end = sorted((cursor.selectionStart(), cursor.selectionEnd()))
+            cursor.setPosition(start)
+            cursor.movePosition(QTextCursor.StartOfLine)
+            cursor.setPosition(end, QTextCursor.KeepAnchor)
+            cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
+            cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
+        self._vim_enter_normal()
+        self._vim_visual_anchor = None
+        if not cursor.hasSelection():
+            return
+        _VIM_REGISTER['text'] = cursor.selectedText().replace(' ', '\n')
+        _VIM_REGISTER['linewise'] = linewise
+        if operator in ('d', 'c'):
+            cursor.removeSelectedText()
+            self.setTextCursor(cursor)
+        if operator == 'c':
+            self._vim_enter_insert()
+    # [FN CLOSED] _vim_apply_visual_operator
+
+    # [FN CATEGORY] _vim_simple_command — every Normal-mode key that isn't a motion, an operator, or
+    # a g/z prefix: mode switches (i/a/I/A/o/O/v/V), x/paste/undo, and the callback-routed actions
+    # (search, :, redo — redo only fires here since Ctrl+R is only intercepted in Normal mode, so
+    # the app-wide Ctrl+R=Run shortcut is untouched whenever a code block isn't focused in vim mode).
+    # [FN] _vim_simple_command — handles one non-motion, non-operator Normal-mode key
+    # [FN OPEN] _vim_simple_command
+    def _vim_simple_command(self, key, text, count):
+        cursor = self.textCursor()
+        if key == Qt.Key_R and (QApplication.keyboardModifiers() & Qt.ControlModifier):
+            self._vim_dispatch_action('redo')
+            return True
+        if text == 'x':
+            for _ in range(count):
+                cursor.deleteChar()
+            self.setTextCursor(cursor)
+            return True
+        if text == 'X':
+            for _ in range(count):
+                cursor.deletePreviousChar()
+            self.setTextCursor(cursor)
+            return True
+        if text == 'p':
+            self._vim_paste(after=True)
+            return True
+        if text == 'P':
+            self._vim_paste(after=False)
+            return True
+        if key == Qt.Key_U and text == 'u':
+            self._vim_dispatch_action('undo')
+            return True
+        if text == 'i':
+            self._vim_enter_insert()
+            return True
+        if text == 'a':
+            cursor.movePosition(QTextCursor.Right)
+            self.setTextCursor(cursor)
+            self._vim_enter_insert()
+            return True
+        if text == 'I':
+            cursor.movePosition(QTextCursor.StartOfLine)
+            self.setTextCursor(cursor)
+            self._vim_enter_insert()
+            return True
+        if text == 'A':
+            cursor.movePosition(QTextCursor.EndOfLine)
+            self.setTextCursor(cursor)
+            self._vim_enter_insert()
+            return True
+        if text == 'o':
+            cursor.movePosition(QTextCursor.EndOfLine)
+            cursor.insertText('\n')
+            self.setTextCursor(cursor)
+            self._vim_enter_insert()
+            return True
+        if text == 'O':
+            cursor.movePosition(QTextCursor.StartOfLine)
+            cursor.insertText('\n')
+            cursor.movePosition(QTextCursor.Up)
+            self.setTextCursor(cursor)
+            self._vim_enter_insert()
+            return True
+        if text == 'v':
+            self._vim_enter_visual('visual')
+            return True
+        if text == 'V':
+            self._vim_enter_visual('visual_line')
+            return True
+        if text == '/':
+            self._vim_dispatch_action('search')
+            return True
+        if key == Qt.Key_N and text == 'n':
+            self._vim_dispatch_action('find_next')
+            return True
+        if text == 'N':
+            self._vim_dispatch_action('find_prev')
+            return True
+        if text == ':':
+            self._vim_dispatch_action('open_command_bar')
+            return True
+        if text == 'g':
+            self._vim_pending_prefix = 'g'
+            return True
+        if key == Qt.Key_G and text == 'G':
+            self._vim_dispatch_action('last_element')
+            return True
+        if text == 'z':
+            self._vim_pending_prefix = 'z'
+            return True
+        return False
+    # [FN CLOSED] _vim_simple_command
+
+    def _vim_paste(self, after):
+        if not _VIM_REGISTER['text']:
+            return
+        cursor = self.textCursor()
+        if _VIM_REGISTER['linewise']:
+            cursor.movePosition(QTextCursor.EndOfLine if after else QTextCursor.StartOfLine)
+            cursor.insertText(('\n' if after else '') + _VIM_REGISTER['text'].rstrip('\n') + ('\n' if not after else ''))
+            if after:
+                cursor.movePosition(QTextCursor.NextBlock)
+            else:
+                cursor.movePosition(QTextCursor.Up, QTextCursor.MoveAnchor, _VIM_REGISTER['text'].count('\n') + 1)
+        else:
+            if after and not cursor.atBlockEnd():
+                cursor.movePosition(QTextCursor.Right)
+            cursor.insertText(_VIM_REGISTER['text'])
+        self.setTextCursor(cursor)
+
+    def _vim_enter_insert(self):
+        self.vim_state = 'insert'
+        self.vim_mode_changed.emit(self.vim_state)
+
+    def _vim_enter_normal(self, move_left=False):
+        self.vim_state = 'normal'
+        if move_left:
+            cursor = self.textCursor()
+            if not cursor.atBlockStart():
+                cursor.movePosition(QTextCursor.Left)
+                self.setTextCursor(cursor)
+        self.vim_mode_changed.emit(self.vim_state)
+
+    def _vim_enter_visual(self, state):
+        self.vim_state = state
+        self._vim_visual_anchor = self.textCursor().position()
+        self.vim_mode_changed.emit(self.vim_state)
 
     # [FN] mousePressEvent — Ctrl+Click jumps to the clicked symbol's definition, same gesture
     # every other IDE uses; the normal click still runs first so the text cursor lands at the
@@ -715,6 +1099,72 @@ def _normalize_ai_text(raw_bytes):
 # [FN CLOSED] _normalize_ai_text
 
 
+# [CST] markdown regexes for _markdown_to_html — fenced blocks extracted first (DOTALL, so their
+# contents never get bold/italic/inline-code substitution applied inside them); bold before italic
+# so **x** doesn't leave stray single *s for the italic pattern to also match.
+_MD_CODE_FENCE_RE = re.compile(r'```(?:\w+)?\n?(.*?)```', re.DOTALL)
+_MD_INLINE_CODE_RE = re.compile(r'`([^`\n]+)`')
+_MD_BOLD_RE = re.compile(r'\*\*(.+?)\*\*|__(.+?)__')
+_MD_ITALIC_RE = re.compile(r'(?<!\*)\*([^*\n]+)\*(?!\*)|(?<!_)_([^_\n]+)_(?!_)')
+
+
+# [FN CATEGORY] _markdown_to_html — not a full CommonMark implementation, just the subset an AI
+# chat response actually uses (bold, italic, inline code, fenced code blocks, simple bullet
+# lines), hand-rolled to avoid a new dependency for a narrow, controlled need — the input is
+# always this app's own AI process output or the user's own typed message, not arbitrary external
+# HTML. Escapes first, substitutes markdown syntax on the escaped text after (the syntax
+# characters `*`/`` ` `` aren't touched by HTML-escaping), so raw `<`/`&` in prose or inside code
+# render literally instead of being parsed as markup.
+# [FN] _markdown_to_html — converts a chat message's markdown-ish text into Qt rich text
+# [FN OPEN] _markdown_to_html
+def _markdown_to_html(text):
+    segments = []
+    last_end = 0
+    for match in _MD_CODE_FENCE_RE.finditer(text):
+        segments.append(('text', text[last_end:match.start()]))
+        segments.append(('code', match.group(1)))
+        last_end = match.end()
+    segments.append(('text', text[last_end:]))
+
+    html_parts = []
+    for kind, segment in segments:
+        if kind == 'code':
+            code_html = html_escape(segment.strip('\n')).replace('\n', '<br>')
+            html_parts.append(
+                f'<pre style="background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; '
+                f'border-radius:6px; padding:8px; margin:4px 0;">{code_html}</pre>'
+            )
+            continue
+        escaped = html_escape(segment)
+        # inline code is stashed behind a placeholder before bold/italic run, and only restored
+        # after — otherwise markdown syntax INSIDE a `code span` (e.g. `*args`) gets re-processed
+        # as italic by the later substitution instead of rendering literally
+        code_spans = []
+
+        def stash_code(m):
+            code_spans.append(m.group(1))
+            return f'\x00{len(code_spans) - 1}\x00'
+
+        escaped = _MD_INLINE_CODE_RE.sub(stash_code, escaped)
+        escaped = _MD_BOLD_RE.sub(lambda m: f'<b>{m.group(1) or m.group(2)}</b>', escaped)
+        escaped = _MD_ITALIC_RE.sub(lambda m: f'<i>{m.group(1) or m.group(2)}</i>', escaped)
+        escaped = re.sub(
+            r'\x00(\d+)\x00',
+            lambda m: f'<code style="background:{theme.CODE_BG}; padding:1px 4px; border-radius:3px;">{code_spans[int(m.group(1))]}</code>',
+            escaped,
+        )
+        rendered_lines = []
+        for line in escaped.split('\n'):
+            stripped = line.lstrip()
+            if stripped[:2] in ('- ', '* '):
+                rendered_lines.append('&nbsp;&nbsp;• ' + stripped[2:])
+            else:
+                rendered_lines.append(line)
+        html_parts.append('<br>'.join(rendered_lines))
+    return ''.join(html_parts)
+# [FN CLOSED] _markdown_to_html
+
+
 # [CST] _TYPING_FRAMES — cycled in the placeholder assistant bubble while a prompt is running and
 # no output has streamed back yet, so the chat shows the AI is working instead of sitting blank
 _TYPING_FRAMES = ('·', '· ·', '· · ·')
@@ -1074,8 +1524,8 @@ class ClaudePane(QWidget):
         bubble.setContentsMargins(12, 8, 12, 9)
         bubble.setSpacing(3)
         name_label = QLabel(name or {'user': 'Tu', 'assistant': _agent_label(self.current_agent)}.get(role, 'Sistema'))
-        label = QLabel(text.strip())
-        label.setTextFormat(Qt.PlainText)
+        label = QLabel(_markdown_to_html(text.strip()))
+        label.setTextFormat(Qt.RichText)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         # TextSelectableByMouse alone doesn't change the hover cursor — without this the bubble
         # (user messages included) looks like static text even though drag-select already works,
@@ -1114,7 +1564,7 @@ class ClaudePane(QWidget):
             self._stream_label = self._add_message('', 'assistant')
             self._stream_text = ''
         self._stream_text += text
-        self._stream_label.setText(self._stream_text.strip())
+        self._stream_label.setText(_markdown_to_html(self._stream_text.strip()))
         self._write_log(text)
         QTimer.singleShot(0, lambda: self.output.verticalScrollBar().setValue(self.output.verticalScrollBar().maximum()))
 
@@ -1946,7 +2396,7 @@ class TitleBar(QWidget):
         )
         self.validate_kant_menu_action.triggered.connect(window._run_kant_validation)
         self.run_menu_action = file_menu.addAction('Esegui')
-        self.run_menu_action.setToolTip("Esegue il file attivo con l'interprete/comando adatto al suo tipo (F5)")
+        self.run_menu_action.setToolTip("Esegue il file attivo con l'interprete/comando adatto al suo tipo (Ctrl+R)")
         self.run_menu_action.triggered.connect(window._run_current_file)
         self.run_tests_menu_action = file_menu.addAction('Esegui test (Ctrl+Shift+T)')
         self.run_tests_menu_action.setToolTip('Esegue l\'intera suite pytest del progetto e mostra i risultati')
@@ -1979,6 +2429,16 @@ class TitleBar(QWidget):
         self.command_palette_menu_action = appearance_menu.addAction('Palette comandi (Ctrl+Shift+P)')
         self.command_palette_menu_action.setToolTip('Apre un elenco cercabile di tutti i comandi disponibili')
         self.command_palette_menu_action.triggered.connect(window._show_command_palette)
+        self.vim_mode_menu_action = appearance_menu.addAction('Modalità VIM')
+        self.vim_mode_menu_action.setCheckable(True)
+        self.vim_mode_menu_action.setChecked(vim_mode_enabled())
+        self.vim_mode_menu_action.setToolTip(
+            "Editing modale stile VIM nei blocchi di codice: Normal/Insert/Visual, motion "
+            "h/j/k/l/w/b/e, operatori d/y/c, navigazione strutturale j/k/gg/G tra gli elementi, "
+            "za per piegare, / e : per cercare ed eseguire comandi. Disattivala per digitare "
+            "sempre normalmente, come prima."
+        )
+        self.vim_mode_menu_action.toggled.connect(set_vim_mode)
         layout.addWidget(self.appearance_menu_btn)
 
         self.lsp_menu_btn = self._menu_button('LSP', 'Funzioni del language server: hover, definizione, rename, formattazione, lint, dipendenze')
@@ -2058,14 +2518,9 @@ class TitleBar(QWidget):
             self.appearance_menu_btn, self.lsp_menu_btn, self.git_menu_btn,
         ]
 
-        # top-right corner: window chrome (minimize/maximize/close) with Run/Debug in a second row
-        # directly beneath it, so both are reachable from the same corner without a full-width
-        # toolbar row for just two icons — a QVBoxLayout keeps the rows aligned under each other.
-        corner = QWidget()
-        corner_layout = QVBoxLayout(corner)
-        corner_layout.setContentsMargins(0, 0, 0, 0)
-        corner_layout.setSpacing(2)
-
+        # top-right corner: window chrome only (minimize/maximize/close) — Run/Debug used to share
+        # this corner in their own row, but that made them small (28x24) and easy to miss; they now
+        # live in the action toolbar row directly below the title bar instead, sized up there.
         chrome_row = QHBoxLayout()
         chrome_row.setContentsMargins(0, 0, 0, 0)
         chrome_row.setSpacing(0)
@@ -2078,30 +2533,7 @@ class TitleBar(QWidget):
             self.buttons.append(btn)
             btn.setStyleSheet(theme.BUTTON_STYLE)
             chrome_row.addWidget(btn)
-        corner_layout.addLayout(chrome_row)
-
-        run_debug_row = QHBoxLayout()
-        run_debug_row.setContentsMargins(0, 0, 0, 0)
-        run_debug_row.setSpacing(2)
-        run_debug_row.addStretch(1)
-        self.run_btn = QToolButton()
-        self.run_btn.setIcon(draw_icon('run', 16))
-        self.run_btn.setIconSize(QSize(16, 16))
-        self.run_btn.setFixedSize(28, 24)
-        self.run_btn.setToolTip('Esegui (Ctrl+R)')
-        self.run_btn.clicked.connect(window._run_current_file)
-        run_debug_row.addWidget(self.run_btn)
-        self.debug_btn = QToolButton()
-        self.debug_btn.setIcon(draw_icon('debug', 16))
-        self.debug_btn.setIconSize(QSize(16, 16))
-        self.debug_btn.setFixedSize(28, 24)
-        self.debug_btn.setToolTip('Debug (F5)')
-        self.debug_btn.clicked.connect(window._debug_current_file)
-        run_debug_row.addWidget(self.debug_btn)
-        corner_layout.addLayout(run_debug_row)
-
-        self.buttons.extend([self.run_btn, self.debug_btn])
-        layout.addWidget(corner)
+        layout.addLayout(chrome_row)
         self.apply_style()
 
     def _menu_button(self, text, tooltip=None):
@@ -2128,7 +2560,7 @@ class TitleBar(QWidget):
         # label) was squeezing its 16px icon down to a sliver inside the fixed 32x28 button
         icon_button_style = theme.BUTTON_STYLE.replace('padding:7px 13px;', 'padding:4px;')
         for btn in self.buttons:
-            if btn in (self.back_btn, self.run_btn, self.debug_btn):
+            if btn is self.back_btn:
                 btn.setStyleSheet(icon_button_style.replace('QPushButton', 'QToolButton') if isinstance(btn, QToolButton) else icon_button_style)
             else:
                 btn.setStyleSheet(tool_button_style if isinstance(btn, QToolButton) else theme.BUTTON_STYLE)
