@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog, QFileDialog, QFrame,
     QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView,
     QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMenu, QPlainTextEdit, QPushButton, QScrollArea,
+    QMainWindow, QMenuBar, QPlainTextEdit, QPushButton, QScrollArea,
     QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QTabWidget, QToolButton,
     QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
@@ -2614,9 +2614,17 @@ class TitleBar(QWidget):
         title_box.addWidget(subtitle)
         layout.addLayout(title_box)
 
-        self.file_menu_btn = self._menu_button('File', 'Comandi sul file attivo: salva, annulla/ripeti, verifica KANT, esegui, esegui test')
-        file_menu = self.file_menu_btn.menu()
+        # a real QMenuBar (flat text entries, no button chrome) instead of QToolButtons each
+        # popping their own QMenu — this window is frameless/custom-drawn, so there's no OS menu
+        # bar to fall back on; setNativeMenuBar(False) keeps it drawn inline here even on macOS,
+        # where Qt would otherwise try to hijack the real system menu bar for it.
+        self.menu_bar = QMenuBar(self)
+        self.menu_bar.setNativeMenuBar(False)
+
+        file_menu = self.menu_bar.addMenu('File')
         file_menu.setToolTipsVisible(True)
+        self.file_menu_btn = file_menu.menuAction()
+        self.file_menu_btn.setToolTip('Comandi sul file attivo: salva, annulla/ripeti, verifica KANT, esegui, esegui test')
         self.save_menu_action = file_menu.addAction('Salva')
         self.save_menu_action.setToolTip('Salva il file attivo su disco (Ctrl+S)')
         self.save_menu_action.triggered.connect(window._save_file)
@@ -2637,11 +2645,11 @@ class TitleBar(QWidget):
         self.run_tests_menu_action = file_menu.addAction('Esegui test (Ctrl+Shift+T)')
         self.run_tests_menu_action.setToolTip('Esegue l\'intera suite pytest del progetto e mostra i risultati')
         self.run_tests_menu_action.triggered.connect(window._run_tests)
-        layout.addWidget(self.file_menu_btn)
 
-        self.search_menu_btn = self._menu_button('Cerca', 'Trova e sostituisci testo nel file attivo o in tutto il progetto')
-        search_menu = self.search_menu_btn.menu()
+        search_menu = self.menu_bar.addMenu('Cerca')
         search_menu.setToolTipsVisible(True)
+        self.search_menu_btn = search_menu.menuAction()
+        self.search_menu_btn.setToolTip('Trova e sostituisci testo nel file attivo o in tutto il progetto')
         self.find_menu_action = search_menu.addAction('Trova nel file')
         self.find_menu_action.setToolTip('Cerca (ed eventualmente sostituisce) del testo nel file attualmente aperto')
         self.find_menu_action.triggered.connect(window._show_find_bar)
@@ -2651,14 +2659,14 @@ class TitleBar(QWidget):
         self.project_replace_menu_action = search_menu.addAction('Sostituisci nel progetto')
         self.project_replace_menu_action.setToolTip('Cerca e sostituisce del testo in tutti i file del progetto aperto')
         self.project_replace_menu_action.triggered.connect(window._replace_project)
-        layout.addWidget(self.search_menu_btn)
 
         # menu order mirrors the PyCharm-style convention: File, then editing/view-level menus
         # (Cerca ~ Edit's find/replace, Aspetto ~ View), with Git (~ VCS) last — version control is
         # its own concern, not part of the editing flow, so it sits at the end of the row
-        self.appearance_menu_btn = self._menu_button('Aspetto', "Tema chiaro/scuro e la palette comandi")
-        appearance_menu = self.appearance_menu_btn.menu()
+        appearance_menu = self.menu_bar.addMenu('Aspetto')
         appearance_menu.setToolTipsVisible(True)
+        self.appearance_menu_btn = appearance_menu.menuAction()
+        self.appearance_menu_btn.setToolTip("Tema chiaro/scuro e la palette comandi")
         self.theme_menu_action = appearance_menu.addAction('Notte')
         self.theme_menu_action.setToolTip('Passa dal tema chiaro a quello scuro (o viceversa)')
         self.theme_menu_action.triggered.connect(window._toggle_theme)
@@ -2675,11 +2683,11 @@ class TitleBar(QWidget):
             "sempre normalmente, come prima."
         )
         self.vim_mode_menu_action.toggled.connect(set_vim_mode)
-        layout.addWidget(self.appearance_menu_btn)
 
-        self.lsp_menu_btn = self._menu_button('LSP', 'Funzioni del language server: hover, definizione, rename, formattazione, lint, dipendenze')
-        lsp_menu = self.lsp_menu_btn.menu()
+        lsp_menu = self.menu_bar.addMenu('LSP')
         lsp_menu.setToolTipsVisible(True)
+        self.lsp_menu_btn = lsp_menu.menuAction()
+        self.lsp_menu_btn.setToolTip('Funzioni del language server: hover, definizione, rename, formattazione, lint, dipendenze')
         self.lsp_hover_menu_action = lsp_menu.addAction('Hover (o passa il mouse su un simbolo)')
         self.lsp_hover_menu_action.setToolTip('Mostra le informazioni del language server per il simbolo sotto il cursore')
         self.lsp_hover_menu_action.triggered.connect(lambda: window._lsp_command('hover'))
@@ -2708,11 +2716,11 @@ class TitleBar(QWidget):
         self.lsp_lint_menu_action = lsp_menu.addAction('Esegui lint (ruff/flake8)')
         self.lsp_lint_menu_action.setToolTip('Analizza il progetto con ruff o flake8 e mostra i problemi trovati')
         self.lsp_lint_menu_action.triggered.connect(window._run_lint_check)
-        layout.addWidget(self.lsp_menu_btn)
 
-        self.git_menu_btn = self._menu_button('Git', 'Apri il pannello Git completo')
-        git_menu = self.git_menu_btn.menu()
+        git_menu = self.menu_bar.addMenu('Git')
         git_menu.setToolTipsVisible(True)
+        self.git_menu_btn = git_menu.menuAction()
+        self.git_menu_btn.setToolTip('Refresh, diff, stage/unstage, commit, cambio branch; "Altro..." apre il pannello Git completo')
         self.git_refresh_menu_action = git_menu.addAction('Refresh')
         self.git_refresh_menu_action.setToolTip('Aggiorna lo stato Git mostrato nella barra e nella struttura del progetto')
         self.git_refresh_menu_action.triggered.connect(window._git_refresh)
@@ -2733,13 +2741,9 @@ class TitleBar(QWidget):
         self.git_branch_menu_action.triggered.connect(window._git_switch_branch)
         git_menu.addSeparator()
         self.git_more_menu_action = git_menu.addAction('Altro...')
-        self.git_more_menu_action.setToolTip('Apri il pannello Git completo')
+        self.git_more_menu_action.setToolTip('Apri il pannello Git completo (branch/stage/diff/commit assieme, o il flusso git-init se il progetto non ha ancora un repo)')
         self.git_more_menu_action.triggered.connect(window._open_git_panel)
-        # Clicking Git opens the one-window panel (branch/stage/diff/commit together, or the git-init
-        # flow if this project has no repo yet) instead of this dropdown.
-        self.git_menu_btn.clicked.disconnect()
-        self.git_menu_btn.clicked.connect(window._open_git_panel)
-        layout.addWidget(self.git_menu_btn)
+        layout.addWidget(self.menu_bar)
 
         self.filename_label = QLabel('')
         self.filename_label.setStyleSheet(f'color:{theme.DIM};')
@@ -2749,10 +2753,7 @@ class TitleBar(QWidget):
         layout.addWidget(self.syntax_label)
 
         layout.addStretch(1)
-        self.buttons = [
-            self.back_btn, self.file_menu_btn, self.search_menu_btn,
-            self.appearance_menu_btn, self.lsp_menu_btn, self.git_menu_btn,
-        ]
+        self.buttons = [self.back_btn]
 
         # top-right corner: window chrome only (minimize/maximize/close) — Run/Debug used to share
         # this corner in their own row, but that made them small (28x24) and easy to miss; they now
@@ -2772,25 +2773,17 @@ class TitleBar(QWidget):
         layout.addLayout(chrome_row)
         self.apply_style()
 
-    def _menu_button(self, text, tooltip=None):
-        btn = QToolButton()
-        btn.setText(text)
-        btn.setPopupMode(QToolButton.DelayedPopup)
-        btn.setMenu(QMenu(btn))
-        if tooltip:
-            btn.setToolTip(tooltip)
-        btn.clicked.connect(lambda _checked=False, b=btn: self._show_button_menu(b))
-        btn.setFixedHeight(28)
-        return btn
-
-    def _show_button_menu(self, btn):
-        menu = btn.menu()
-        if menu is not None:
-            menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
-
     def apply_style(self):
         self.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
         self.theme_menu_action.setText('Giorno' if self.window.night_mode else 'Notte')
+        # flat text entries (no button chrome/border) — a real menu bar, not a row of buttons
+        self.menu_bar.setStyleSheet(
+            f'QMenuBar {{ background:transparent; border:none; spacing:4px; }} '
+            f'QMenuBar::item {{ background:transparent; color:{theme.TEXT}; padding:6px 10px; '
+            f'border-radius:6px; font-weight:600; }} '
+            f'QMenuBar::item:selected {{ background:{theme.CODE_BG}; color:{theme.ACCENT}; }} '
+            f'QMenuBar::item:pressed {{ background:{theme.ACCENT}; color:#ffffff; }}'
+        )
         tool_button_style = theme.BUTTON_STYLE.replace('QPushButton', 'QToolButton')
         # back_btn is icon-only now — theme.BUTTON_STYLE's 7px/13px padding (sized for a text
         # label) was squeezing its 16px icon down to a sliver inside the fixed 32x28 button

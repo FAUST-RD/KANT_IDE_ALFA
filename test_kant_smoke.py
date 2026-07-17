@@ -592,7 +592,6 @@ class KantSmokeTest(unittest.TestCase):
         QTest.mouseDClick(tree_label, Qt.LeftButton)
         assert label_dclicks == [dummy_item]
         assert window.title_bar.file_menu_btn.menu() is not None
-        assert window.title_bar.file_menu_btn.popupMode() == QToolButton.DelayedPopup
         window.close()
 
     def test_tree_stylesheet_stays_tight_and_consistent_across_theme_toggle(self):
@@ -1597,21 +1596,11 @@ class KantSmokeTest(unittest.TestCase):
             MainWindow._delete_tree_item(delete_window, delete_item, 'file')
             assert events == ['flush', ('close', False), 'move']
 
-    def test_git_button_hover_does_not_show_dropdown(self):
-        # Hover opening was intentionally removed: only the full Git panel opens from the button.
+    def test_git_menu_more_action_opens_full_panel(self):
+        # Git is a normal QMenuBar entry like File/Cerca/Aspetto/LSP (no more special "click
+        # bypasses the dropdown" QToolButton behavior) — "Altro..." (the last item, after a
+        # separator) is the one action that reaches the full Git panel.
         window = MainWindow()
-        menu = window.title_bar.git_menu_btn.menu()
-        calls = []
-        original_exec = menu.exec
-        menu.exec = lambda *args, **kwargs: calls.append(args)
-        try:
-            window.title_bar.eventFilter(window.title_bar.git_menu_btn, QEvent(QEvent.Enter))
-        finally:
-            menu.exec = original_exec
-        assert calls == []
-
-        # "Altro..." (the dropdown's last item, after a separator) reaches the full Git panel —
-        # same destination as clicking the button itself, for whoever opens it via the dropdown
         opened = []
         window._open_git_panel = lambda: opened.append(True)
         window.title_bar.git_more_menu_action.trigger()
@@ -1905,26 +1894,27 @@ class KantSmokeTest(unittest.TestCase):
 
     def test_project_chrome_hidden_on_welcome_shown_after_open(self):
         # The title-bar menus belong to the project workspace, so none appear on the welcome screen.
-        # isHidden(), not
-        # isVisible(): window is never shown in this test, so isVisible() would be False regardless
-        # of these calls (it also accounts for the whole unshown ancestor chain).
+        # These 5 are QMenuBar entries (QAction, via menuAction()) now, not QWidgets — QAction has
+        # isVisible() but no isHidden(), unlike action_toolbar (a real QWidget, isHidden() is fine
+        # there since the window is never shown in this test, so isVisible() would read False
+        # regardless, via the whole unshown ancestor chain).
         window = MainWindow()
         project_menus = (
             window.title_bar.file_menu_btn, window.title_bar.search_menu_btn,
             window.title_bar.appearance_menu_btn, window.title_bar.lsp_menu_btn,
             window.title_bar.git_menu_btn,
         )
-        assert all(btn.isHidden() for btn in project_menus)
+        assert all(not action.isVisible() for action in project_menus)
         assert window.action_toolbar.isHidden()
 
         project_root = Path(_mkdtemp_safe())
         window._ide_yes_no = lambda *_args, **_kwargs: False  # decline the KANT-tagging prompts
         window._open_project_folder(str(project_root))
-        assert all(not btn.isHidden() for btn in project_menus)
+        assert all(action.isVisible() for action in project_menus)
         assert not window.action_toolbar.isHidden()
 
         window._go_back_to_welcome()
-        assert all(btn.isHidden() for btn in project_menus)
+        assert all(not action.isVisible() for action in project_menus)
         assert window.action_toolbar.isHidden()
         window.close()
 
