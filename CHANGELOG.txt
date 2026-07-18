@@ -1,5 +1,10 @@
 KANT IDE changelog
 
+2026-07-19 (74)
+- Run/Debug buttons in the action toolbar are back to the same size as Save/Undo/Redo/Find in the same row (used to be visibly bigger).
+- Fixed the model/effort selectors' closed-face icon, which could get squeezed out by the (invisible but still layout-reserved) full item text depending on the active Qt style — the old `color:transparent` QSS hack only hid the text's ink, not its footprint. New `IconOnlyCombo` blanks the text at paint time instead, which removes that reserved width at the source regardless of style engine; the dropdown itself is unaffected and still shows full names.
+- Moved the token-savings toggle (image compression before sending) from under the chat to directly above the Invia row, and turned it from a plain "Immagini compresse" checkbox into a checkable pill with a token icon and a name ("Risparmia token") that actually says what it saves.
+
 2026-07-19 (73)
 - CRT-scanline overlay (entry 70) now runs in night mode too: the line color flips (a faint light pen instead of a faint dark one) instead of the effect just being skipped there.
 - Title-bar dropdown menus pared back from entry 70's bulkier padding/weight to a more minimal look — thinner rows, no bold, softer radius — without dropping any menu entries or the disabled-item graying.

@@ -38,8 +38,8 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect, QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView,
     QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMenuBar, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QTabWidget, QToolButton,
-    QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
+    QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QStyle, QStyleOptionComboBox, QStylePainter,
+    QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
 from kant import theme
@@ -1505,6 +1505,30 @@ class ScanlineOverlay(QWidget):
 # [FN CLOSED] ScanlineOverlay
 
 
+# [FN CATEGORY] IconOnlyCombo — a QComboBox whose closed face shows only its current item's icon,
+# never its text. The earlier approach (a plain QComboBox plus `color:transparent` in the
+# stylesheet) only hides the text's ink, not its layout footprint — the native/native-styled combo
+# box still reserves room for the full item text next to the icon, and depending on the active Qt
+# style that reserved space can crowd the icon out of the narrow closed face entirely (reported
+# broken; not reproducible in the offscreen/Fusion test harness, which doesn't share the real
+# native style's box-model quirks). Blanking `opt.currentText` before the style paints the label
+# control removes that reserved width at the source, regardless of which style is active — the
+# dropdown popup is untouched and still shows full item names (see apply_style's explicit
+# view().setMinimumWidth()); only currentText()/itemText() as DATA are unaffected, since only the
+# paint-time copy of the option is touched.
+# [FN] IconOnlyCombo — QComboBox that paints its closed face with no text, icon only
+# [FN OPEN] IconOnlyCombo
+class IconOnlyCombo(QComboBox):
+    def paintEvent(self, event):
+        painter = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        opt.currentText = ''
+        painter.drawComplexControl(QStyle.CC_ComboBox, opt)
+        painter.drawControl(QStyle.CE_ComboBoxLabel, opt)
+# [FN CLOSED] IconOnlyCombo
+
+
 class ClaudePane(QWidget):
     finished = Signal()
 
@@ -1566,14 +1590,14 @@ class ClaudePane(QWidget):
         self.agent_select.addItem('Codex', 'codex')
         self.agent_select.setToolTip('Quale CLI AI usare per i messaggi inviati da questa plancia')
         header.addWidget(self.agent_select)
-        self.model_select = QComboBox()
+        self.model_select = IconOnlyCombo()
         self.model_select.setToolTip("Modello per l'agente selezionato")
         self.model_select.addItems(CLAUDE_MODELS)
         self.model_select.setCursor(Qt.PointingHandCursor)
         self.model_select.setIconSize(QSize(18, 18))
         self.model_select.setFixedWidth(44)
         header.addWidget(self.model_select)
-        self.effort_select = QComboBox()
+        self.effort_select = IconOnlyCombo()
         self.effort_select.setToolTip("Reasoning effort per l'agente selezionato")
         self.effort_select.addItems(EFFORT_LEVELS['claude'])
         self.effort_select.setCursor(Qt.PointingHandCursor)
@@ -1622,12 +1646,28 @@ class ClaudePane(QWidget):
         self.output.setWidget(self.chat)
         layout.addWidget(self.output, 1)
 
+        # attached-files chip row: only visible while at least one file is pending, cleared on send
+        # (see _attach_files/_refresh_attachment_chips/_send) — one removable chip per file
+        self.attachments_row = QWidget()
+        self.attachments_layout = QHBoxLayout(self.attachments_row)
+        self.attachments_layout.setContentsMargins(0, 0, 0, 4)
+        self.attachments_layout.setSpacing(6)
+        self.attachments_row.hide()
+        layout.addWidget(self.attachments_row)
+
         # "risparmio token ma lossy": when checked, an attached image (not documents — those go
         # through convert_attached_document unconditionally, which isn't lossy the same way) is
         # downscaled/recompressed by compress_attached_image before its path is queued. Always
-        # visible next to the attach button, not just while something's already attached — it's a
-        # setting for the NEXT attachment, not a property of the current chip row.
-        self.lossy_images = QCheckBox('Immagini compresse')
+        # visible, not just while something's already attached — it's a setting for the NEXT
+        # attachment, not a property of the current chip row. Right above the composer/Invia row
+        # (not tucked under the chat like before) and a checkable pill with a token icon + a name
+        # that actually says what it saves, instead of a plain "Immagini compresse" checkbox that
+        # read as an image-quality setting rather than a token-budget one.
+        self.lossy_images = QPushButton(' Risparmia token')
+        self.lossy_images.setIcon(draw_icon('tokens', 14))
+        self.lossy_images.setIconSize(QSize(14, 14))
+        self.lossy_images.setCheckable(True)
+        self.lossy_images.setCursor(Qt.PointingHandCursor)
         self.lossy_images.setToolTip(
             "Modalità risparmio token (lossy): le immagini allegate vengono ridimensionate e "
             "ricompresse prima dell'invio, per far leggere meno token al modello a scapito della "
@@ -1638,15 +1678,6 @@ class ClaudePane(QWidget):
         lossy_row.addWidget(self.lossy_images)
         lossy_row.addStretch(1)
         layout.addLayout(lossy_row)
-
-        # attached-files chip row: only visible while at least one file is pending, cleared on send
-        # (see _attach_files/_refresh_attachment_chips/_send) — one removable chip per file
-        self.attachments_row = QWidget()
-        self.attachments_layout = QHBoxLayout(self.attachments_row)
-        self.attachments_layout.setContentsMargins(0, 0, 0, 4)
-        self.attachments_layout.setSpacing(6)
-        self.attachments_row.hide()
-        layout.addWidget(self.attachments_row)
 
         self.prompt = _PromptEdit()
         self.prompt.setFixedHeight(90)
@@ -1729,7 +1760,9 @@ class ClaudePane(QWidget):
             theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
         )
         self.focus_label.setStyleSheet(f'color:{theme.DIM};')
-        self.lossy_images.setStyleSheet(f'color:{theme.DIM}; font-weight:600; spacing:6px;')
+        self.lossy_images.setStyleSheet(
+            theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
+        )
         self.attach_btn.setStyleSheet(
             f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:1px solid {theme.BORDER}; '
             f'border-radius:8px; font-size:15pt; }} '
@@ -1737,6 +1770,7 @@ class ClaudePane(QWidget):
         )
         self._refresh_attachment_chips()
         self.global_mode_btn.setIcon(draw_icon('globe', 14))
+        self.lossy_images.setIcon(draw_icon('tokens', 14))
         self.attach_btn.setIcon(draw_icon('attach', 18))
         self.send_btn.setIcon(draw_icon('arrow-right', 14, '#111827'))
         self._refresh_selector_icons()

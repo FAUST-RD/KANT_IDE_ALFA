@@ -686,17 +686,18 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         separator.setFixedHeight(22)
         self._action_toolbar_separator = separator
         layout.addWidget(separator)
-        # Run/Debug visibly bigger than the rest, at the trailing edge of this same row (moved from
-        # the leading edge on request — same toolbar, opposite side)
+        # Run/Debug at the trailing edge of this same row (moved from the leading edge on request —
+        # same toolbar, opposite side), same size as the rest of the row now (used to be visibly
+        # bigger, on request)
         for key, tooltip, callback in (
             ('run', 'Esegui (Ctrl+R)', self._run_current_file),
             ('debug', 'Debug (F5)', self._debug_current_file),
         ):
             btn = QToolButton()
-            btn.setIcon(draw_icon(key, 26))
-            btn.setIconSize(QSize(26, 26))
+            btn.setIcon(draw_icon(key, 18))
+            btn.setIconSize(QSize(18, 18))
             btn.setToolTip(tooltip)
-            btn.setFixedSize(40, 36)
+            btn.setFixedSize(32, 28)
             btn.clicked.connect(callback)
             layout.addWidget(btn)
             self.action_toolbar_buttons[key] = btn

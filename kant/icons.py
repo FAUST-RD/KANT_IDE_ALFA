@@ -45,6 +45,7 @@ _SVG_BODIES = {
     'grid': '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
     'pin': '<path d="M9 3h6l-1 6 3 3H7l3-3zM12 12v9"/>',
     'close': '<path d="M6 6l12 12M18 6L6 18"/>',
+    'tokens': '<circle cx="9" cy="15" r="5"/><circle cx="15" cy="9" r="5"/>',
 }
 # [CST CLOSED] _SVG_BODIES
 
