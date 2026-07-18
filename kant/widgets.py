@@ -1755,7 +1755,9 @@ class ClaudePane(QWidget):
         self.model_select.view().setMinimumWidth(180)
         self.effort_select.setStyleSheet(icon_combo_style)
         self.effort_select.view().setMinimumWidth(120)
-        self.auto_permissions.setStyleSheet(f'color:{theme.ACCENT}; font-weight:600; spacing:6px;')
+        self.auto_permissions.setStyleSheet(
+            theme.CHECKBOX_STYLE + f'QCheckBox {{ color:{theme.ACCENT}; font-weight:600; }}'
+        )
         self.global_mode_btn.setStyleSheet(
             theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
         )
@@ -2760,11 +2762,17 @@ class CollapsibleSection(QWidget):
 
         if show_header:
             self.toggle_btn = QToolButton()
-            self.toggle_btn.setArrowType(Qt.DownArrow)
+            # a drawn SVG icon (theme-aware via draw_icon), not setArrowType — QToolButton's native
+            # arrow primitive is drawn by the active Qt style and, on the native Windows style in
+            # particular, doesn't reliably pick up this stylesheet's `color`, so the arrow could
+            # stay whatever the style's own default is (reported: stuck white in night mode)
+            # regardless of theme
+            self.toggle_btn.setIcon(draw_icon('arrow-down', 12))
+            self.toggle_btn.setIconSize(QSize(12, 12))
             self.toggle_btn.setCheckable(True)
             self.toggle_btn.setChecked(True)
             self.toggle_btn.setToolTip('Comprimi/espandi questa sezione')
-            self.toggle_btn.setStyleSheet(f'border:none; color:{theme.TEXT}; background:transparent; padding:0; margin:0;')
+            self.toggle_btn.setStyleSheet('border:none; background:transparent; padding:0; margin:0;')
             self.toggle_btn.setMaximumWidth(16)
             self.toggle_btn.clicked.connect(self._on_toggle)
 
@@ -2796,7 +2804,7 @@ class CollapsibleSection(QWidget):
     def _on_toggle(self):
         expanded = self.toggle_btn.isChecked()
         self.content.setVisible(expanded)
-        self.toggle_btn.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle_btn.setIcon(draw_icon('arrow-down' if expanded else 'arrow-right', 12))
 
     def set_expanded(self, expanded):
         if self.toggle_btn is None:

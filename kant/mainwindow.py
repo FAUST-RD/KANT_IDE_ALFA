@@ -234,8 +234,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         shell_layout.setSpacing(0)
         self.title_bar = TitleBar(self)
         shell_layout.addWidget(self.title_bar)
-        # the titlebar owns these widgets (they sit to the right of the "KANT IDE" wordmark now);
-        # keep short aliases so the rest of MainWindow doesn't need to know that
+        # the titlebar owns these widgets (they sit to the right of its menu bar); keep short
+        # aliases so the rest of MainWindow doesn't need to know that
         self.filename_label = self.title_bar.filename_label
         self.syntax_label = self.title_bar.syntax_label
         # its own row, not squeezed into the title bar — that row's essential window chrome
@@ -581,7 +581,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _tree_stylesheet — boxed KANT tree QSS with a theme-aware selection color
     # [FN OPEN] _tree_stylesheet
     def _tree_stylesheet(self):
-        selected_bg = '#1e293b' if self.night_mode else '#fdf3d8'
+        selected_bg = '#1a1a1c' if self.night_mode else '#fdf3d8'
         padding = '2px' if self.view_mode == 'code' and self.compact_kant_view else '6px 4px'
         item_padding = '1px 2px' if self.view_mode == 'code' and self.compact_kant_view else '0px'
         return (
@@ -640,6 +640,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             for tab in self.open_tabs.values():
                 tab.apply_style()
                 self._render_view(tab, tab.filter_uid)
+                # element pages already got their tab label re-styled by _update_element_tab_title
+                # right below — a plain FileTab's own tab-strip label was missing that call, so its
+                # text color (set explicitly in code, not inherited via QSS cascade) went stale on
+                # a theme toggle instead of following BG/TEXT to the new theme
+                self._update_tab_title(tab)
             for page in self._element_pages.values():
                 self._update_element_tab_title(page)
             for btn in self.tabs.tabBar().findChildren(QToolButton):

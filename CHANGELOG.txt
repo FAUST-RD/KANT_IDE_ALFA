@@ -1,5 +1,11 @@
 KANT IDE changelog
 
+2026-07-19 (75)
+- Night mode's background is now true black (`#000000`), not the earlier navy-tinted dark palette — BORDER/hover/disabled shades adjusted to match; KANT tag color-coding (TAG_COLORS/TAG_BACKGROUNDS) deliberately left untouched.
+- Fixed a stale comment in mainwindow.py still describing the removed "KANT IDE" title-bar wordmark as if it were still there.
+- The KANT section fold-arrow ("pin") and open tab labels could stay stuck on the wrong color in night mode: the fold-arrow used `QToolButton.setArrowType`, a native style primitive that doesn't reliably follow this app's stylesheet color on every Qt style — replaced with a theme-aware drawn icon. Tab labels had their text color set explicitly in code (not inherited via QSS) but `_apply_theme` never re-ran that for already-open file tabs on a theme toggle — now it does.
+- Redesigned every plain on/off checkbox (AI pane's "Automatico", new-project's starter-module/git-init checks) as a rounded slider/toggle-switch track instead of the OS's native tick-box, matching the pill-shaped, gold-accent look already used elsewhere.
+
 2026-07-19 (74)
 - Run/Debug buttons in the action toolbar are back to the same size as Save/Undo/Redo/Find in the same row (used to be visibly bigger).
 - Fixed the model/effort selectors' closed-face icon, which could get squeezed out by the (invisible but still layout-reserved) full item text depending on the active Qt style — the old `color:transparent` QSS hack only hid the text's ink, not its footprint. New `IconOnlyCombo` blanks the text at paint time instead, which removes that reserved width at the source regardless of style engine; the dropdown itself is unaffected and still shows full names.

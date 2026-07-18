@@ -842,12 +842,12 @@ class IdeDialogsMixin:
 
         starter_check = QCheckBox('Crea un modulo di esempio con tag KANT')
         starter_check.setChecked(True)
-        starter_check.setStyleSheet(f'color:{theme.TEXT};')
+        starter_check.setStyleSheet(theme.CHECKBOX_STYLE + f'QCheckBox {{ color:{theme.TEXT}; }}')
         body.addWidget(starter_check)
 
         git_check = QCheckBox('Inizializza un repository Git')
         git_check.setChecked(True)
-        git_check.setStyleSheet(f'color:{theme.TEXT};')
+        git_check.setStyleSheet(theme.CHECKBOX_STYLE + f'QCheckBox {{ color:{theme.TEXT}; }}')
         body.addWidget(git_check)
 
         field_label('Anteprima:')

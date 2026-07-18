@@ -54,23 +54,48 @@ QPushButton:pressed {{ background:{ACCENT}; color:#ffffff; }}
 QPushButton:disabled {{ color:{DIM}; border-color:#e2e8f0; background:#f1f5f9; }}
 '''
 
+# every plain on/off checkbox in the app (auto_permissions, the new-project starter/git-init
+# checks) as a rounded slider/toggle-switch track instead of the OS's native tick-box square, to
+# match the pill-shaped, gold-accent language the rest of the chrome already uses. The "thumb" is
+# a hard-stop radial gradient circle near one edge of the pill — QSS has no separate thumb
+# sub-control to position, so this fakes one directly in the indicator's own background.
+CHECKBOX_STYLE = f'''
+QCheckBox {{ spacing:8px; }}
+QCheckBox::indicator {{ width:34px; height:18px; border-radius:9px; border:1px solid {BORDER}; }}
+QCheckBox::indicator:hover {{ border-color:{ACCENT}; }}
+QCheckBox::indicator:unchecked {{
+    background: qradialgradient(cx:0.24, cy:0.5, radius:0.46, fx:0.24, fy:0.5,
+        stop:0 {DIM}, stop:0.6 {DIM}, stop:0.62 {PANEL}, stop:1 {PANEL});
+}}
+QCheckBox::indicator:checked {{
+    border-color:{ACCENT};
+    background: qradialgradient(cx:0.76, cy:0.5, radius:0.46, fx:0.76, fy:0.5,
+        stop:0 #ffffff, stop:0.6 #ffffff, stop:0.62 {ACCENT}, stop:1 {ACCENT});
+}}
+'''
+
 
 def set_theme(night=False):
     global NIGHT, BG, PANEL, BORDER, TEXT, DIM, ACCENT, CODE_BG, HOT, OK, WARN, DANGER
-    global HL_COMMENT, HL_STRING, HL_NUMBER, HL_KEYWORD, APP_STYLE, BUTTON_STYLE
+    global HL_COMMENT, HL_STRING, HL_NUMBER, HL_KEYWORD, APP_STYLE, BUTTON_STYLE, CHECKBOX_STYLE
 
     NIGHT = night
     if night:
-        BG = '#0f172a'; PANEL = '#111827'; BORDER = '#334155'; TEXT = '#e5e7eb'
-        DIM = '#94a3b8'; ACCENT = '#f3bd27'; CODE_BG = '#0b1120'
+        # true black, not the earlier navy-tinted dark palette (#0f172a/#111827/...) — BG is pure
+        # black, PANEL a hair above it for chrome to still read as its own surface, CODE_BG back
+        # down to pure black so the coding/code areas recess the same way CODE_BG already recesses
+        # below PANEL in day mode. KANT tag colors (TAG_COLORS/TAG_BACKGROUNDS/NIGHT_TAG_*) are left
+        # untouched on purpose — only the neutral chrome palette changes here.
+        BG = '#000000'; PANEL = '#0d0d0f'; BORDER = '#2a2a2e'; TEXT = '#e5e7eb'
+        DIM = '#8b93a3'; ACCENT = '#f3bd27'; CODE_BG = '#000000'
         # a lighter, more saturated orange than the day value — needs to read clearly against the
         # dark BG/CODE_BG while staying just as distinct from gold ACCENT (see the top-level HOT
         # comment for why this can't just be a tint of ACCENT)
         HOT = '#fb923c'; OK = '#4ade80'; WARN = '#c084fc'; DANGER = '#f87171'
-        HL_COMMENT = '#94a3b8'; HL_STRING = '#86efac'; HL_NUMBER = '#93c5fd'; HL_KEYWORD = '#f59e0b'
+        HL_COMMENT = '#8b93a3'; HL_STRING = '#86efac'; HL_NUMBER = '#93c5fd'; HL_KEYWORD = '#f59e0b'
         TAG_COLORS.clear(); TAG_COLORS.update(NIGHT_TAG_COLORS)
         TAG_BACKGROUNDS.clear(); TAG_BACKGROUNDS.update(NIGHT_TAG_BACKGROUNDS)
-        hover = '#1e293b'; disabled_border = '#334155'; disabled_bg = '#111827'
+        hover = '#1a1a1c'; disabled_border = '#2a2a2e'; disabled_bg = '#0a0a0c'
     else:
         BG = '#ffffff'; PANEL = '#fbfcff'; BORDER = '#d7dce5'; TEXT = '#111827'
         DIM = '#64748b'; ACCENT = '#f3bd27'; CODE_BG = '#f3f5f9'
@@ -96,6 +121,20 @@ QPushButton {{
 QPushButton:hover {{ background:{hover}; color:{ACCENT}; border-color:{ACCENT}; }}
 QPushButton:pressed {{ background:{ACCENT}; color:#ffffff; }}
 QPushButton:disabled {{ color:{DIM}; border-color:{disabled_border}; background:{disabled_bg}; }}
+'''
+    CHECKBOX_STYLE = f'''
+QCheckBox {{ spacing:8px; }}
+QCheckBox::indicator {{ width:34px; height:18px; border-radius:9px; border:1px solid {BORDER}; }}
+QCheckBox::indicator:hover {{ border-color:{ACCENT}; }}
+QCheckBox::indicator:unchecked {{
+    background: qradialgradient(cx:0.24, cy:0.5, radius:0.46, fx:0.24, fy:0.5,
+        stop:0 {DIM}, stop:0.6 {DIM}, stop:0.62 {PANEL}, stop:1 {PANEL});
+}}
+QCheckBox::indicator:checked {{
+    border-color:{ACCENT};
+    background: qradialgradient(cx:0.76, cy:0.5, radius:0.46, fx:0.76, fy:0.5,
+        stop:0 #ffffff, stop:0.6 #ffffff, stop:0.62 {ACCENT}, stop:1 {ACCENT});
+}}
 '''
 
 
