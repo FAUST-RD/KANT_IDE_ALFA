@@ -23,7 +23,7 @@ import shiboken6
 
 from PySide6.QtCore import QFileSystemWatcher, QPoint, QPointF, Qt, QSettings, QSize, Signal, QTimer
 from PySide6.QtGui import (
-    QColor, QFont, QKeySequence, QMouseEvent, QShortcut, QTextCursor, QTextDocument,
+    QColor, QFont, QKeySequence, QMouseEvent, QPainter, QShortcut, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -57,7 +57,7 @@ from kant.pyenv import (
 from kant.workspace import ROLE_PATH, WorkspaceMixin, discard_snapshot, rollback_snapshot
 from kant.widgets import (
     CodeEdit, TerminalPane, ClaudePane, CollapsibleSection, LeafSection,
-    ProjectTree, make_app_icon, make_app_pixmap, RecentFolderCard, TitleBar, FileTab,
+    ProjectTree, ScanlineOverlay, make_app_icon, make_app_pixmap, RecentFolderCard, TitleBar, FileTab,
     MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS, _tag_header_html, _markdown_to_html,
     set_vim_mode, vim_mode_enabled, show_code_hover_popup, hide_code_hover_popup,
 )
@@ -252,6 +252,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._set_project_chrome_visible(False)
         self.size_grip = QSizeGrip(self.shell)
         self.size_grip.setFixedSize(18, 18)
+        # app-wide, not tied to any one panel's particular shade of light background — see
+        # ScanlineOverlay's own comment for why this can't just be a QSS background-image
+        self.scanline_overlay = ScanlineOverlay(self.shell)
+        self.scanline_overlay.resize(self.shell.size())
+        self.scanline_overlay.raise_()
 
         self.setStyleSheet(theme.APP_STYLE)
         saved_geometry = self.settings.value('windowGeometry')
@@ -428,6 +433,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if hasattr(self, 'size_grip'):
             self.size_grip.move(self.width() - 22, self.height() - 22)
             self.size_grip.raise_()
+        if hasattr(self, 'scanline_overlay'):
+            self.scanline_overlay.resize(self.shell.size())
+            self.scanline_overlay.raise_()
         self._position_map_tab()
         self._position_claude_tab()
         self._position_map_dialog()
@@ -1981,7 +1989,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.map_dialog.resized.connect(self._position_map_tab)
         self.map_dialog.apply_style()
         project_name = os.path.basename(self.project_root_path) if self.project_root_path else ''
-        self.map_dialog.set_graph(self._get_xref(), project_name, self.project_root_path or '')
+        # the very first open of a project whose xref graph hasn't finished its background build
+        # yet (_get_xref returns {} and schedules the build) shows a spinner instead of an
+        # unexplained empty graph; _schedule_xref_build's own apply() callback re-calls set_graph
+        # with the real data (and no loading flag) once the build actually completes
+        still_building = self._xref_cache is None
+        self.map_dialog.set_graph(self._get_xref(), project_name, self.project_root_path or '', loading=still_building)
         self.map_dialog.show()
         self._position_map_dialog()
         self.map_dialog.raise_()

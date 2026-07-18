@@ -1,5 +1,12 @@
 KANT IDE changelog
 
+2026-07-19 (70)
+- Fixed a real regression from entry 69's effort color-coding: the model/effort selectors' closed face was already `color:transparent` by design (icon-only, full value only in the tooltip) — reported unreadable a second time, so this drops the fragile icon-only design entirely. Both now show real, always-visible text (same combo style already used by the working agent selector) plus a small leading icon; effort's icon stays colored per level.
+- Removed the "KANT IDE / STRUCTURAL CODE ARCHIVE" title-bar wordmark to reclaim vertical space; the row is now 38px instead of 54px.
+- File/Cerca/Aspetto/LSP/Git dropdown menu items are noticeably bulkier now (more padding, larger font) instead of Qt's cramped single-line default rows, and unavailable items now visibly gray out (`QMenu::item:disabled`) instead of just silently stopping the click — styling `QMenu::item` at all suppresses Qt's own built-in disabled dimming unless it's redeclared.
+- MAPPA shows a small rotating loading spinner over the graph the first time it's opened on a project whose xref build hasn't finished yet, instead of an unexplained empty graph.
+- The CRT-scanline effect (entry 69) is now a single transparent overlay covering the entire app shell, day mode only, instead of one specific panel's background color — it no longer matters which shade of light background sits underneath since it's not tied to any one panel's fill anymore.
+
 2026-07-19 (69)
 - Effort selector now color-codes each level (green low, gold medium, orange high, red xhigh/max, purple ultracode/ultra) instead of one flat icon for every level — the combo's closed face always shows its current item's own icon, so the selected effort reads at a glance.
 - The "+ Aggiungi un elemento" card at the bottom of the whole-file KANT outline now sits behind a clear divider line instead of a bare top margin, so it doesn't read as attached to whatever leaf element happens to be the last one rendered above it.

@@ -1253,6 +1253,48 @@ class EdgeFlowPopup(QFrame):
 # neighbours, an "isolate selected" mode, expand/collapse-all, and zoom/fit. Owns the full graph and
 # recomputes the displayed (filtered + collapsed) node set on every change; the view only renders
 # that. Double-clicking a leaf node emits nodeActivated so the main window can open it in the editor.
+# [FN CATEGORY] _LoadingSpinner — a small rotating arc shown over the graph view while the very
+# first xref build for a project is still running in the background (_get_xref returns {} and
+# schedules the build the moment MAPPA is opened before any graph has ever been computed) — without
+# it, that first open just showed an empty graph with no indication anything was happening.
+# [FN] _LoadingSpinner — QWidget that paints a rotating accent-colored arc while started
+# [FN OPEN] _LoadingSpinner
+class _LoadingSpinner(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self.setFixedSize(32, 32)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.hide()
+
+    def _tick(self):
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def start(self):
+        self._angle = 0
+        self._timer.start(80)
+        self.show()
+        self.raise_()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor(theme.ACCENT))
+        pen.setWidth(3)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        rect = self.rect().adjusted(4, 4, -4, -4)
+        painter.drawArc(rect, self._angle * 16, 110 * 16)
+# [FN CLOSED] _LoadingSpinner
+
+
 # [FN] XrefMapDialog — filterable, searchable, collapsible cross-reference map dialog
 # [FN OPEN] XrefMapDialog
 class XrefMapDialog(QDialog):
@@ -1334,6 +1376,9 @@ class XrefMapDialog(QDialog):
         self.drill_title_card.setMaximumWidth(320)
         self.drill_title_card.hide()
         self.resized.connect(self._position_drill_title_card)
+
+        self.loading_spinner = _LoadingSpinner(self)
+        self.resized.connect(self._position_loading_spinner)
 
     def _build_toolbar(self):
         bar = QWidget()
@@ -1574,9 +1619,18 @@ class XrefMapDialog(QDialog):
             self.move(geo.topLeft())
             self._positioned = True
 
-    # [FN] set_graph — loads a fresh full graph and renders it (keeping the user's filter state)
+    # [FN] set_graph — loads a fresh full graph and renders it (keeping the user's filter state).
+    # loading=True (the very first open of a project whose xref hasn't finished building yet — see
+    # MainWindow._open_xref_window) shows the spinner over whatever's rendered instead of leaving an
+    # empty graph with no explanation; any later call (real data, even a legitimately empty project)
+    # implicitly clears it.
     # [FN OPEN] set_graph
-    def set_graph(self, elements, project_name='', project_path=''):
+    def set_graph(self, elements, project_name='', project_path='', loading=False):
+        if loading:
+            self._position_loading_spinner()
+            self.loading_spinner.start()
+        else:
+            self.loading_spinner.stop()
         position_key = _position_settings_key(project_path, project_name)
         new_project = position_key != self._position_key
         if position_key != self._position_key:
@@ -1911,6 +1965,12 @@ class XrefMapDialog(QDialog):
         y = view_geo.top() + 20
         self.drill_title_card.move(x, y)
         self.drill_title_card.raise_()
+
+    def _position_loading_spinner(self):
+        view_geo = self.view.geometry()
+        x = view_geo.center().x() - self.loading_spinner.width() // 2
+        y = view_geo.center().y() - self.loading_spinner.height() // 2
+        self.loading_spinner.move(x, y)
 
     # [FN CATEGORY] _add_common_origin_anchors — a filter/collapse can remove an element's own
     # parent from the displayed set while leaving several of its siblings visible; without this

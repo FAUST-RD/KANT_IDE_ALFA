@@ -1455,24 +1455,30 @@ class _PromptEdit(QPlainTextEdit):
 # [FN CLOSED] _PromptEdit
 
 
-# [FN CATEGORY] _ScanlineWidget — a very faint repeating horizontal-line texture painted over the
-# widget's own background, evoking old CRT scanlines. Direct QPainter drawing rather than a QSS
-# background-image: PySide6's QSS engine doesn't alpha-composite a semi-transparent background-image
-# over a background-color at all (confirmed empirically — a fully opaque tile renders, anything with
-# transparency silently doesn't), so a real paintEvent is the only reliable way to get a subtle
-# overlay instead of an all-or-nothing one. Day mode only; a CRT glow has no business in a dark room.
-# [FN] _ScanlineWidget — QWidget subclass that paints faint scanlines after its normal contents
-# [FN OPEN] _ScanlineWidget
-class _ScanlineWidget(QWidget):
+# [FN CATEGORY] ScanlineOverlay — a very faint repeating horizontal-line texture (old CRT look)
+# painted over EVERYTHING underneath, app-wide, instead of picking one specific panel's background
+# color to match — a transparent, click-through, always-on-top sibling covering the whole shell, not
+# a per-widget background. Direct QPainter drawing rather than a QSS background-image: PySide6's QSS
+# engine doesn't alpha-composite a semi-transparent background-image over background-color at all
+# (confirmed empirically — a fully opaque test tile rendered, anything with transparency silently
+# didn't), so a real paintEvent is the only reliable way to get a subtle overlay instead of an
+# all-or-nothing one. Day mode only; a CRT glow has no business in a dark room.
+# [FN] ScanlineOverlay — QWidget that paints faint scanlines over whatever sits beneath it
+# [FN OPEN] ScanlineOverlay
+class ScanlineOverlay(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+
     def paintEvent(self, event):
-        super().paintEvent(event)
         if theme.NIGHT:
             return
         painter = QPainter(self)
         painter.setPen(QColor(0, 0, 0, 12))
         for y in range(0, self.height(), 2):
             painter.drawLine(0, y, self.width(), y)
-# [FN CLOSED] _ScanlineWidget
+# [FN CLOSED] ScanlineOverlay
 
 
 class ClaudePane(QWidget):
@@ -1547,15 +1553,15 @@ class ClaudePane(QWidget):
         self.model_select.setToolTip("Modello per l'agente selezionato")
         self.model_select.addItems(CLAUDE_MODELS)
         self.model_select.setCursor(Qt.PointingHandCursor)
-        self.model_select.setIconSize(QSize(18, 18))
-        self.model_select.setFixedWidth(44)
+        self.model_select.setIconSize(QSize(14, 14))
+        self.model_select.setMinimumWidth(118)
         header.addWidget(self.model_select)
         self.effort_select = QComboBox()
         self.effort_select.setToolTip("Reasoning effort per l'agente selezionato")
         self.effort_select.addItems(EFFORT_LEVELS['claude'])
         self.effort_select.setCursor(Qt.PointingHandCursor)
-        self.effort_select.setIconSize(QSize(18, 18))
-        self.effort_select.setFixedWidth(44)
+        self.effort_select.setIconSize(QSize(14, 14))
+        self.effort_select.setMinimumWidth(88)
         header.addWidget(self.effort_select)
         header.addStretch(1)
         self.auto_permissions = QCheckBox('Automatico')
@@ -1591,7 +1597,7 @@ class ClaudePane(QWidget):
         self.output = QScrollArea()
         self.output.setWidgetResizable(True)
         self.output.setFrameShape(QFrame.NoFrame)
-        self.chat = _ScanlineWidget()
+        self.chat = QWidget()
         self.chat_layout = QVBoxLayout(self.chat)
         self.chat_layout.setContentsMargins(6, 10, 6, 10)
         self.chat_layout.setSpacing(10)
@@ -1684,16 +1690,11 @@ class ClaudePane(QWidget):
             f'QComboBox::drop-down {{ border:none; width:16px; }}'
         )
         self.agent_select.setStyleSheet(combo_style)
-        icon_combo_style = (
-            f'QComboBox {{ background:{theme.PANEL}; color:transparent; border:1px solid {theme.BORDER}; '
-            f'border-radius:8px; padding:4px 15px 4px 5px; }} '
-            f'QComboBox:hover {{ border-color:{theme.ACCENT}; }} '
-            f'QComboBox::drop-down {{ border:none; width:14px; }} '
-            f'QComboBox QAbstractItemView {{ background:{theme.PANEL}; color:{theme.TEXT}; '
-            f'border:1px solid {theme.BORDER}; selection-background-color:{theme.CODE_BG}; }}'
-        )
-        self.model_select.setStyleSheet(icon_combo_style)
-        self.effort_select.setStyleSheet(icon_combo_style)
+        # model/effort used to be icon-only faces (color:transparent, full value only in the
+        # tooltip/dropdown) — real text is more reliable than an icon nobody can read the meaning
+        # of at a glance, and removes an entire class of "why can't I see what's selected" reports
+        self.model_select.setStyleSheet(combo_style)
+        self.effort_select.setStyleSheet(combo_style)
         self.auto_permissions.setStyleSheet(f'color:{theme.ACCENT}; font-weight:600; spacing:6px;')
         self.global_mode_btn.setStyleSheet(
             theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
@@ -1764,21 +1765,21 @@ class ClaudePane(QWidget):
         }.get(level, theme.DIM)
     # [FN CLOSED] _effort_color
 
-    # [FN CATEGORY] _refresh_selector_icons — model and effort remain native, fully clickable combo
-    # boxes, but their compact face is an SVG; the full selected value stays in the tooltip/menu.
-    # Effort additionally gets a per-item colored icon (_effort_color) instead of one fixed color for
-    # every level — the combo's closed face always shows its current item's own icon, so this alone
-    # makes the selected effort level readable by color without opening the dropdown.
+    # [FN CATEGORY] _refresh_selector_icons — model and effort show their real text now (see
+    # apply_style), plus a small leading icon for a quick visual anchor. Effort's icon is
+    # additionally colored per level (_effort_color) instead of one fixed color for every level — the
+    # combo's closed face always shows its current item's own icon, so the color alone signals the
+    # selected effort even before reading the text next to it.
     # [FN] _refresh_selector_icons — refreshes AI selector icons and selected-value tooltips
     # [FN OPEN] _refresh_selector_icons
     def _refresh_selector_icons(self):
-        model_icon = draw_icon('model', 18)
+        model_icon = draw_icon('model', 14)
         for index in range(self.model_select.count()):
             self.model_select.setItemIcon(index, model_icon)
         self.model_select.setToolTip(f'Modello: {self.model_select.currentText()}')
         for index in range(self.effort_select.count()):
             level = self.effort_select.itemText(index).strip()
-            self.effort_select.setItemIcon(index, draw_icon('effort', 18, self._effort_color(level)))
+            self.effort_select.setItemIcon(index, draw_icon('effort', 14, self._effort_color(level)))
         self.effort_select.setToolTip(f'Effort: {self.effort_select.currentText()}')
     # [FN CLOSED] _refresh_selector_icons
 
@@ -2911,7 +2912,9 @@ class TitleBar(QWidget):
         super().__init__()
         self.window = window
         self.drag_offset = None
-        self.setFixedHeight(54)
+        # no more stacked "KANT IDE / STRUCTURAL CODE ARCHIVE" title box (branding text on request,
+        # to reclaim vertical space) — the row only needs to fit back_btn/menu_bar/labels now
+        self.setFixedHeight(38)
         # a bare QWidget doesn't paint stylesheet background/border at all unless this is set —
         # the border-bottom below (meant to separate the title bar from the panels underneath)
         # was silently never rendering
@@ -2919,29 +2922,16 @@ class TitleBar(QWidget):
         self.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 5, 8, 5)
+        layout.setContentsMargins(14, 4, 8, 4)
         layout.setSpacing(12)
 
         self.back_btn = QPushButton('')
         self.back_btn.setIcon(draw_icon('home', 16))
         self.back_btn.setIconSize(QSize(16, 16))
-        self.back_btn.setFixedSize(32, 28)
+        self.back_btn.setFixedSize(30, 26)
         self.back_btn.setToolTip('Torna al menu iniziale')
         self.back_btn.clicked.connect(window._go_back_to_welcome)
         layout.addWidget(self.back_btn)
-
-        title_box = QVBoxLayout()
-        title_box.setContentsMargins(0, 0, 0, 0)
-        title_box.setSpacing(0)
-        title = QLabel('KANT IDE')
-        title.setFont(QFont('Consolas', 16, QFont.DemiBold))
-        title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:4px;')
-        subtitle = QLabel('STRUCTURAL CODE ARCHIVE')
-        subtitle.setFont(QFont('Consolas', 8))
-        subtitle.setStyleSheet(f'color:{theme.DIM}; letter-spacing:1px;')
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        layout.addLayout(title_box)
 
         # a real QMenuBar (flat text entries, no button chrome) instead of QToolButtons each
         # popping their own QMenu — this window is frameless/custom-drawn, so there's no OS menu
@@ -3106,13 +3096,25 @@ class TitleBar(QWidget):
         self.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
         self.back_btn.setIcon(draw_icon('home', 16))
         self.theme_menu_action.setText('Giorno' if self.window.night_mode else 'Notte')
-        # flat text entries (no button chrome/border) — a real menu bar, not a row of buttons
+        # flat text entries (no button chrome/border) — a real menu bar, not a row of buttons.
+        # QMenu (the dropdown itself) gets its own rule too: unstyled, its items default to Qt's
+        # native cramped single-line rows — bumped up here on request ("più corpose"), with an
+        # explicit :disabled rule since styling QMenu::item at all suppresses Qt's own built-in
+        # disabled dimming unless it's redeclared — a plain setEnabled(False) used to just stop the
+        # click from doing anything, with no clear color change to actually show it was unavailable.
         self.menu_bar.setStyleSheet(
             f'QMenuBar {{ background:transparent; border:none; spacing:4px; }} '
             f'QMenuBar::item {{ background:transparent; color:{theme.TEXT}; padding:6px 10px; '
             f'border-radius:6px; font-weight:600; }} '
             f'QMenuBar::item:selected {{ background:{theme.CODE_BG}; color:{theme.ACCENT}; }} '
-            f'QMenuBar::item:pressed {{ background:{theme.ACCENT}; color:#ffffff; }}'
+            f'QMenuBar::item:pressed {{ background:{theme.ACCENT}; color:#ffffff; }} '
+            f'QMenu {{ background:{theme.PANEL}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
+            f'border-radius:8px; padding:4px; }} '
+            f'QMenu::item {{ background:transparent; padding:8px 24px 8px 14px; border-radius:6px; '
+            f'font-size:{theme.CODE_FONT_PT}pt; }} '
+            f'QMenu::item:selected {{ background:{theme.CODE_BG}; color:{theme.ACCENT}; }} '
+            f'QMenu::item:disabled {{ color:{theme.DIM}; }} '
+            f'QMenu::separator {{ height:1px; background:{theme.BORDER}; margin:4px 8px; }}'
         )
         tool_button_style = theme.BUTTON_STYLE.replace('QPushButton', 'QToolButton')
         # back_btn is icon-only now — theme.BUTTON_STYLE's 7px/13px padding (sized for a text

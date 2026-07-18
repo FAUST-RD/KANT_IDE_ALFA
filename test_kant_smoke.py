@@ -248,8 +248,17 @@ class KantSmokeTest(unittest.TestCase):
         pane = window.claude_pane
         pane.set_agent('claude')
         assert not pane.model_select.isEditable() and not pane.effort_select.isEditable()
-        assert pane.model_select.width() == 44 and pane.effort_select.width() == 44
+        # regression: these used to be icon-only faces (fixed 44px, color:transparent) with the
+        # selected value shown only in the tooltip — real, always-visible text now, wide enough to
+        # actually show it, since the icon-only design was reported unreadable more than once
+        assert pane.model_select.minimumWidth() >= 100 and pane.effort_select.minimumWidth() >= 70
+        assert 'transparent' not in pane.model_select.styleSheet()
+        assert 'transparent' not in pane.effort_select.styleSheet()
         assert not pane.model_select.itemIcon(0).isNull() and not pane.effort_select.itemIcon(0).isNull()
+        # effort's icon is colored per level, not the same icon/color for every entry
+        low_icon = pane.effort_select.itemIcon(pane.effort_select.findText('low')).pixmap(14, 14).toImage()
+        max_icon = pane.effort_select.itemIcon(pane.effort_select.findText('max')).pixmap(14, 14).toImage()
+        assert low_icon.pixelColor(7, 7) != max_icon.pixelColor(7, 7)
         assert pane.attach_btn.text() == '' and not pane.attach_btn.icon().isNull()
         assert 'analizza il codice' in pane.prompt.placeholderText()
         # effort options sync per agent, same shape as the existing model selector
@@ -1591,6 +1600,27 @@ class KantSmokeTest(unittest.TestCase):
             assert len(expand_dialog._display) == 2  # double-click again re-expands it
             expand_dialog.close()
             QSettings('KANT', 'KANT Editor').remove(expand_dialog._position_key)
+
+    def test_xref_map_loading_spinner_shows_until_real_data_arrives(self):
+        # regression: opening MAPPA before its background xref build ever finished used to just
+        # show an empty graph with no explanation — set_graph(loading=True) now shows a spinner
+        # instead, and any later call (real data) implicitly clears it
+        with _temp_dir() as tmp:
+            app = self.app
+            dialog = XrefMapDialog()
+            dialog.resize(700, 500)
+            dialog.show()
+            app.processEvents()
+            assert not dialog.loading_spinner.isVisible()
+            dialog.set_graph({}, 'loading-project', str(Path(tmp) / 'loading-project'), loading=True)
+            app.processEvents()
+            assert dialog.loading_spinner.isVisible()
+            module_graph = {'m': XrefElement('m', 'm', 'MOD', 'm.py', 'Modulo', 'm.py', 0)}
+            dialog.set_graph(module_graph, 'loading-project', str(Path(tmp) / 'loading-project'))
+            app.processEvents()
+            assert not dialog.loading_spinner.isVisible()
+            dialog.close()
+            QSettings('KANT', 'KANT Editor').remove(dialog._position_key)
 
     def test_xref_map_module_edges_aggregate_but_hidden_by_default(self):
         with _temp_dir() as tmp:
