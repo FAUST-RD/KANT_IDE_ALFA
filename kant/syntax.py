@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from xml.etree import ElementTree
 
-from kant.model import Node, parse_kant, KantParseError
+from kant.model import CATEGORY_RE, TAGLINE_RE, Node, Run, _short_desc, parse_kant, KantParseError
 
 
 # [CST] KEYWORDS — cross-language keyword set for the lightweight syntax highlighter below
@@ -97,11 +97,37 @@ def _quote_arg(arg):
     return f'"{arg}"' if os.name == 'nt' else shlex.quote(arg)
 
 
+# [FN CATEGORY] find_duplicate_uid — walks a parsed tree looking for the first #id reused by two
+# different nodes; shared by check_kant_markers (live check) and audit_kant_headers (full project
+# validation) so the reused-id detection logic exists in exactly one place.
+# [FN] find_duplicate_uid — first Node whose #id was already seen elsewhere in the tree, or None
+# [FN OPEN] find_duplicate_uid
+def find_duplicate_uid(tree):
+    seen = set()
+
+    def walk(node):
+        for item in node.body:
+            if isinstance(item, Node):
+                if item.uid in seen:
+                    return item
+                seen.add(item.uid)
+                dupe = walk(item)
+                if dupe is not None:
+                    return dupe
+        return None
+
+    return walk(tree)
+# [FN CLOSED] find_duplicate_uid
+
+
 # [FN CATEGORY] check_kant_markers — re-parses the file's current (possibly just-edited) text with
 # parse_kant, which already enforces strict OPEN/CLOSED nesting and #id matching and raises
 # KantParseError on any mismatch; on top of that this only needs to add the one check parse_kant
 # can't do on its own — #id uniqueness across the whole file, since two non-overlapping OPEN/CLOSED
-# pairs elsewhere in the same file could reuse an id without ever tripping the stack-matching check
+# pairs elsewhere in the same file could reuse an id without ever tripping the stack-matching check.
+# Deliberately cheap and single-verdict (first problem found, stop) — this runs on every keystroke's
+# live syntax check (see check_file_syntax); the fuller multi-issue audit is audit_kant_headers below,
+# run only from the background full-project validation.
 # [FN] check_kant_markers — validates KANT marker nesting and #id uniqueness for one file's text
 # [FN OPEN] check_kant_markers
 def check_kant_markers(text):
@@ -110,24 +136,153 @@ def check_kant_markers(text):
     except KantParseError as e:
         return {'ok': False, 'line': e.line, 'message': e.message}
 
-    seen = set()
-
-    def find_dupe(node):
-        for item in node.body:
-            if isinstance(item, Node):
-                if item.uid in seen:
-                    return item
-                seen.add(item.uid)
-                dupe = find_dupe(item)
-                if dupe is not None:
-                    return dupe
-        return None
-
-    dupe = find_dupe(tree)
+    dupe = find_duplicate_uid(tree)
     if dupe is not None:
-        return {'ok': False, 'line': 1, 'message': f'#id duplicato nel file: #{dupe.uid} ({dupe.tag} {dupe.name})'}
+        line = dupe.open_line or 1
+        return {'ok': False, 'line': line, 'message': f'#id duplicato nel file: #{dupe.uid} ({dupe.tag} {dupe.name})'}
     return {'ok': True, 'message': 'Marcatori KANT OK'}
 # [FN CLOSED] check_kant_markers
+
+
+# [CST] _HEADER_NAME_SEPARATORS — same separators _short_desc (kant/model.py) already uses to split
+# a CATEGORY/tagline's "Name — description" text; reused here so audit_kant_headers extracts the
+# "name" portion the identical way the rest of the codebase already defines it, not a new heuristic.
+_HEADER_NAME_SEPARATORS = (' — ', ' - ', ' -- ', ': ')
+
+
+def _header_name_part(text):
+    text = (text or '').strip()
+    for sep in _HEADER_NAME_SEPARATORS:
+        if sep in text:
+            return text.split(sep, 1)[0].strip()
+    if text.startswith(('—', '-')):
+        return ''
+    for sep in _HEADER_NAME_SEPARATORS:
+        # trailing separator with no description after it ("Name —") — sep itself never matches as
+        # an infix above since there's nothing past it to form the closing space, but the name part
+        # is still recoverable by stripping the separator's own (unspaced) marker off the end
+        marker = sep.strip()
+        if text.endswith(marker):
+            return text[:-len(marker)].strip()
+    return text
+
+
+# [FN CATEGORY] audit_kant_headers — the fuller, multi-issue counterpart to check_kant_markers: walks
+# the whole parsed tree (not just the first problem) and separates hard errors (nesting/pair/#id
+# problems already caught by parse_kant plus header/tag/name coherence and orphaned pending headers)
+# from warnings (missing/empty headers, over-length taglines, tag outside the fixed 8-tag set,
+# unconfirmed marker-to-declaration linkage). Only ever called from the background full-project
+# validation (kant/projectops.py:validate_kant_project) — never from the live per-keystroke path,
+# which stays on the cheaper single-verdict check_kant_markers above.
+# [FN] audit_kant_headers — full error/warning audit of one file's KANT markers
+# [FN OPEN] audit_kant_headers
+_FIXED_TAGS = {'MOD', 'CFG', 'CLS', 'TYP', 'FN', 'CST', 'VAR', 'TST'}
+# same per-name declaration templates kant/projectops.py:definition_locations already uses to find a
+# symbol's definition — reused here (formatted with the escaped element name) instead of a new set
+_DECLARATION_TEMPLATES = [
+    r'\b(?:async\s+def|def|class)\s+{name}\b',
+    r'\bfunction\s+{name}\b',
+    r'\b(?:const|let|var|type|interface|enum|struct|fn)\s+{name}\b',
+    r'^\s*{name}\s*[:=]',
+]
+
+
+def audit_kant_headers(text):
+    try:
+        tree = parse_kant(text)
+    except KantParseError as e:
+        return {'errors': [{'line': e.line, 'message': e.message, 'tag': None, 'name': None}], 'warnings': []}
+
+    errors, warnings = [], []
+
+    dupe = find_duplicate_uid(tree)
+    if dupe is not None:
+        errors.append({
+            'line': dupe.open_line or 1, 'tag': dupe.tag, 'name': dupe.name,
+            'message': f'#id duplicato nel file: #{dupe.uid} ({dupe.tag} {dupe.name})',
+        })
+
+    for line_no, tag, kind in tree.orphaned:
+        marker = f'[{tag} CATEGORY]' if kind == 'category' else f'[{tag}]'
+        errors.append({
+            'line': line_no, 'tag': tag, 'name': None,
+            'message': f'intestazione {marker} pendente, non associata a un OPEN successivo',
+        })
+
+    def walk(node):
+        for item in node.body:
+            if not isinstance(item, Node):
+                continue
+            if item.category_raw:
+                m = CATEGORY_RE.match(item.category_raw)
+                cat_tag, cat_text = (m.group(1), m.group(2)) if m else (None, '')
+                if cat_tag is not None and cat_tag != item.tag:
+                    errors.append({
+                        'line': item.category_line, 'tag': item.tag, 'name': item.name,
+                        'message': f'tag CATEGORY ({cat_tag}) incoerente con OPEN ({item.tag})',
+                    })
+                elif _header_name_part(cat_text) not in (item.name, ''):
+                    errors.append({
+                        'line': item.category_line, 'tag': item.tag, 'name': item.name,
+                        'message': f'nome in CATEGORY ("{_header_name_part(cat_text)}") incoerente con OPEN ("{item.name}")',
+                    })
+            else:
+                warnings.append({'line': item.open_line, 'tag': item.tag, 'name': item.name, 'message': 'CATEGORY mancante'})
+            if item.tag_raw:
+                m = TAGLINE_RE.match(item.tag_raw)
+                tl_tag, tl_text = (m.group(1), m.group(3)) if m else (None, '')
+                if tl_tag is not None and tl_tag != item.tag:
+                    errors.append({
+                        'line': item.tagline_line, 'tag': item.tag, 'name': item.name,
+                        'message': f'tag riga descrittiva ({tl_tag}) incoerente con OPEN ({item.tag})',
+                    })
+                elif _header_name_part(tl_text) not in (item.name, ''):
+                    errors.append({
+                        'line': item.tagline_line, 'tag': item.tag, 'name': item.name,
+                        'message': f'nome nella riga descrittiva incoerente con OPEN ("{item.name}")',
+                    })
+                else:
+                    # tl_text is known to start with item.name (or have no name prefix at all) at
+                    # this point — strip that known prefix plus one separator to get the actual
+                    # description, rather than _short_desc's generic search (which can't tell "name
+                    # followed by a separator and nothing else" from "no separator present at all")
+                    remainder = tl_text[len(item.name):].strip() if tl_text.startswith(item.name) else tl_text
+                    for sep in _HEADER_NAME_SEPARATORS:
+                        if remainder.startswith(sep.strip()):
+                            remainder = remainder[len(sep.strip()):].strip()
+                            break
+                    desc = remainder
+                    if not desc:
+                        warnings.append({'line': item.tagline_line, 'tag': item.tag, 'name': item.name, 'message': 'tagline vuota'})
+                    elif len(desc.split()) > 8:
+                        warnings.append({
+                            'line': item.tagline_line, 'tag': item.tag, 'name': item.name,
+                            'message': 'descrizione oltre le 8 parole previste dalla convenzione',
+                        })
+            else:
+                warnings.append({'line': item.open_line, 'tag': item.tag, 'name': item.name, 'message': 'tagline mancante'})
+            if item.tag not in _FIXED_TAGS:
+                warnings.append({
+                    'line': item.open_line, 'tag': item.tag, 'name': item.name,
+                    'message': f'tag "{item.tag}" non appartiene all\'insieme previsto (MOD/CFG/CLS/TYP/FN/CST/VAR/TST)',
+                })
+            first_code_line = next(
+                (ln for run in item.body if isinstance(run, Run) for ln in run.lines if ln.strip()), None,
+            )
+            if first_code_line is not None:
+                escaped = re.escape(item.name)
+                linked = any(re.search(template.format(name=escaped), first_code_line)
+                             for template in _DECLARATION_TEMPLATES)
+                if not linked:
+                    warnings.append({
+                        'line': item.open_line, 'tag': item.tag, 'name': item.name,
+                        'message': 'impossibile confermare il collegamento del marker alla dichiarazione — verifica manuale',
+                    })
+            walk(item)
+
+    walk(tree)
+    return {'errors': errors, 'warnings': warnings}
+# [FN CLOSED] audit_kant_headers
 
 
 # ponytail: broad syntax support is delegated to compilers already on PATH; unknown or missing tools

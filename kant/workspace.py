@@ -18,7 +18,10 @@ from PySide6.QtWidgets import QGraphicsColorizeEffect
 
 from kant import theme
 from kant.fileio import file_fingerprint, is_safe_child_name, write_bytes_atomic, write_file_atomic
-from kant.model import KantParseError, parse_kant
+from kant.groupings import migrate_member_paths
+from kant.mappa import migrate_position_keys
+from kant.model import KantParseError, parse_kant, serialize_kant
+from kant.projectops import validate_kant_project
 
 
 ROLE_PATH = Qt.UserRole + 1
@@ -152,13 +155,16 @@ def render_review_text(item, accepted_hunks):
 
 
 def apply_ai_review(root, review, accepted, manual_text=None):
-    """Keep only accepted AI hunks, using edited final text where the reviewer supplied it."""
+    """Keep only accepted AI hunks, using edited final text where the reviewer supplied it. Returns
+    the rel-paths that survive the apply as non-binary text (still exist, not binary) — the input
+    normalize_missing_ids needs to know which files it may touch."""
     manual_text = manual_text or {}
     for item in review:
         target = safe_project_path(root, item['path'])
         current = Path(target).read_bytes() if os.path.isfile(target) else None
         if current != item['new']:
             raise OSError(f"{item['path']} e cambiato durante la revisione; nessuna scelta applicata")
+    kept = []
     for item in review:
         rel = item['path']
         selected = set(accepted.get(rel, ()))
@@ -181,6 +187,61 @@ def apply_ai_review(root, review, accepted, manual_text=None):
         else:
             os.makedirs(os.path.dirname(target), exist_ok=True)
             write_bytes_atomic(target, result)
+            if not item['binary']:
+                kept.append(rel)
+    return kept
+
+
+# [FN CATEGORY] normalize_missing_ids — after an accepted AI review, stamp missing #ids into the
+# kept files so a later reparse doesn't mint a fresh one every time (kant/model.py's _assign_uids
+# mints in-memory only; it's serialize_kant's write-back that makes an id stick). Deliberately scoped
+# to exactly the paths the caller passes in (apply_ai_review's own `kept` return value) — never all
+# legacy files project-wide, and never anything the review rejected or a rollback restored.
+# [FN] normalize_missing_ids — persists missing #ids for the given rel-paths; reports what happened
+# [FN OPEN] normalize_missing_ids
+def normalize_missing_ids(root, paths):
+    normalized, skipped = [], []
+    for rel in paths:
+        try:
+            target = safe_project_path(root, rel)
+        except ValueError:
+            skipped.append((rel, 'percorso fuori dal progetto'))
+            continue
+        if not os.path.isfile(target):
+            skipped.append((rel, 'file non piu presente'))
+            continue
+        try:
+            original = Path(target).read_bytes()
+        except OSError as error:
+            skipped.append((rel, f'lettura fallita: {error}'))
+            continue
+        fingerprint_before = file_fingerprint(target)
+        try:
+            text = original.decode('utf-8')
+        except UnicodeDecodeError:
+            skipped.append((rel, 'file binario'))
+            continue
+        newline = '\r\n' if '\r\n' in text else '\n'
+        normalized_text = text.replace('\r\n', '\n')
+        try:
+            tree = parse_kant(normalized_text)
+        except KantParseError:
+            skipped.append((rel, 'marker non validi'))
+            continue
+        serialized = serialize_kant(tree)
+        if serialized == normalized_text:
+            continue  # no id was missing — nothing to normalize, not a skip either
+        if file_fingerprint(target) != fingerprint_before:
+            skipped.append((rel, 'modificato esternamente durante la normalizzazione'))
+            continue
+        try:
+            write_bytes_atomic(target, serialized.replace('\n', newline).encode('utf-8'))
+        except OSError as error:
+            skipped.append((rel, f'scrittura fallita: {error}'))
+            continue
+        normalized.append(rel)
+    return normalized, skipped
+# [FN CLOSED] normalize_missing_ids
 
 
 def rollback_snapshot(root, snapshot, ignored=()):
@@ -367,17 +428,6 @@ class WorkspaceMixin:
         self._check_kant_map(self.project_root_path)
         self._watch_project_tree()
 
-    def _refresh_and_validate_after_ai(self):
-        if self._closing:
-            return
-        self._refresh_after_fs_change()
-        if not getattr(self.claude_pane, 'validate_after_finish', False):
-            return
-        self.claude_pane.validate_after_finish = False
-        result = self._validate_kant_project()
-        if result:
-            self.claude_pane.write_info('\n' + result + '\n')
-
     def _prepare_ai_snapshot(self):
         if not self.project_root_path or not self._flush_all_tabs():
             return False
@@ -439,20 +489,33 @@ class WorkspaceMixin:
             discard_snapshot(snapshot)
             self._ai_snapshot = None
             self._clear_ai_snapshot_marker()
+            # nothing to accept/reject — no review is pending, so it's safe to do the definitive
+            # refresh right away instead of waiting on a resolution that will never come
+            self._refresh_after_fs_change()
+            if getattr(self.claude_pane, 'validate_after_finish', False):
+                self.claude_pane.validate_after_finish = False
+                result = self._validate_kant_project()
+                if result:
+                    self.claude_pane.write_info('\n' + result + '\n')
             return
         summary = '\n'.join(f"- {item['status']}: {item['path']}" for item in review)
         self.claude_pane.write_info(f'\nModifiche AI pronte per il controllo:\n{summary}')
 
+        # [FN CATEGORY] resolved — the user's (or auto-permissions') final accept/reject decision on
+        # the pending AI review. Everything here is deliberately gated behind this closure actually
+        # firing: no definitive validation, map sync, tree refresh, or xref rebuild happens before
+        # it — those used to run unconditionally right after the CLI process exited, racing ahead of
+        # a still-unresolved manual review. apply and rollback each get their own exact sequence.
+        # [FN] resolved — applies or rolls back the pending AI review, then follows the matching sequence
+        # [FN OPEN] resolved
         def resolved(action, accepted, manual_text):
             skipped_dirs = []
             self.tabs.setEnabled(False)
             try:
                 if action == 'apply':
-                    apply_ai_review(self.project_root_path, review, accepted, manual_text)
-                    result_message = 'Modifiche AI revisionate e applicate'
+                    kept = apply_ai_review(self.project_root_path, review, accepted, manual_text)
                 else:
                     skipped_dirs = rollback_snapshot(self.project_root_path, snapshot, ignored)
-                    result_message = 'Modifiche AI annullate e snapshot ripristinato'
             except OSError as error:
                 self.tabs.setEnabled(True)
                 self._ide_message('Revisione AI', f'Operazione incompleta: {error}\nSnapshot conservato in {snapshot}')
@@ -468,7 +531,30 @@ class WorkspaceMixin:
             self._clear_ai_snapshot_marker()
             for tab in list(self.open_tabs.values()):
                 self._on_fs_file_changed(tab.path)
+            self.claude_pane.validate_after_finish = False
+            if action == 'apply':
+                normalized, id_skipped = normalize_missing_ids(self.project_root_path, kept)
+                result, errors, visual_errors, map_state, warnings = validate_kant_project(
+                    self.project_root_path, self.kant_map_path,
+                )
+                if map_state != 'marker_invalidi':
+                    self._sync_kant_map()
+                self._show_validation_results(errors, visual_errors)
+                self._refresh_after_fs_change()
+                result_message = 'Modifiche AI revisionate e applicate'
+                if normalized:
+                    result_message += f'\nID mancanti persistiti in: {", ".join(normalized)}'
+                if id_skipped:
+                    skipped_note = '; '.join(f'{rel} ({reason})' for rel, reason in id_skipped)
+                    result_message += f'\nNormalizzazione ID saltata per: {skipped_note}'
+                self.claude_pane.write_info('\n' + result + '\n')
+            else:
+                # rollback: only the restore + reload + refresh sequence — no id normalization, no
+                # rewrites, no map regen (the snapshot already restored the previous map too)
+                self._refresh_after_fs_change()
+                result_message = 'Modifiche AI annullate e snapshot ripristinato'
             self.claude_pane.write_info(result_message)
+        # [FN CLOSED] resolved
 
         # automatic mode means the user asked not to be interrupted for permission decisions either
         # — extending that to the review step too: accept everything silently instead of offering a
@@ -580,6 +666,11 @@ class WorkspaceMixin:
             return
         for tab in affected:
             self._retarget_tab(tab, new_path + tab.path[len(old_path):])
+        if self.project_root_path:
+            old_rel = os.path.relpath(old_path, self.project_root_path).replace(os.sep, '/')
+            new_rel = os.path.relpath(new_path, self.project_root_path).replace(os.sep, '/')
+            migrate_member_paths(self.project_root_path, old_rel, new_rel, is_dir)
+            migrate_position_keys(self.project_root_path, old_rel, new_rel, is_dir)
         self._refresh_after_fs_change()
 
     def _retarget_tab(self, tab, new_path):

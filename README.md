@@ -117,6 +117,11 @@ A **Grouping** is a named, arbitrary bundle of tagged elements — any file, any
 
 Claude Code and Codex can run inside the IDE. Permission prompts, project snapshots, file/hunk review, atomic application, and rollback keep delegated work visible and reversible.
 
+Chat messages can carry file attachments — any document or image, not limited to the open project. Neither CLI has a multimodal-upload flag, so an attachment rides along as a plain path the agent's own file-reading tool opens, the same way the hidden per-message focus hint already works. Two optional, opt-in size reductions apply before a path is queued:
+
+- **Documents** (PDF, DOCX, PPTX, XLSX, HTML) are converted to plain Markdown via [MarkItDown](https://github.com/microsoft/markitdown) when it's installed and the document actually has extractable text — a scanned/image-only PDF is left untouched. Install with `pip install "markitdown[all]"` to enable it; the editor works the same without it, just attaching the original file.
+- **Images** can optionally be downscaled and re-encoded as JPEG at reduced quality — a lossy, opt-in "risparmio token" toggle next to the attach button, off by default.
+
 KANT IDE also includes Git actions, a terminal, lightweight syntax checks, optional language-server integration, Python debugging, and day/night themes.
 
 ## Quick start

@@ -10,8 +10,8 @@ from pathlib import Path
 
 from kant import theme
 from kant.fileio import file_fingerprint
-from kant.model import Node, read_top_level_label
-from kant.syntax import check_kant_markers
+from kant.model import Node, read_top_level_label, read_top_level_label_result
+from kant.syntax import audit_kant_headers, check_kant_markers
 
 
 def iter_project_text_files(root):
@@ -91,17 +91,39 @@ def build_kant_map(root, project_name):
     return '\n'.join([*lines, '```', ''])
 
 
+def _canonical_map_text(text):
+    # equivalent only across line-ending and trailing-newline differences — used both to decide
+    # whether the map is in sync (validate_kant_project) and whether _sync_kant_map needs to write
+    return text.replace('\r\n', '\n').rstrip('\n')
+
+
+def _collect_uids(tree, rel, into):
+    for item in tree.body:
+        if isinstance(item, Node):
+            if item.uid is not None:
+                into.setdefault(item.uid, []).append((rel, item.tag, item.name))
+            _collect_uids(item, rel, into)
+
+
+# [FN CATEGORY] validate_kant_project — single project-wide scan: per-file marker validation (hard
+# errors from check_kant_markers/audit_kant_headers, soft warnings from audit_kant_headers plus
+# cross-file duplicate #id detection) feeding one of five mutually exclusive map states. Structural
+# marker errors take precedence over the map comparison — a broken source file means the canonical
+# map can't be trusted to represent it, so map sync is never even evaluated in that case.
+# [FN] validate_kant_project — full marker + canonical map-sync validation for a project
+# [FN OPEN] validate_kant_project
 def validate_kant_project(root, map_path):
-    errors, visual_errors, tagged = [], [], []
+    errors, visual_errors, warnings, tagged = [], [], [], []
     checked_markers = 0
-    map_text = ''
-    if map_path is None:
-        errors.append('manca KANT_*.md nella radice del progetto')
-    else:
+    map_text = None
+    map_read_error = None
+    if map_path is not None:
         try:
             map_text = Path(map_path).read_text(encoding='utf-8')
         except OSError as error:
-            errors.append(f'{os.path.basename(map_path)} non leggibile: {error}')
+            map_read_error = str(error)
+
+    uid_locations = {}
     for path in iter_kant_tagged_files(root):
         rel = os.path.relpath(path, root).replace(os.sep, '/')
         try:
@@ -118,17 +140,44 @@ def validate_kant_project(root, map_path):
             message = result.get('message', 'marker KANT non valido')
             errors.append(f'{rel}:{line} {message}')
             visual_errors.append((path, rel, line, message))
-        label = read_top_level_label(path)
+        audit = audit_kant_headers(text)
+        for entry in audit['errors']:
+            errors.append(f"{rel}:{entry['line']} {entry['message']}")
+            visual_errors.append((path, rel, entry['line'], entry['message']))
+        for entry in audit['warnings']:
+            warnings.append(f"{rel}:{entry['line']} {entry['message']}")
+        label, parse_error = read_top_level_label_result(path)
         if label is not None:
-            tagged.append((rel, label[0]))
-    map_out_of_sync = False
-    if map_text:
-        missing = [rel for rel, tag in tagged if f'[{tag} {rel}]' not in map_text]
-        if missing:
-            map_out_of_sync = True
-            sample = ', '.join(missing[:5])
-            extra = f' (+{len(missing) - 5})' if len(missing) > 5 else ''
-            errors.append(f'KANT map non coerente: mancano {sample}{extra}')
+            tag, _desc, tree, _top = label
+            tagged.append((rel, tag))
+            _collect_uids(tree, rel, uid_locations)
+
+    for uid, locations in uid_locations.items():
+        files = sorted({rel for rel, _tag, _name in locations})
+        if len(files) > 1:
+            sample = ', '.join(files[:5])
+            extra = f' (+{len(files) - 5})' if len(files) > 5 else ''
+            warnings.append(f'UID duplicato #{uid} in {sample}{extra}')
+
+    if map_path is None:
+        map_state = 'assente'
+        errors.append('manca KANT_*.md nella radice del progetto')
+    elif map_read_error is not None:
+        map_state = 'errore_generazione'
+        errors.append(f'{os.path.basename(map_path)} non leggibile: {map_read_error}')
+    elif errors:
+        map_state = 'marker_invalidi'
+    else:
+        try:
+            canonical = build_kant_map(root, os.path.basename(root))
+        except OSError as error:
+            map_state = 'errore_generazione'
+            errors.append(f'generazione mappa fallita: {error}')
+        else:
+            map_state = 'sincronizzata' if _canonical_map_text(canonical) == _canonical_map_text(map_text) else 'non_sincronizzata'
+            if map_state == 'non_sincronizzata':
+                errors.append('KANT map non coerente con il sorgente')
+
     map_name = os.path.basename(map_path) if map_path else 'KANT_*.md'
     if errors:
         sample = '\n'.join(f'- {error}' for error in errors[:8])
@@ -136,7 +185,8 @@ def validate_kant_project(root, map_path):
         summary = f'# KANT verifica: ERRORI\n{sample}{extra}'
     else:
         summary = f'# KANT verifica: OK ({map_name}, {checked_markers} file con marker)'
-    return summary, errors, visual_errors, map_out_of_sync
+    return summary, errors, visual_errors, map_state, warnings
+# [FN CLOSED] validate_kant_project
 
 
 def definition_locations(root, symbol, limit=200):

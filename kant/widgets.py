@@ -30,7 +30,7 @@ from PySide6.QtCore import (
     QSize, QStringListModel, Signal, QTimer,
 )
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
+    QBrush, QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
     QPainterPathStroker, QSyntaxHighlighter, QTextCharFormat, QTextCursor, QTextDocument,
 )
 from PySide6.QtWidgets import (
@@ -1050,6 +1050,85 @@ def _write_system_prompt_file(text, directory=None):
     return path
 
 
+# [CST] _IMAGE_ATTACHMENT_EXTENSIONS — formats compress_attached_image actually knows how to open;
+# svg is deliberately excluded (QImage rasterizes it, losing exactly the vector precision a diagram
+# attachment needs) and is sent through unchanged regardless of the lossy toggle.
+_IMAGE_ATTACHMENT_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'}
+
+
+def _attachment_temp_prefix(kind, original_path):
+    # keeps the original filename recognizable in the chip label (os.path.basename of the
+    # resolved temp path) instead of a bare random suffix — a user who attached "spec.pdf"
+    # shouldn't see ".kant-attach-doc-a1b2c3.md" with no trace of what it came from
+    stem = re.sub(r'[^\w.-]', '_', Path(original_path).stem)[:40]
+    return f'.kant-attach-{kind}-{stem}-'
+
+
+# [FN CATEGORY] compress_attached_image — the "risparmio token ma lossy" toggle's actual effect:
+# downscales to a max dimension and re-encodes as JPEG at reduced quality using QImage (already a
+# hard dependency via PySide6 — no new package needed for this), so a large screenshot or photo
+# reads as far fewer tokens when the model's own file-reading tool opens it. Returns the ORIGINAL
+# path unchanged on anything that isn't a recognized raster format or fails to load — a failed
+# compression attempt must never silently drop the attachment.
+# [FN] compress_attached_image — lossily downscale/recompress an attached image, or pass it through
+# [FN OPEN] compress_attached_image
+def compress_attached_image(path, max_dimension=1280, quality=60):
+    if Path(path).suffix.lower() not in _IMAGE_ATTACHMENT_EXTENSIONS:
+        return path
+    image = QImage(path)
+    if image.isNull():
+        return path
+    if image.width() > max_dimension or image.height() > max_dimension:
+        image = image.scaled(max_dimension, max_dimension, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    try:
+        fd, out_path = safe_mkstemp(prefix=_attachment_temp_prefix('img', path), suffix='.jpg')
+        os.close(fd)
+        if not image.save(out_path, 'JPEG', quality):
+            return path
+    except OSError:
+        return path
+    return out_path
+# [FN CLOSED] compress_attached_image
+
+
+# [CST] _DOCUMENT_ATTACHMENT_EXTENSIONS — formats worth routing through MarkItDown at all; plain
+# text-ish formats (.txt/.md/.csv/.json/...) are already lean and go through unchanged — converting
+# them would just be a no-op wrapped in a slower, more fallible code path.
+_DOCUMENT_ATTACHMENT_EXTENSIONS = {'.pdf', '.docx', '.pptx', '.xlsx', '.doc', '.ppt', '.xls', '.html', '.htm'}
+
+
+# [FN CATEGORY] convert_attached_document — a raw PDF/DOCX/PPTX/XLSX read by the model's own file
+# tool costs far more tokens than the same content as clean Markdown (binary structure, embedded
+# XML, formatting noise); MarkItDown (microsoft/markitdown) extracts just the text/structure. Two
+# distinct "give up and keep the original" paths, both correct per the ask: the package not being
+# installed (an optional dependency — the editor works without it, same as an optional language
+# server), and a document with no extractable text (a scanned/image-only PDF) — MarkItDown would
+# return empty/near-empty content for the latter, which is worse than just attaching the original.
+# [FN] convert_attached_document — MarkItDown-convert a document attachment, or pass it through
+# [FN OPEN] convert_attached_document
+def convert_attached_document(path):
+    if Path(path).suffix.lower() not in _DOCUMENT_ATTACHMENT_EXTENSIONS:
+        return path
+    try:
+        from markitdown import MarkItDown
+    except ImportError:
+        return path
+    try:
+        text = (MarkItDown().convert(path).text_content or '').strip()
+    except Exception:
+        return path
+    if not text:
+        return path  # no text detected — keep the original as-is, per the ask
+    try:
+        fd, out_path = safe_mkstemp(prefix=_attachment_temp_prefix('doc', path), suffix='.md')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+    except OSError:
+        return path
+    return out_path
+# [FN CLOSED] convert_attached_document
+
+
 def _agent_executable(agent):
     return 'codex' if agent == 'codex' else 'claude'
 
@@ -1390,6 +1469,7 @@ class ClaudePane(QWidget):
         self.before_run = None
         self.context_hint = None  # callable returning a hidden scoping instruction, or None; see _send
         self.focus_hint = None  # callable returning a short human-readable focus summary, or None
+        self._pending_attachments = []  # [(original_path, resolved_path), ...] from _attach_files, cleared on send
         # each run_prompt call is otherwise a brand-new, stateless claude/codex subprocess with no
         # memory of earlier turns — these track this pane's ongoing conversation per provider so a
         # later message can ask the CLI to resume it instead of starting fresh every time. Reset in
@@ -1495,6 +1575,32 @@ class ClaudePane(QWidget):
         self.output.setWidget(self.chat)
         layout.addWidget(self.output, 1)
 
+        # "risparmio token ma lossy": when checked, an attached image (not documents — those go
+        # through convert_attached_document unconditionally, which isn't lossy the same way) is
+        # downscaled/recompressed by compress_attached_image before its path is queued. Always
+        # visible next to the attach button, not just while something's already attached — it's a
+        # setting for the NEXT attachment, not a property of the current chip row.
+        self.lossy_images = QCheckBox('Immagini compresse')
+        self.lossy_images.setToolTip(
+            "Modalità risparmio token (lossy): le immagini allegate vengono ridimensionate e "
+            "ricompresse prima dell'invio, per far leggere meno token al modello a scapito della "
+            "qualità. I documenti (PDF, DOCX, ...) non sono affetti da questa opzione."
+        )
+        lossy_row = QHBoxLayout()
+        lossy_row.setContentsMargins(0, 0, 0, 4)
+        lossy_row.addWidget(self.lossy_images)
+        lossy_row.addStretch(1)
+        layout.addLayout(lossy_row)
+
+        # attached-files chip row: only visible while at least one file is pending, cleared on send
+        # (see _attach_files/_refresh_attachment_chips/_send) — one removable chip per file
+        self.attachments_row = QWidget()
+        self.attachments_layout = QHBoxLayout(self.attachments_row)
+        self.attachments_layout.setContentsMargins(0, 0, 0, 4)
+        self.attachments_layout.setSpacing(6)
+        self.attachments_row.hide()
+        layout.addWidget(self.attachments_row)
+
         self.prompt = _PromptEdit()
         self.prompt.setFixedHeight(90)
         self.prompt.setFont(QFont('Consolas', theme.CODE_FONT_PT))
@@ -1505,6 +1611,12 @@ class ClaudePane(QWidget):
         self.prompt.send_requested.connect(self._send)
         self.prompt.setPlaceholderText('Prompt per claude -p... (Invio per inviare, Ctrl+Invio per andare a capo)')
         composer = QHBoxLayout()
+        self.attach_btn = QPushButton('📎')
+        self.attach_btn.setFixedSize(36, 42)
+        self.attach_btn.setCursor(Qt.PointingHandCursor)
+        self.attach_btn.setToolTip('Allega documenti o immagini da far leggere a Claude/Codex')
+        self.attach_btn.clicked.connect(self._attach_files)
+        composer.addWidget(self.attach_btn, 0, Qt.AlignBottom)
         composer.addWidget(self.prompt, 1)
         self.send_btn = QPushButton(' Invia')
         self.send_btn.setIcon(draw_icon('arrow-right', 14))
@@ -1551,6 +1663,13 @@ class ClaudePane(QWidget):
             theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
         )
         self.focus_label.setStyleSheet(f'color:{theme.DIM};')
+        self.lossy_images.setStyleSheet(f'color:{theme.DIM}; font-weight:600; spacing:6px;')
+        self.attach_btn.setStyleSheet(
+            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:1px solid {theme.BORDER}; '
+            f'border-radius:8px; font-size:15pt; }} '
+            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
+        )
+        self._refresh_attachment_chips()
         self.send_btn.setStyleSheet(
             f'QPushButton {{ background:{theme.WARN}; color:#ffffff; border:none; border-radius:9px; '
             f'padding:7px 15px; font-weight:700; }} '
@@ -1774,12 +1893,103 @@ class ClaudePane(QWidget):
         prompt = self.prompt.toPlainText().strip()
         if not prompt:
             return
+        if self._pending_attachments:
+            # plain absolute paths in the visible prompt text, not a hidden channel like
+            # context_hint — the user deliberately chose these, so both the chat bubble and the
+            # actual CLI call should show them; claude/codex read the path themselves the same way
+            # context_hint already tells them to read the focused file themselves (no separate
+            # upload mechanism needed for a CLI-driven integration). The RESOLVED path is what's
+            # actually sent (a converted/compressed copy, when convert_attached_document or
+            # compress_attached_image produced one) — the original name is only for the chip label.
+            attachment_list = '\n'.join(f'- {resolved}' for _original, resolved in self._pending_attachments)
+            prompt = f'{prompt}\n\n[File allegati — leggili per rispondere]\n{attachment_list}'
         hint = self.context_hint() if self.context_hint else None
         effort = self.effort_select.currentText().strip()
         if effort == MODEL_DEFAULT:
             effort = None
         if self.run_prompt(prompt, effort=effort, context_hint=hint):
             self.prompt.clear()
+            self._pending_attachments = []
+            self._refresh_attachment_chips()
+
+    # [FN CATEGORY] _attach_files — lets the user pick documents/images from anywhere on disk to
+    # reference in the next message; claude/codex CLIs aren't given the file's bytes directly
+    # (there's no multimodal-upload flag for either `-p`/`exec`), so this works the same way
+    # context_hint already does — the path is named in the prompt and the CLI's own Read tool
+    # (not sandboxed to cwd for reads) opens it, image or text, when it answers. Documents always
+    # go through convert_attached_document (MarkItDown, falls back to the original untouched);
+    # images only go through compress_attached_image when self.lossy_images is checked — that one
+    # is genuinely lossy, so it stays opt-in rather than always-on like the document conversion.
+    # [FN] _attach_files — opens a file picker, resolves, and queues the chosen paths
+    # [FN OPEN] _attach_files
+    def _attach_files(self):
+        paths, _filter = QFileDialog.getOpenFileNames(
+            self, 'Allega file',
+            filter='Immagini e documenti (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.svg *.pdf *.txt *.md *.csv *.json);;Tutti i file (*)',
+        )
+        if not paths:
+            return
+        existing_originals = {original for original, _resolved in self._pending_attachments}
+        for path in paths:
+            if path in existing_originals:
+                continue
+            resolved = convert_attached_document(path)
+            if resolved == path and self.lossy_images.isChecked():
+                resolved = compress_attached_image(path)
+            self._pending_attachments.append((path, resolved))
+        self._refresh_attachment_chips()
+    # [FN CLOSED] _attach_files
+
+    def _remove_attachment(self, original_path):
+        self._pending_attachments = [
+            pair for pair in self._pending_attachments if pair[0] != original_path
+        ]
+        self._refresh_attachment_chips()
+
+    # [FN CATEGORY] _refresh_attachment_chips — the chip always shows the ORIGINAL filename the
+    # user actually picked ("spec.pdf"), never the converted/compressed temp path it resolves to
+    # ("kant-attach-doc-spec-a1b2c3.md") — showing the cryptic resolved name would make it look
+    # like a different, unexpected file got attached instead of a transparent size-reduction step.
+    # [FN] _refresh_attachment_chips — rebuilds the attachment row from _pending_attachments
+    # [FN OPEN] _refresh_attachment_chips
+    def _refresh_attachment_chips(self):
+        while self.attachments_layout.count():
+            item = self.attachments_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for original, resolved in self._pending_attachments:
+            chip = QFrame()
+            chip.setObjectName('attachmentChip')
+            chip_layout = QHBoxLayout(chip)
+            chip_layout.setContentsMargins(8, 3, 4, 3)
+            chip_layout.setSpacing(4)
+            name = QLabel(os.path.basename(original))
+            name.setStyleSheet(f'color:{theme.TEXT}; border:none;')
+            was_reduced = resolved != original
+            name.setToolTip(f'{original}\n-> ridotto a: {resolved}' if was_reduced else original)
+            if was_reduced:
+                shrink_mark = QLabel('↓')
+                shrink_mark.setToolTip('Allegato ridotto prima dell\'invio (documento convertito o immagine compressa)')
+                shrink_mark.setStyleSheet(f'color:{theme.ACCENT}; border:none; font-weight:700;')
+                chip_layout.addWidget(shrink_mark)
+            remove_btn = QPushButton('×')
+            remove_btn.setFixedSize(18, 18)
+            remove_btn.setCursor(Qt.PointingHandCursor)
+            remove_btn.setToolTip('Rimuovi questo allegato')
+            remove_btn.setStyleSheet(
+                f'QPushButton {{ background:transparent; color:{theme.DIM}; border:none; font-weight:700; }} '
+                f'QPushButton:hover {{ color:{theme.WARN}; }}'
+            )
+            remove_btn.clicked.connect(lambda _checked=False, p=original: self._remove_attachment(p))
+            chip_layout.addWidget(name)
+            chip_layout.addWidget(remove_btn)
+            chip.setStyleSheet(
+                f'#attachmentChip {{ background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; border-radius:9px; }}'
+            )
+            self.attachments_layout.addWidget(chip)
+        self.attachments_layout.addStretch(1)
+        self.attachments_row.setVisible(bool(self._pending_attachments))
+    # [FN CLOSED] _refresh_attachment_chips
 
     # [FN CATEGORY] run_prompt — the actual `claude -p` launch, shared by the prompt box's Invia
     # button and any caller that needs to drive this pane programmatically (e.g. MainWindow forcing

@@ -1,6 +1,6 @@
 ---
 name: kant-code-map
-description: Generate or update the KANT structural code map (a KANT_*.md file at the project root) and its tag comments in source code. Only invoke this when the user types the exact command /kant-code-map. Do not invoke it for natural-language phrasing like "update the KANT map" or "generate the map" — wait for the literal command.
+description: Analyze the repository and add/fix KANT tag comments in source code so the IDE can deterministically regenerate the structural code map (a KANT_*.md file at the project root). Only invoke this when the user types the exact command /kant-code-map. Do not invoke it for natural-language phrasing like "update the KANT map" or "generate the map" — wait for the literal command.
 ---
 
 # KANT Code Map
@@ -8,84 +8,31 @@ description: Generate or update the KANT structural code map (a KANT_*.md file a
 Usage: `/kant-code-map` — no arguments.
 
 When invoked, for the current project:
-1. Create/update `KANT_<project-name>.md` at the project root.
-2. Add matching tag comments above each tagged element in source code.
+1. Analyze the repository and add or correct KANT tag comments above every
+   tagged element in source code (see "Code comments" below).
+2. Do not create, edit, or hand-compose `KANT_<project-name>.md` yourself —
+   KANT IDE regenerates that file deterministically from the source markers
+   after your changes are reviewed and applied. Writing it yourself only
+   produces a version the IDE immediately overwrites.
 
-## KANT file structure
+## KANT file structure (reference only — the IDE generates this, you don't)
 
-`KANT_<project-name>.md` is a real Markdown document, not raw bracket text
-dumped into a `.md` file: it needs a title, a `##` section header, and the
-map content itself wrapped in a fenced code block (so indentation and line
-breaks render exactly as written — Markdown collapses plain indentation and
-line breaks outside of code fences).
+`KANT_<project-name>.md` is a real Markdown document: a title, a `##`
+section header, and the map content wrapped in a fenced code block. This is
+what the IDE's generator produces from your source markers — shown here so
+you understand what your tag comments turn into, not as something to author:
+
+```
+[MOD auth/login.py] — login/logout endpoints
+- [CLS] UserManager — creates and authenticates users
+-- [FN] login — checks credentials, creates session
+-- [FN] logout — invalidates current session
+[CFG config/database.yaml] — DB connection settings
+```
 
 The map is canonical and has no line numbers — it never goes stale, and
 exact positions are found by grepping the tag comment in source (e.g.
 `grep -rn "\[FN\] login"`), not by reading a number that can drift.
-
-```
-[MOD auth/login.py] — login/logout endpoints
-- [CLS] UserManager — creates and authenticates users
--- [FN] login — checks credentials, creates session
--- [FN] logout — invalidates current session
-[CFG config/database.yaml] — DB connection settings
-```
-
-**Indentation is mandatory, not cosmetic — every element declared inside a
-MOD (or inside a CLS) MUST be prefixed with one literal `-` per nesting
-level, directly before the tag, followed by a single space (`- [FN] ...` at
-depth 1, `-- [FN] ...` at depth 2, and so on). This applies even when the
-module is flat (no classes, everything a direct child of MOD): those
-elements still get a single `-` prefix under the MOD line. An element with
-no `-` prefix, aligned with its own MOD line, is a hierarchy violation, full
-stop — there is no such thing as a "top-level sibling" of MOD.**
-
-**A `[CST]` (or `[VAR]`) entry corresponds to exactly one source statement —
-not to how many names conceptually belong together.**
-
-- If a single statement defines multiple constants (tuple/multi-target
-  assignment), that statement is ONE entry listing all its names.
-- If constants are defined in separate statements — even on adjacent lines,
-  even conceptually related — each gets its OWN entry. Never merge separate
-  statements into one just because they're related.
-
-Same statement → ONE entry:
-```python
-W, H, P = 800, 500, 80  # field width, height, paddle height
-```
-```
-[CST] W, H, P — field width, height, paddle height
-```
-
-Separate statements → THREE entries, even though related:
-```python
-W = 800  # field width
-H = 500  # field height
-P = 80   # paddle height
-```
-```
-[CST] W — field width
-[CST] H — field height
-[CST] P — paddle height
-```
-
-Full template — exactly the file structure to write, including the
-Markdown syntax itself (`#`, `##`, and the fences are literal characters in
-the output file, not formatting of this instruction):
-
-````markdown
-# KANT Map — auth-service
-
-## Structural map
-
-```
-[MOD auth/login.py] — login/logout endpoints
-- [CLS] UserManager — creates and authenticates users
--- [FN] login — checks credentials, creates session
--- [FN] logout — invalidates current session
-[CFG config/database.yaml] — DB connection settings
-```
-````
 
 Fixed tag set — do not add others:
 
@@ -100,27 +47,12 @@ Fixed tag set — do not add others:
 | VAR | mutable global/state var | no |
 | TST | test | path only if standalone file |
 
-## Line format
-
-`[TAG] Name — description, max 8 words`
-`[TAG relative/path]` for MOD/CFG/TST files (the path is the name).
-
-Nesting: one literal `-` per level, directly before the tag, plus a single
-space (`- [TAG]` at depth 1, `-- [TAG]` at depth 2). Children inherit the
-parent's path/context by position, not by repeating it.
-
 ## Rules
 
 - Only run on the exact `/kant-code-map` command — never as a side effect of another task, never from paraphrased natural language.
-- Update the existing KANT file in place, never duplicate it.
 - Cover all real code files; skip assets, binaries, deps (node_modules, venv, .git, dist, build).
-- Order elements as they appear in source (top-to-bottom), not alphabetically.
-- The source code is the single source of truth. On any mismatch, regenerate
-  the KANT file from the code, never the other way around.
-- Before finishing, re-check the output against these most-violated rules:
-  the file is genuine Markdown (title, `##` header, map content inside a
-  fenced code block); every non-MOD/CFG element has the correct number of
-  `-` prefixes for its nesting depth (never flush left with MOD).
+- The source code is the single source of truth. The generated map always reflects it — never edit the map to "fix" a mismatch, fix or add the source markers instead.
+- Before finishing, re-check your source edits against the most-violated rules below: every tag comment matches its declaration's name; CATEGORY and the tag line agree with OPEN/CLOSED on tag and name; no `[TAG INCOMING]`/`[TAG OUTGOING]` lines were added.
 
 ## Code comments
 
@@ -137,11 +69,15 @@ never carry a description and never merge with the category line or the
    `[TAG] Name — description, max 8 words`. This line is the grep anchor.
 3. **Open marker** — pure boundary start, no description: `[TAG OPEN] Name`
 
-**Closing** (immediately after the element's last line), up to three lines:
+**Closing** (immediately after the element's last line), one line:
 
 1. `[TAG CLOSED] Name`
-2. `[TAG INCOMING] Name — data used as input, comma-separated`
-3. `[TAG OUTGOING] Name — data produced as output, comma-separated`
+
+There is no INCOMING/OUTGOING line to write. Who calls/uses an element and
+what it calls/uses is computed deterministically from the code by KANT IDE's
+cross-reference system, not hand-written here — a stale or wrong data-flow
+comment is worse than none. Never add `[TAG INCOMING]`/`[TAG OUTGOING]`
+lines to new or edited code.
 
 Tag and name in OPEN and CLOSED must match, so the exact span of every
 element is recoverable by grep alone, even with nesting.
@@ -167,17 +103,6 @@ WRONG (crossing spans — the class closes before its own child does):
 - [FN CLOSED] login
 ```
 
-INCOMING/OUTGOING apply only to `FN` and `TST` — units with actual data
-flow. `CST`, `VAR`, `TYP`, `CLS`, `MOD`, `CFG` are declarative: skip both
-lines entirely for them, don't write empty ones.
-
-For `FN`: INCOMING is parameters plus any external names read (globals,
-constants, other functions' return values consumed). OUTGOING is the return
-value plus any external state mutated (side effects — DB writes, file I/O,
-mutated globals). If an `FN` genuinely has neither (rare — a pure no-arg
-function with no return and no side effect), write `none` rather than
-omitting the line, so its absence is never mistaken for "forgot to add it."
-
 Example (Python):
 ```python
 # [FN CATEGORY] list_users — paginates using offset = (page-1) * MAX_PAGE_SIZE, capped server-side
@@ -187,8 +112,6 @@ def list_users(page: int = 1):
     offset = (page - 1) * MAX_PAGE_SIZE
     return db.query(User).limit(MAX_PAGE_SIZE).offset(offset).all()
 # [FN CLOSED] list_users
-# [FN INCOMING] list_users — page, MAX_PAGE_SIZE
-# [FN OUTGOING] list_users — paginated user list
 
 # [FN CATEGORY] create_user — validates payload, hashes password, persists row
 # [FN] create_user — POST /users, creates new user
@@ -196,19 +119,16 @@ def list_users(page: int = 1):
 def create_user(payload: UserCreate):
     ...
 # [FN CLOSED] create_user
-# [FN INCOMING] create_user — payload
-# [FN OUTGOING] create_user — created user record, db write
 ```
 
 Binding rules:
 
 - Every comment must include the element's name, matching the declaration
   it delimits — unambiguous even out of context.
-- The tag line must be byte-identical to the corresponding entry in the
-  KANT file (minus indentation), so grep on either one finds the other.
+- The tag line must be byte-identical to the corresponding entry the IDE
+  will generate in the KANT map (minus indentation), so grep on either one
+  finds the other.
 - Every OPEN must have exactly one CLOSED with the same tag and name;
   an unmatched marker is invalid.
-- When renaming an FN/TST element, rename it in all seven places in the same
-  edit: declaration, category line, tag line, open marker, closed marker,
-  incoming line, outgoing line, and the KANT entry (for other tags, skip the
-  incoming/outgoing places — five places, as before).
+- When renaming an element, rename it in all five places in the same edit:
+  declaration, category line, tag line, open marker, and closed marker.

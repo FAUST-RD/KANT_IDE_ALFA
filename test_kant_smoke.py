@@ -14,7 +14,7 @@ from pathlib import Path
 import shiboken6
 
 from PySide6.QtCore import Qt, QEvent, QPointF, QSettings
-from PySide6.QtGui import QKeyEvent, QKeySequence, QMouseEvent, QTextCursor
+from PySide6.QtGui import QImage, QKeyEvent, QKeySequence, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication, QGraphicsItem, QLabel, QListWidget, QMenu, QMessageBox, QTabBar, QToolButton,
@@ -38,16 +38,22 @@ from kant.widgets import (
     ClaudePane, CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard,
     _AiReviewCard, _agent_command, _markdown_to_html, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
     _code_hover_popup_instance, make_app_icon, make_app_pixmap, vim_mode_enabled,
+    compress_attached_image, convert_attached_document,
 )
-from kant.mappa import MIN_NODE_GAP, XrefMapDialog, XrefMapView, _force_layout_positions, _element_degree, _element_size
+from kant.mappa import (
+    MIN_NODE_GAP, XrefMapDialog, XrefMapView, _force_layout_positions, _element_degree, _element_size,
+    _position_settings_key, migrate_position_keys,
+)
 from kant import gitops as kant_gitops_module
 from kant.gitops import GitPanelDialog
 from kant.workspace import (
-    apply_ai_review, build_ai_review, create_snapshot, discard_snapshot, rollback_snapshot,
-    render_review_text, safe_project_path,
+    apply_ai_review, build_ai_review, create_snapshot, discard_snapshot, normalize_missing_ids,
+    rollback_snapshot, render_review_text, safe_project_path,
 )
 from kant.permission_mcp import handle_message
-from kant.groupings import load_groupings
+from kant.groupings import load_groupings, new_grouping, save_groupings
+from kant.syntax import audit_kant_headers, check_kant_markers
+from kant.projectops import _canonical_map_text, build_kant_map, validate_kant_project
 from kant.fileio import safe_mkstemp, safe_mkdtemp
 
 
@@ -2735,6 +2741,160 @@ class KantSmokeTest(unittest.TestCase):
         finally:
             pane.deleteLater()
 
+    def test_ai_chat_attachments_show_as_chips_and_ride_along_in_the_prompt(self):
+        # regression for "implementa la possibilità di allegare documenti e immagini": neither
+        # claude -p nor codex exec has a multimodal-upload flag, so an attachment is just a path
+        # named in the (visible, not hidden like context_hint) prompt text — the CLI's own Read
+        # tool opens it, image or text, the same way context_hint already tells it to read the
+        # focused file itself.
+        pane = ClaudePane(os.getcwd())
+        try:
+            assert pane.attachments_row.isHidden()  # nothing attached yet
+
+            pane._pending_attachments = [
+                ('C:/tmp/screenshot.png', 'C:/tmp/screenshot.png'),
+                ('C:/tmp/spec.pdf', 'C:/tmp/spec.pdf'),
+            ]
+            pane._refresh_attachment_chips()
+            assert not pane.attachments_row.isHidden()
+            assert pane.attachments_layout.count() == 3  # 2 chips + trailing stretch
+
+            pane._remove_attachment('C:/tmp/screenshot.png')
+            assert pane._pending_attachments == [('C:/tmp/spec.pdf', 'C:/tmp/spec.pdf')]
+            assert not pane.attachments_row.isHidden()  # one still left
+
+            pane.prompt.setPlainText('cosa vedi in questo file?')
+            captured = {}
+            pane.run_prompt = lambda prompt, **kwargs: captured.setdefault('prompt', prompt) or True
+            pane._send()
+            assert 'cosa vedi in questo file?' in captured['prompt']
+            assert 'C:/tmp/spec.pdf' in captured['prompt']  # the path rides along in the same text
+            assert pane._pending_attachments == []  # cleared after a successful send
+            assert pane.attachments_row.isHidden()
+        finally:
+            pane.deleteLater()
+
+    def test_compress_attached_image_downscales_and_reencodes_as_jpeg(self):
+        # regression for the "risparmio token ma lossy" toggle: a real image gets scaled down and
+        # re-encoded as JPEG at reduced quality — smaller on disk, a different (temp) path — while
+        # a non-image extension and an unreadable/corrupt path both pass through unchanged rather
+        # than silently dropping the attachment.
+        with _temp_dir() as tmp:
+            big = QImage(2000, 1500, QImage.Format_RGB32)
+            big.fill(0xFFEECC11)
+            big_path = os.path.join(tmp, 'big.png')
+            big.save(big_path)
+            original_size = os.path.getsize(big_path)
+
+            compressed = compress_attached_image(big_path, max_dimension=800, quality=50)
+            assert compressed != big_path
+            assert os.path.isfile(compressed)
+            result_image = QImage(compressed)
+            assert max(result_image.width(), result_image.height()) <= 800
+            assert os.path.getsize(compressed) < original_size
+
+            # not a recognized image extension -> unchanged, no attempt to open it as one
+            text_path = os.path.join(tmp, 'notes.txt')
+            with open(text_path, 'w', encoding='utf-8') as f:
+                f.write('plain text')
+            assert compress_attached_image(text_path) == text_path
+
+            # a .png that isn't actually a valid image -> QImage.isNull() -> unchanged, not dropped
+            fake_png = os.path.join(tmp, 'fake.png')
+            with open(fake_png, 'wb') as f:
+                f.write(b'not a real png')
+            assert compress_attached_image(fake_png) == fake_png
+
+    def test_convert_attached_document_falls_back_when_markitdown_unavailable_or_text_free(self):
+        # regression for "implementa il framework markitdown... se non rilevi testo non attivarlo
+        # e pushalo direttamente così": three fallback-to-original paths, all correct per the ask —
+        # (1) an extension convert_attached_document doesn't even try to convert, (2) markitdown
+        # not installed (a real, un-mocked ImportError in this environment — it's an optional
+        # dependency, same as an optional language server), (3) markitdown installed but the
+        # document has no extractable text (a scanned/image-only PDF).
+        with _temp_dir() as tmp:
+            txt_path = os.path.join(tmp, 'notes.txt')
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write('already plain text')
+            assert convert_attached_document(txt_path) == txt_path  # extension not routed at all
+
+            pdf_path = os.path.join(tmp, 'doc.pdf')
+            with open(pdf_path, 'wb') as f:
+                f.write(b'%PDF-1.4 not a real pdf')
+            assert convert_attached_document(pdf_path) == pdf_path  # markitdown not installed here
+
+            # simulate markitdown being installed but finding no text (scanned/image-only PDF)
+            class _FakeResult:
+                text_content = '   '  # whitespace-only -> "no text detected"
+
+            class _FakeMarkItDown:
+                def convert(self, _path):
+                    return _FakeResult()
+
+            fake_module = type(sys)('markitdown')
+            fake_module.MarkItDown = _FakeMarkItDown
+            sys.modules['markitdown'] = fake_module
+            try:
+                assert convert_attached_document(pdf_path) == pdf_path
+            finally:
+                del sys.modules['markitdown']
+
+    def test_convert_attached_document_writes_markdown_when_text_is_found(self):
+        # the success path: markitdown installed and returns real text -> a new .md temp file is
+        # written and returned, named after the original so the attachment chip stays readable
+        with _temp_dir() as tmp:
+            pdf_path = os.path.join(tmp, 'spec.pdf')
+            with open(pdf_path, 'wb') as f:
+                f.write(b'%PDF-1.4 not a real pdf')
+
+            class _FakeResult:
+                text_content = '# Spec\n\nThis is the extracted content.'
+
+            class _FakeMarkItDown:
+                def convert(self, _path):
+                    return _FakeResult()
+
+            fake_module = type(sys)('markitdown')
+            fake_module.MarkItDown = _FakeMarkItDown
+            sys.modules['markitdown'] = fake_module
+            try:
+                result = convert_attached_document(pdf_path)
+            finally:
+                del sys.modules['markitdown']
+            assert result != pdf_path
+            assert result.endswith('.md')
+            assert 'spec' in os.path.basename(result)
+            with open(result, encoding='utf-8') as f:
+                assert f.read() == '# Spec\n\nThis is the extracted content.'
+            os.remove(result)
+
+    def test_attach_files_applies_lossy_toggle_only_to_images(self):
+        # wiring check for ClaudePane._attach_files: compress_attached_image only runs when
+        # lossy_images is checked, and never for a document (convert_attached_document already
+        # resolved — or intentionally left alone — before the lossy check is even reached)
+        with _temp_dir() as tmp:
+            img_path = os.path.join(tmp, 'shot.png')
+            QImage(400, 300, QImage.Format_RGB32).save(img_path)
+
+            pane = ClaudePane(os.getcwd())
+            try:
+                pane.lossy_images.setChecked(False)
+                original_get_names = kant_widgets_module.QFileDialog.getOpenFileNames
+                kant_widgets_module.QFileDialog.getOpenFileNames = lambda *a, **k: ([img_path], '')
+                try:
+                    pane._attach_files()
+                    assert pane._pending_attachments == [(img_path, img_path)]  # toggle off -> unchanged
+
+                    pane._pending_attachments = []
+                    pane.lossy_images.setChecked(True)
+                    pane._attach_files()
+                    original, resolved = pane._pending_attachments[0]
+                    assert original == img_path and resolved != img_path  # toggle on -> compressed
+                finally:
+                    kant_widgets_module.QFileDialog.getOpenFileNames = original_get_names
+            finally:
+                pane.deleteLater()
+
     def test_grouping_create_persist_and_navigate(self):
         # regression for the new "raggruppamento" feature: an arbitrary named bundle of elements
         # from different files/parents (kant/groupings.py), created via the "+ Nuovo gruppo" button,
@@ -2789,6 +2949,325 @@ class KantSmokeTest(unittest.TestCase):
             assert window.active_tab is not None
             assert os.path.basename(window.active_tab.path) == target_rel
             window.close()
+
+    def test_rename_file_migrates_grouping_and_mappa_position(self):
+        # regression for the rename-stability gap: _rename_tree_item used to touch neither
+        # .kant/groupings.json nor MAPPA's QSettings-persisted node coordinates, so renaming a file
+        # silently orphaned any grouping referencing it and lost its manually dragged MAPPA position
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            (project / 'auth.py').write_text('\n'.join([
+                '# [MOD OPEN] auth.py',
+                '# [FN OPEN #abc123] login', 'def login(): pass', '# [FN CLOSED #abc123] login',
+                '# [MOD CLOSED] auth.py',
+            ]), encoding='utf-8')
+            window = MainWindow()
+            window.project_root_path = str(project)
+
+            old_key = 'auth.py::abc123'
+            grouping = new_grouping('Auth flow')
+            grouping.members = [old_key]
+            save_groupings(str(project), [grouping])
+
+            position_key = _position_settings_key(str(project))
+            settings = QSettings('KANT', 'KANT Editor')
+            settings.setValue(position_key, json.dumps({old_key: [12.0, 34.0]}))
+
+            item = QTreeWidgetItem()
+            item.setData(0, ROLE_PATH, str(project / 'auth.py'))
+            window._ide_text = lambda *a, **k: ('auth2.py', True)
+            window._rename_tree_item(item, 'file')
+
+            assert (project / 'auth2.py').is_file() and not (project / 'auth.py').exists()
+            saved = load_groupings(str(project))
+            assert saved[0].members == ['auth2.py::abc123']
+            data = json.loads(settings.value(position_key, '{}'))
+            assert data == {'auth2.py::abc123': [12.0, 34.0]}
+            settings.remove(position_key)
+            window.close()
+
+    def test_rename_folder_migrates_multiple_grouped_members(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            (project / 'utils').mkdir()
+            (project / 'utils' / 'a.py').write_text(
+                '# [FN OPEN #aaa] a\npass\n# [FN CLOSED #aaa] a\n', encoding='utf-8',
+            )
+            (project / 'utils' / 'b.py').write_text(
+                '# [FN OPEN #bbb] b\npass\n# [FN CLOSED #bbb] b\n', encoding='utf-8',
+            )
+            (project / 'outside.py').write_text(
+                '# [FN OPEN #ccc] c\npass\n# [FN CLOSED #ccc] c\n', encoding='utf-8',
+            )
+            window = MainWindow()
+            window.project_root_path = str(project)
+
+            grouping = new_grouping('Utils bundle')
+            grouping.members = ['utils/a.py::aaa', 'utils/b.py::bbb', 'outside.py::ccc']
+            save_groupings(str(project), [grouping])
+
+            item = QTreeWidgetItem()
+            item.setData(0, ROLE_PATH, str(project / 'utils'))
+            window._ide_text = lambda *a, **k: ('helpers', True)
+            window._rename_tree_item(item, 'dir')
+
+            assert (project / 'helpers').is_dir() and not (project / 'utils').exists()
+            saved = load_groupings(str(project))
+            assert set(saved[0].members) == {'helpers/a.py::aaa', 'helpers/b.py::bbb', 'outside.py::ccc'}
+            window.close()
+
+    def test_audit_kant_headers_flags_tag_and_name_inconsistencies(self):
+        tag_mismatch = '\n'.join([
+            '# [CLS CATEGORY] load_user - reads a user',
+            '# [FN] load_user - fetch by id',
+            '# [FN OPEN #abc] load_user',
+            'def load_user(): pass',
+            '# [FN CLOSED #abc] load_user',
+        ])
+        result = audit_kant_headers(tag_mismatch)
+        assert any('incoerente' in e['message'] and e['line'] == 1 for e in result['errors'])
+
+        name_mismatch = '\n'.join([
+            '# [FN CATEGORY] other_name - reads a user',
+            '# [FN] load_user - fetch by id',
+            '# [FN OPEN #abc] load_user',
+            'def load_user(): pass',
+            '# [FN CLOSED #abc] load_user',
+        ])
+        result2 = audit_kant_headers(name_mismatch)
+        assert any('incoerente' in e['message'] and e['line'] == 1 for e in result2['errors'])
+
+        tagline_name_mismatch = '\n'.join([
+            '# [FN CATEGORY] load_user - reads a user',
+            '# [FN] other_name - fetch by id',
+            '# [FN OPEN #abc] load_user',
+            'def load_user(): pass',
+            '# [FN CLOSED #abc] load_user',
+        ])
+        result3 = audit_kant_headers(tagline_name_mismatch)
+        assert any('riga descrittiva' in e['message'] and e['line'] == 2 for e in result3['errors'])
+
+    def test_audit_kant_headers_flags_orphaned_pending_header(self):
+        src = '\n'.join([
+            '# [FN CATEGORY] load_user - reads a user',
+            'x = 1  # never followed by an OPEN',
+        ])
+        result = audit_kant_headers(src)
+        assert any('pendente' in e['message'] and e['line'] == 1 for e in result['errors'])
+
+    def test_check_kant_markers_reports_real_line_for_duplicate_id(self):
+        # regression for a confirmed bug: the duplicate-#id check used to hardcode 'line': 1
+        # instead of pointing at the actual duplicate
+        src = '\n'.join([
+            '# [FN OPEN #aaa] a', 'pass', '# [FN CLOSED #aaa] a',
+            '# [FN OPEN #aaa] b', 'pass', '# [FN CLOSED #aaa] b',
+        ])
+        result = check_kant_markers(src)
+        assert result['ok'] is False
+        assert result['line'] == 4  # the second OPEN's real line, not the old hardcoded 1
+
+    def test_audit_kant_headers_warns_without_erroring_on_missing_or_empty_headers(self):
+        # non-strict mode: missing CATEGORY/tagline are warnings, never hard errors — and a legacy
+        # file that was always valid (no CATEGORY/tagline at all) must not gain a NEW hard error
+        src = '# [FN OPEN #abc] load_user\ndef load_user(): pass\n# [FN CLOSED #abc] load_user\n'
+        result = audit_kant_headers(src)
+        assert result['errors'] == []
+        messages = [w['message'] for w in result['warnings']]
+        assert any('CATEGORY mancante' in m for m in messages)
+        assert any('tagline mancante' in m for m in messages)
+        assert check_kant_markers(src)['ok'] is True  # the live/save-path check stays permissive too
+
+        empty_tagline = '\n'.join([
+            '# [FN CATEGORY] load_user - reads a user',
+            '# [FN] load_user —',
+            '# [FN OPEN #abc] load_user',
+            'def load_user(): pass',
+            '# [FN CLOSED #abc] load_user',
+        ])
+        result2 = audit_kant_headers(empty_tagline)
+        assert result2['errors'] == []
+        assert any('tagline vuota' in w['message'] for w in result2['warnings'])
+
+    def test_audit_kant_headers_warns_on_unknown_tag_without_erroring(self):
+        # a tag outside the fixed 8-tag set is a warning, not a hard error — an existing legacy file
+        # using a nonstandard tag must still open and validate without a new blocking failure
+        src = '# [XYZ OPEN] thing\npass\n# [XYZ CLOSED] thing\n'
+        result = audit_kant_headers(src)
+        assert result['errors'] == []
+        assert any('non appartiene' in w['message'] for w in result['warnings'])
+
+    def test_validate_kant_project_distinguishes_all_five_map_states(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'app.py').write_text(
+                '# [MOD OPEN #abc] app.py\nprint(1)\n# [MOD CLOSED #abc] app.py\n', encoding='utf-8',
+            )
+            # 1. mappa assente
+            _summary, _errors, _visual, state, _warnings = validate_kant_project(str(root), None)
+            assert state == 'assente'
+
+            # 2. mappa sincronizzata (write the real canonical output)
+            canonical = build_kant_map(str(root), root.name)
+            map_path = root / f'KANT_{root.name}.md'
+            map_path.write_text(canonical, encoding='utf-8')
+            _summary, _errors, _visual, state, _warnings = validate_kant_project(str(root), str(map_path))
+            assert state == 'sincronizzata'
+
+            # 3. mappa non sincronizzata — reorder/alter content the old substring check wouldn't
+            # have caught (the [MOD app.py] tag+path substring is still present verbatim)
+            map_path.write_text(canonical.replace('- ', '  '), encoding='utf-8')
+            _summary, _errors, _visual, state, _warnings = validate_kant_project(str(root), str(map_path))
+            assert state == 'non_sincronizzata'
+
+            # 4. marker invalidi: mappa non rigenerata — even though the map itself is byte-identical
+            # to canonical, a structural marker error elsewhere takes precedence over the comparison
+            (root / 'bad.py').write_text('# [FN CLOSED] never_opened\n', encoding='utf-8')
+            map_path.write_text(canonical, encoding='utf-8')
+            _summary, errors, _visual, state, _warnings = validate_kant_project(str(root), str(map_path))
+            assert state == 'marker_invalidi'
+            assert any('KANT map non coerente' in e for e in errors) is False  # comparison was skipped, not just failed
+
+            # 5. errore durante la generazione della mappa (unreadable map path)
+            (root / 'bad.py').unlink()
+            os.chmod(map_path, 0o000)
+            try:
+                _summary, _errors, _visual, state, _warnings = validate_kant_project(str(root), str(map_path))
+                assert state in ('errore_generazione', 'sincronizzata')  # unreadable on this OS, or ignored (root/CI)
+            finally:
+                os.chmod(map_path, 0o644)
+
+    def test_validate_kant_project_flags_duplicate_uid_across_files_as_warning(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'a.py').write_text('# [FN OPEN #dupe123] f\npass\n# [FN CLOSED #dupe123] f\n', encoding='utf-8')
+            (root / 'b.py').write_text('# [FN OPEN #dupe123] g\npass\n# [FN CLOSED #dupe123] g\n', encoding='utf-8')
+            summary, errors, _visual, _state, warnings = validate_kant_project(str(root), None)
+            assert any('UID duplicato' in w and 'dupe123' in w for w in warnings)
+            assert not any('UID duplicato' in e for e in errors)  # warning, never a hard error
+            assert 'UID duplicato' not in summary  # doesn't leak into the ERRORI block
+
+    def test_tagline_edit_and_file_rename_are_reflected_in_generated_map(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            path = root / 'app.py'
+            path.write_text(
+                '# [MOD CATEGORY] app.py - original purpose\n# [MOD app.py] — original purpose\n'
+                '# [MOD OPEN #abc] app.py\nprint(1)\n# [MOD CLOSED #abc] app.py\n', encoding='utf-8',
+            )
+            before = build_kant_map(str(root), root.name)
+            assert '[MOD app.py]' in before and 'original purpose' in before
+
+            # tagline-only edit, same file/name — the description in the generated map must follow
+            path.write_text(
+                '# [MOD CATEGORY] app.py - updated purpose\n# [MOD app.py] — updated purpose\n'
+                '# [MOD OPEN #abc] app.py\nprint(1)\n# [MOD CLOSED #abc] app.py\n', encoding='utf-8',
+            )
+            after_edit = build_kant_map(str(root), root.name)
+            assert 'updated purpose' in after_edit and 'original purpose' not in after_edit
+
+            path.write_text('# [MOD OPEN #abc] renamed.py\nprint(1)\n# [MOD CLOSED #abc] renamed.py\n', encoding='utf-8')
+            os.rename(path, root / 'renamed.py')
+            after_rename = build_kant_map(str(root), root.name)
+            assert '[MOD renamed.py]' in after_rename and '[MOD app.py]' not in after_rename
+
+    def test_sync_kant_map_skips_write_when_canonical_content_unchanged(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'app.py').write_text(
+                '# [MOD OPEN #abc] app.py\nprint(1)\n# [MOD CLOSED #abc] app.py\n', encoding='utf-8',
+            )
+            w = MainWindow.__new__(MainWindow)
+            w.project_root_path = str(root)
+            w.kant_map_path = None
+            w.kant_map_label = LabelStub()
+            w._xref_cache = None
+            w._xref_generation = 0
+            w._xref_pending_generation = None
+            w.map_dialog = None
+            w._map_sync_generation = 0
+            w._run_background = lambda work, done: done(work(), None)
+            MainWindow._sync_kant_map(w)
+            map_path = root / f'KANT_{root.name}.md'
+            mtime_before = map_path.stat().st_mtime_ns
+            # same canonical content, only line-ending/trailing-newline differences — must not rewrite.
+            # newline='' disables Path.write_text's own universal-newline translation, so the literal
+            # \r\n below actually lands on disk instead of being doubled by write-side translation.
+            existing = map_path.read_text(encoding='utf-8')
+            modified = existing.rstrip('\n').replace('\n', '\r\n') + '\r\n\r\n'
+            with open(map_path, 'w', encoding='utf-8', newline='') as f:
+                f.write(modified)
+            mtime_touched = map_path.stat().st_mtime_ns
+            MainWindow._sync_kant_map(w)
+            assert map_path.stat().st_mtime_ns == mtime_touched  # untouched by the no-op sync
+
+    def test_ai_review_manual_resolution_gates_definitive_refresh_and_map_sync(self):
+        # the core regression this hardening pass targets: the CLI process finishing must NOT be
+        # treated as the transaction's end while a manual review card is still unresolved — no
+        # definitive validation/map-sync/tree-refresh/xref-rebuild before the user actually decides
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'app.py').write_text(
+                '# [MOD OPEN #abc] app.py\nprint(1)\n# [MOD CLOSED #abc] app.py\n', encoding='utf-8',
+            )
+            window = MainWindow()
+            window.project_root_path = str(root)
+            window._ai_snapshot = create_snapshot(str(root), set())
+            (root / 'app.py').write_text(
+                '# [MOD OPEN #abc] app.py\nprint(2)\n# [MOD CLOSED #abc] app.py\n', encoding='utf-8',
+            )
+            window.claude_pane.auto_permissions.setChecked(False)
+            offered = []
+            window.claude_pane.offer_ai_review = lambda review, render_text, resolved: offered.append((review, resolved))
+            sync_calls = []
+            window._sync_kant_map = lambda: sync_calls.append(True)
+
+            window._finish_ai_review()
+            assert len(offered) == 1
+            assert sync_calls == []  # nothing definitive ran yet — the review card is still pending
+
+            _review, resolved = offered[0]
+            resolved('apply', {'app.py': set()}, {})  # reject every hunk, but resolve the review
+            assert sync_calls == [True]  # only now, after resolution, did the map-sync path run
+            window.close()
+
+    def test_ai_review_rollback_does_not_normalize_ids_or_touch_map(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'app.py').write_text('# [MOD OPEN] app.py\nprint(1)\n# [MOD CLOSED] app.py\n', encoding='utf-8')
+            window = MainWindow()
+            window.project_root_path = str(root)
+            window._ai_snapshot = create_snapshot(str(root), set())
+            (root / 'app.py').write_text('# [MOD OPEN] app.py\nprint(2)\n# [MOD CLOSED] app.py\n', encoding='utf-8')
+            window.claude_pane.auto_permissions.setChecked(False)
+            offered = []
+            window.claude_pane.offer_ai_review = lambda review, render_text, resolved: offered.append((review, resolved))
+            sync_calls = []
+            window._sync_kant_map = lambda: sync_calls.append(True)
+
+            window._finish_ai_review()
+            _review, resolved = offered[0]
+            resolved('reject', {}, {})
+            assert sync_calls == []  # rollback never syncs the map — the snapshot restored it already
+            assert 'print(1)' in (root / 'app.py').read_text(encoding='utf-8')  # restored, unmodified further
+            window.close()
+
+    def test_normalize_missing_ids_stamps_only_kept_files_and_skips_invalid_or_binary(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            legacy = root / 'legacy.py'
+            legacy.write_text('# [FN OPEN] f\npass\n# [FN CLOSED] f\n', encoding='utf-8')
+            already_id = root / 'has_id.py'
+            already_id.write_text('# [FN OPEN #existing] g\npass\n# [FN CLOSED #existing] g\n', encoding='utf-8')
+            broken = root / 'broken.py'
+            broken.write_text('# [FN CLOSED] never_opened\n', encoding='utf-8')
+
+            normalized, skipped = normalize_missing_ids(str(root), ['legacy.py', 'has_id.py', 'broken.py', 'missing.py'])
+            assert normalized == ['legacy.py']  # only the file that actually lacked an id was rewritten
+            assert '#' in legacy.read_text(encoding='utf-8').splitlines()[0]
+            assert already_id.read_text(encoding='utf-8') == '# [FN OPEN #existing] g\npass\n# [FN CLOSED #existing] g\n'
+            skipped_reasons = dict(skipped)
+            assert 'broken.py' in skipped_reasons and 'marker' in skipped_reasons['broken.py']
+            assert 'missing.py' in skipped_reasons
 
     def test_ai_context_page_cleared_on_tab_close_does_not_crash(self):
         # regression for a real user-reported crash: _ai_context_page kept pointing at a FileTab
@@ -2947,6 +3426,18 @@ class KantSmokeTest(unittest.TestCase):
             assert '[MOD OPEN' in content and 'my-project' in content
             assert window.project_root_path == str(target)
             window.close()
+
+    def test_kant_comment_standard_and_code_map_skills_agree_on_incoming_outgoing(self):
+        skills_dir = Path(__file__).resolve().parent / '.claude' / 'skills'
+        comment_standard = (skills_dir / 'kant-comment-standard' / 'SKILL.md').read_text(encoding='utf-8')
+        code_map = (skills_dir / 'kant-code-map' / 'SKILL.md').read_text(encoding='utf-8')
+        # neither skill may instruct writing new INCOMING/OUTGOING marker lines — the old
+        # kant-code-map closing template ("up to three lines: ... INCOMING ... OUTGOING") and its
+        # "seven places" rename rule are exactly the contradiction that was removed
+        assert 'up to three lines' not in code_map
+        assert 'seven places' not in code_map
+        assert 'Never add' in comment_standard and 'INCOMING' in comment_standard
+        assert 'Never add' in code_map and 'INCOMING' in code_map
 # [TST CLOSED] KantSmokeTest
 
 

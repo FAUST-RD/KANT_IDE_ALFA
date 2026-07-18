@@ -71,3 +71,53 @@ def add_member(project_root, group_id, key):
     save_groupings(project_root, groupings)
     return groupings
 # [FN CLOSED] add_member
+
+
+# [FN CATEGORY] remap_member_key — rewrites the rel_path portion of one xref-style key
+# ('<rel_path>::<uid>') when it falls under old_rel, leaving the uid untouched. For a file rename
+# (is_dir=False) only an exact rel_path match qualifies; for a folder rename (is_dir=True) both the
+# folder's own key (rare — groupings hold elements, which live inside files, not bare folders) and
+# every key nested under it qualify, mirroring the same old_path/os.sep prefix test
+# kant/workspace.py:_rename_tree_item already uses to find affected open tabs. Pure and total: a key
+# that doesn't match old_rel is returned unchanged, so a caller can map this over every member
+# without a separate "does this apply" branch, and a second call with the same (old_rel, new_rel)
+# after the first is a no-op — nothing left starts with old_rel anymore.
+# [FN] remap_member_key — key with its rel_path rewritten if under old_rel, else key unchanged
+# [FN OPEN] remap_member_key
+def remap_member_key(key, old_rel, new_rel, is_dir):
+    if '::' not in key:
+        return key
+    rel, uid = key.rsplit('::', 1)
+    if is_dir:
+        if rel == old_rel:
+            new_path = new_rel
+        elif rel.startswith(old_rel + '/'):
+            new_path = new_rel + rel[len(old_rel):]
+        else:
+            return key
+    elif rel != old_rel:
+        return key
+    else:
+        new_path = new_rel
+    return f'{new_path}::{uid}'
+# [FN CLOSED] remap_member_key
+
+
+# [FN CATEGORY] migrate_member_paths — after KANT IDE renames a file or folder, updates every
+# Grouping member key whose path fell under the old name, preserving the uid and leaving unrelated
+# members untouched. Saves only if something actually changed (idempotent: a repeat call with the
+# same old_rel/new_rel finds nothing left to remap and skips the write).
+# [FN] migrate_member_paths — remaps Groupings member keys after a rename; True if anything changed
+# [FN OPEN] migrate_member_paths
+def migrate_member_paths(project_root, old_rel, new_rel, is_dir):
+    groupings = load_groupings(project_root)
+    changed = False
+    for grouping in groupings:
+        remapped = [remap_member_key(key, old_rel, new_rel, is_dir) for key in grouping.members]
+        if remapped != grouping.members:
+            grouping.members = remapped
+            changed = True
+    if changed:
+        save_groupings(project_root, groupings)
+    return changed
+# [FN CLOSED] migrate_member_paths

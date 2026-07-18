@@ -86,13 +86,23 @@ class Node:
     outgoing_raw: str = None
     incoming: str = None  # data used as input (FN/TST only) — comma-separated, from IO_RE
     outgoing: str = None  # data produced as output (FN/TST only) — comma-separated, from IO_RE
+    # source line numbers for each marker, 1-based — populated by parse_kant, never round-tripped
+    # (raw_* strings already carry the real content); exists purely so post-parse validation
+    # (kant/syntax.py's audit_kant_headers) can report exact locations without a second scan.
+    open_line: int = None
+    closed_line: int = None
+    category_line: int = None
+    tagline_line: int = None
+    # root-only: (line_no, tag, 'category'|'tagline') for every CATEGORY/tagline marker that was
+    # seen but never resolved into a following OPEN — silently kept as plain text otherwise.
+    orphaned: list = field(default_factory=list)
 
 
 def parse_kant(source: str) -> Node:
     root = Node(tag='ROOT', name='', open_raw=None)
     stack = [root]
     open_lines = [0]  # lockstep with `stack`, for error messages
-    pending_category = pending_tag = None  # (raw_line, tag, text)
+    pending_category = pending_tag = None  # (line_no, raw_line, tag, text)
     last_closed = None  # node closed by the immediately preceding line, for INCOMING/OUTGOING
 
     def current_body():
@@ -105,31 +115,40 @@ def parse_kant(source: str) -> Node:
         else:
             body.append(Run(lines=[text]))
 
+    def flush_orphan(pending, kind):
+        # the pending CATEGORY/tagline line never reached a following OPEN — kept as plain text
+        # (unchanged legacy behavior) but also recorded so audit_kant_headers can flag it
+        push_line(pending[1])
+        root.orphaned.append((pending[0], pending[2], kind))
+
     lines = source.split('\n')
     for line_no, line in enumerate(lines, start=1):
         m = CATEGORY_RE.match(line)
         if m:
             if pending_category:  # unresolved header line, never reached an OPEN — keep it as text
-                push_line(pending_category[0])
-            pending_category = (line, m.group(1), m.group(2))
+                flush_orphan(pending_category, 'category')
+            pending_category = (line_no, line, m.group(1), m.group(2))
             last_closed = None
             continue
         m = OPEN_RE.match(line)
         if m:
             tag, id_, name = m.group(1), m.group(2), m.group(3)
             if pending_tag:
-                desc = _short_desc(pending_tag[2])
+                desc = _short_desc(pending_tag[3])
             elif pending_category:
-                desc = _short_desc(pending_category[2])
+                desc = _short_desc(pending_category[3])
             else:
                 desc = _short_desc(name)
             node = Node(
                 tag=tag, name=name, open_raw=line,
-                category_raw=pending_category[0] if pending_category else None,
-                tag_raw=pending_tag[0] if pending_tag else None,
+                category_raw=pending_category[1] if pending_category else None,
+                tag_raw=pending_tag[1] if pending_tag else None,
                 desc=desc,
-                category_desc=_short_desc(pending_category[2]) if pending_category else None,
+                category_desc=_short_desc(pending_category[3]) if pending_category else None,
                 uid=id_,
+                open_line=line_no,
+                category_line=pending_category[0] if pending_category else None,
+                tagline_line=pending_tag[0] if pending_tag else None,
             )
             pending_category = pending_tag = None
             current_body().append(node)
@@ -143,9 +162,9 @@ def parse_kant(source: str) -> Node:
             # flush any header line that never resolved into an OPEN, before popping the stack,
             # so it stays inside the node being closed instead of landing after it once popped
             if pending_category:
-                push_line(pending_category[0]); pending_category = None
+                flush_orphan(pending_category, 'category'); pending_category = None
             if pending_tag:
-                push_line(pending_tag[0]); pending_tag = None
+                flush_orphan(pending_tag, 'tagline'); pending_tag = None
             last_closed = None
             if len(stack) <= 1:
                 raise KantParseError(f'[{tag} CLOSED] {name} has no matching OPEN', line_no)
@@ -161,6 +180,7 @@ def parse_kant(source: str) -> Node:
                     f'its OPEN (#{top.uid})', line_no, open_lines[-1],
                 )
             top.closed_raw = line
+            top.closed_line = line_no
             last_closed = top
             stack.pop()
             open_lines.pop()
@@ -181,21 +201,21 @@ def parse_kant(source: str) -> Node:
         m = TAGLINE_RE.match(line)
         if m:
             if pending_tag:  # unresolved header line, never reached an OPEN — keep it as text
-                push_line(pending_tag[0])
-            pending_tag = (line, m.group(1), m.group(3))
+                flush_orphan(pending_tag, 'tagline')
+            pending_tag = (line_no, line, m.group(1), m.group(3))
             last_closed = None
             continue
         # flush any tentative header lines that never resolved into an OPEN (plain comment lines)
         if pending_category:
-            push_line(pending_category[0]); pending_category = None
+            flush_orphan(pending_category, 'category'); pending_category = None
         if pending_tag:
-            push_line(pending_tag[0]); pending_tag = None
+            flush_orphan(pending_tag, 'tagline'); pending_tag = None
         push_line(line)
         last_closed = None
     if pending_category:
-        push_line(pending_category[0])
+        flush_orphan(pending_category, 'category')
     if pending_tag:
-        push_line(pending_tag[0])
+        flush_orphan(pending_tag, 'tagline')
     if len(stack) > 1:
         unclosed = stack[-1]
         raise KantParseError(

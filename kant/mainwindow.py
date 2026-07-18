@@ -47,7 +47,7 @@ from kant.lsp import LSP_SERVERS_BY_EXT, file_uri, path_from_file_uri, lsp_serve
 from kant.dialogs import IdeDialogsMixin
 from kant.gitops import GitOpsMixin
 from kant.projectops import (
-    build_kant_map, definition_locations, has_any_kant_tags, iter_kant_tagged_files,
+    _canonical_map_text, build_kant_map, definition_locations, has_any_kant_tags, iter_kant_tagged_files,
     reference_locations, scan_project_replace, search_project, validate_kant_project,
 )
 from kant.pyenv import (
@@ -939,7 +939,6 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.claude_pane.focus_hint = self._build_ai_focus_summary
         self.claude_pane.refresh_focus_label()
         self.claude_pane.finished.connect(self._finish_ai_review)
-        self.claude_pane.finished.connect(self._refresh_and_validate_after_ai)
 
         self.terminal_dock = self._build_terminal_dock()
         self._style_io_tabs()
@@ -2299,6 +2298,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         def save_map(text, error):
             if error or generation != self._map_sync_generation or project_root != self.project_root_path:
                 return
+            if os.path.isfile(path):
+                try:
+                    existing = Path(path).read_text(encoding='utf-8')
+                except OSError:
+                    existing = None
+                if existing is not None and _canonical_map_text(existing) == _canonical_map_text(text):
+                    self.kant_map_path = path
+                    self._update_kant_map_label()
+                    return
             try:
                 write_file_atomic(path, text)
             except OSError:
@@ -2315,14 +2323,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if not self.project_root_path:
             return ''
         self._check_kant_map(self.project_root_path)
-        result, errors, visual_errors, map_out_of_sync = validate_kant_project(self.project_root_path, self.kant_map_path)
+        result, errors, visual_errors, map_state, warnings = validate_kant_project(self.project_root_path, self.kant_map_path)
 
-        if map_out_of_sync:
-            # "map non coerente" (KANT_<project>.md missing entries the source now has) is the one
-            # validation failure that's mechanically, deterministically fixable — it's exactly what
-            # _sync_kant_map already regenerates from source on every save. No reason to surface it
+        if map_state == 'non_sincronizzata':
+            # the one validation failure that's mechanically, deterministically fixable — it's
+            # exactly what _sync_kant_map already regenerates from source. No reason to surface it
             # as an error the user has to notice and manually resync themselves; self-heal instead
-            # and only report whatever real (marker-syntax) errors remain, if any.
+            # and only report whatever real (marker-syntax) errors remain, if any. Deliberately NOT
+            # done when map_state == 'marker_invalidi' — regenerating a map from source that itself
+            # fails validation would just write a different-but-still-wrong map.
             errors = [e for e in errors if not e.startswith('KANT map non coerente')]
             self._sync_kant_map()
             note = 'mappa KANT non coerente con il codice — rigenerata automaticamente'
@@ -2332,6 +2341,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 result = f'# KANT verifica: ERRORI\n{sample}{extra}\n# ({note})'
             else:
                 result = f'# KANT verifica: OK ({note})'
+
+        if warnings:
+            sample = '\n'.join(f'- {warning}' for warning in warnings[:8])
+            extra = f'\n- ... altri {len(warnings) - 8} avvisi' if len(warnings) > 8 else ''
+            result = f'{result}\n# AVVISI\n{sample}{extra}'
 
         self._show_validation_results(errors, visual_errors)
         return result

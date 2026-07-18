@@ -24,10 +24,50 @@ from PySide6.QtWidgets import (
 )
 
 from kant import theme
+from kant.groupings import remap_member_key
 from kant.icons import draw_icon
 from kant.model import Node
 from kant.xref import XrefElement
 
+
+# [FN] _position_settings_key — the QSettings key MAPPA's node coordinates are stored under for a
+# project; one key per project (not per node). Factored out of XrefMapDialog.set_graph so
+# migrate_position_keys below can compute the identical key without a live dialog instance.
+# [FN OPEN] _position_settings_key
+def _position_settings_key(project_path, project_name=''):
+    identity = os.path.normcase(os.path.abspath(project_path or project_name or '.'))
+    return 'xrefPositionsV2/' + hashlib.sha1(identity.encode('utf-8')).hexdigest()
+# [FN CLOSED] _position_settings_key
+
+
+# [FN CATEGORY] migrate_position_keys — after KANT IDE renames a file or folder, remaps MAPPA's
+# persisted node coordinates the same way kant/groupings.py:migrate_member_paths remaps Grouping
+# members — same remap_member_key rule, same key format, so a renamed node keeps its manually
+# dragged position instead of silently losing it the next time set_graph filters positions down to
+# elements it can still find (see set_graph's `self._positions = {... if key in elements}`, which is
+# exactly where an unmigrated rename's coordinates would otherwise vanish). Not a dialog method —
+# the coordinates persist in QSettings whether or not MAPPA is currently open.
+# [FN] migrate_position_keys — remaps MAPPA's saved coordinates after a rename; True if changed
+# [FN OPEN] migrate_position_keys
+def migrate_position_keys(project_path, old_rel, new_rel, is_dir):
+    settings = QSettings('KANT', 'KANT Editor')
+    key = _position_settings_key(project_path)
+    try:
+        data = json.loads(settings.value(key, '{}'))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    changed = False
+    remapped = {}
+    for member_key, value in data.items():
+        new_key = remap_member_key(member_key, old_rel, new_rel, is_dir)
+        changed = changed or new_key != member_key
+        remapped[new_key] = value
+    if changed:
+        settings.setValue(key, json.dumps(remapped))
+    return changed
+# [FN CLOSED] migrate_position_keys
 
 
 
@@ -1510,8 +1550,7 @@ class XrefMapDialog(QDialog):
     # [FN] set_graph — loads a fresh full graph and renders it (keeping the user's filter state)
     # [FN OPEN] set_graph
     def set_graph(self, elements, project_name='', project_path=''):
-        identity = os.path.normcase(os.path.abspath(project_path or project_name or '.'))
-        position_key = 'xrefPositionsV2/' + hashlib.sha1(identity.encode('utf-8')).hexdigest()
+        position_key = _position_settings_key(project_path, project_name)
         new_project = position_key != self._position_key
         if position_key != self._position_key:
             self._position_key = position_key
