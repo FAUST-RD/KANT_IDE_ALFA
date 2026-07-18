@@ -1447,18 +1447,25 @@ class KantSmokeTest(unittest.TestCase):
             module_uid = next(item.uid for item in module_tree.body if isinstance(item, Node))
             MainWindow._update_io_tabs(io_window, module_uid)
             # selecting the module aggregates its children's (alpha's) references, not just the
-            # module's own empty direct incoming/outgoing
-            assert io_window.incoming_view.count() == 1 and 'helper' in io_window.incoming_view.item(0).text()
-            assert io_window.outgoing_view.count() == 1 and 'helper' in io_window.outgoing_view.item(0).text()
+            # module's own empty direct incoming/outgoing. The item itself carries no text (see
+            # _update_io_tabs's fill()) — only the widget set via setItemWidget is drawn, so
+            # visible content is checked there, not on the item.
+            assert io_window.incoming_view.count() == 1 and not io_window.incoming_view.item(0).text()
+            assert io_window.outgoing_view.count() == 1 and not io_window.outgoing_view.item(0).text()
             incoming_label = io_window.incoming_view.itemWidget(io_window.incoming_view.item(0))
+            outgoing_label = io_window.outgoing_view.itemWidget(io_window.outgoing_view.item(0))
+            assert 'helper' in incoming_label.text() and 'helper' in outgoing_label.text()
             assert '[FN]' in incoming_label.text() and 'border-bottom:2px solid' in incoming_label.styleSheet()
             # the whole-file view (uid=None — file tree item, or a tab with no section filter) is the
             # same module element, not "nothing selected"; it must aggregate the same way
             io_window.incoming_view.clear()
             io_window.outgoing_view.clear()
             MainWindow._update_io_tabs(io_window, None)
-            assert io_window.incoming_view.count() == 1 and 'helper' in io_window.incoming_view.item(0).text()
-            assert io_window.outgoing_view.count() == 1 and 'helper' in io_window.outgoing_view.item(0).text()
+            assert io_window.incoming_view.count() == 1 and not io_window.incoming_view.item(0).text()
+            assert io_window.outgoing_view.count() == 1 and not io_window.outgoing_view.item(0).text()
+            incoming_label = io_window.incoming_view.itemWidget(io_window.incoming_view.item(0))
+            outgoing_label = io_window.outgoing_view.itemWidget(io_window.outgoing_view.item(0))
+            assert 'helper' in incoming_label.text() and 'helper' in outgoing_label.text()
 
     def test_xref_map_view_and_dialog_interactions(self):
         with _temp_dir() as tmp:

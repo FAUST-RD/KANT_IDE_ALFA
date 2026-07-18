@@ -1,5 +1,8 @@
 KANT IDE changelog
 
+2026-07-19 (76)
+- Fixed duplicated text in the Incoming/Outgoing panel rows: each row was both a QListWidgetItem constructed WITH its own visible text AND a separate styled QLabel drawn on top via setItemWidget (which doesn't clear the item's own text/foreground painting underneath it) — the item now carries no text of its own, only selection data; the label is the sole thing drawn.
+
 2026-07-19 (75)
 - Night mode's background is now true black (`#000000`), not the earlier navy-tinted dark palette — BORDER/hover/disabled shades adjusted to match; KANT tag color-coding (TAG_COLORS/TAG_BACKGROUNDS) deliberately left untouched.
 - Fixed a stale comment in mainwindow.py still describing the removed "KANT IDE" title-bar wordmark as if it were still there.

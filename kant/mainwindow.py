@@ -2218,9 +2218,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             # short description (what the left tree shows), and hovering gives the category text
             for target_key in sorted(keys, key=lambda k: (xref[k].file, xref[k].desc)):
                 el = xref[target_key]
-                item = QListWidgetItem(f'{arrow}  [{el.tag}] {el.desc}      ·  {el.file}')
+                # no text passed to the item itself: it's just a data/selection carrier here, the
+                # QLabel set below via setItemWidget is the only thing actually drawn — giving the
+                # item its own text too used to paint both, since setItemWidget doesn't clear an
+                # item's own text/foreground painting underneath the widget it hosts
+                item = QListWidgetItem()
                 item.setData(ROLE_KEY, target_key)
-                item.setForeground(QColor(theme.TAG_COLORS.get(el.tag, theme.TEXT)))
                 item.setToolTip(el.category_desc or 'Doppio clic per aprire')
                 view.addItem(item)
                 color = theme.TAG_COLORS.get(el.tag, theme.TEXT)
