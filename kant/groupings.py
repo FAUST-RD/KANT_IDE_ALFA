@@ -113,7 +113,10 @@ def migrate_member_paths(project_root, old_rel, new_rel, is_dir):
     groupings = load_groupings(project_root)
     changed = False
     for grouping in groupings:
-        remapped = [remap_member_key(key, old_rel, new_rel, is_dir) for key in grouping.members]
+        # dict.fromkeys dedupes while preserving order — if two distinct old keys ever remapped onto
+        # the same new key (a rename target colliding with an existing member), keep one entry
+        # instead of a stray duplicate; mirrors migrate_position_keys' own collision handling below
+        remapped = list(dict.fromkeys(remap_member_key(key, old_rel, new_rel, is_dir) for key in grouping.members))
         if remapped != grouping.members:
             grouping.members = remapped
             changed = True

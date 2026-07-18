@@ -21,7 +21,6 @@ from kant.fileio import file_fingerprint, is_safe_child_name, write_bytes_atomic
 from kant.groupings import migrate_member_paths
 from kant.mappa import migrate_position_keys
 from kant.model import KantParseError, parse_kant, serialize_kant
-from kant.projectops import validate_kant_project
 
 
 ROLE_PATH = Qt.UserRole + 1
@@ -413,6 +412,14 @@ class WorkspaceMixin:
     def _on_tab_saved(self, tab):
         self._watch_open_file(tab.path)
         self._sync_kant_map()
+        # a save can add/rename/delete KANT elements (new element via "+", a metadata edit, a
+        # hand-typed marker) that the left "Codice" tree needs to reflect — don't rely solely on the
+        # QFileSystemWatcher noticing an in-place atomic replace of an already-watched file (an
+        # os.replace over an existing name doesn't reliably read as a directory change on every
+        # OS/Qt backend); arm the same debounce timer directly, exactly like
+        # _create_new_file/_prompt_add_file/_create_new_folder/_rename_tree_item already do for
+        # their own filesystem mutations
+        self.fs_refresh_timer.start(400)
 
     def _refresh_after_fs_change(self):
         if not self.project_root_path:
@@ -534,12 +541,11 @@ class WorkspaceMixin:
             self.claude_pane.validate_after_finish = False
             if action == 'apply':
                 normalized, id_skipped = normalize_missing_ids(self.project_root_path, kept)
-                result, errors, visual_errors, map_state, warnings = validate_kant_project(
-                    self.project_root_path, self.kant_map_path,
-                )
-                if map_state != 'marker_invalidi':
-                    self._sync_kant_map()
-                self._show_validation_results(errors, visual_errors)
+                # reuse the same result/warnings composition and self-heal logic the manual
+                # "Verifica" button uses, just widened to also generate a map that didn't exist yet
+                # (a first-time AI tagging run) — never widened to 'marker_invalidi', which must
+                # never regenerate the map (kept as the shared default, not passed here)
+                result = self._validate_kant_project(extra_sync_states=('assente', 'errore_generazione'))
                 self._refresh_after_fs_change()
                 result_message = 'Modifiche AI revisionate e applicate'
                 if normalized:

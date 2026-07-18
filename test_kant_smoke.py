@@ -28,7 +28,7 @@ from kant import widgets as kant_widgets_module
 from kant import fileio as kant_fileio_module
 from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT, ROLE_LINE, ROLE_KEY
 from kant.lsp import file_uri, LspClient
-from kant.model import Node, Run, parse_kant, serialize_kant, read_top_level_label_result
+from kant.model import Node, Run, build_new_element_node, parse_kant, serialize_kant, read_top_level_label_result
 from kant.pyenv import (
     dependency_file, detect_venvs, has_module, interpreter_label, interpreter_version,
     is_python_majority_project, load_interpreter, save_interpreter,
@@ -37,7 +37,7 @@ from kant.xref import build_xref, XrefElement
 from kant.widgets import (
     ClaudePane, CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard,
     _AiReviewCard, _agent_command, _markdown_to_html, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
-    _code_hover_popup_instance, make_app_icon, make_app_pixmap, vim_mode_enabled,
+    _code_hover_popup_instance, make_app_icon, make_app_pixmap, set_vim_mode, vim_mode_enabled,
     compress_attached_image, convert_attached_document,
 )
 from kant.mappa import (
@@ -2073,6 +2073,8 @@ class KantSmokeTest(unittest.TestCase):
             w._xref_pending_generation = None
             w.map_dialog = None
             w._map_sync_generation = 0
+            w._map_sync_running = False
+            w._map_sync_rerun_needed = False
             w._run_background = lambda work, done: done(work(), None)
 
             result = MainWindow._validate_kant_project(w)
@@ -2097,6 +2099,8 @@ class KantSmokeTest(unittest.TestCase):
             w._xref_pending_generation = None
             w.map_dialog = None
             w._map_sync_generation = 0
+            w._map_sync_running = False
+            w._map_sync_rerun_needed = False
             w._run_background = lambda work, done: done(work(), None)
             MainWindow._sync_kant_map(w)
             assert (root / f'KANT_{root.name}.md').exists()
@@ -2428,15 +2432,22 @@ class KantSmokeTest(unittest.TestCase):
             edits = window.active_page.findChildren(CodeEdit)
             assert len(edits) == 2, f'expected 2 CodeEdits, got {len(edits)} (stale duplicates from a double render?)'
 
-            edits[0].setFocus()
-            app.processEvents()
-            QTest.keyClicks(edits[0], 'j')
-            app.processEvents()
-            assert QApplication.focusWidget() is edits[1]
+            # vim mode defaults off (test_vim_mode_disabled_by_default) — the 'j'/'k' motions this
+            # test exercises only fire in vim mode, so enable it here and restore the default
+            # afterward, or the flag leaks into whichever test runs next
+            set_vim_mode(True)
+            try:
+                edits[0].setFocus()
+                app.processEvents()
+                QTest.keyClicks(edits[0], 'j')
+                app.processEvents()
+                assert QApplication.focusWidget() is edits[1]
 
-            QTest.keyClicks(edits[1], 'k')
-            app.processEvents()
-            assert QApplication.focusWidget() is edits[0]
+                QTest.keyClicks(edits[1], 'k')
+                app.processEvents()
+                assert QApplication.focusWidget() is edits[0]
+            finally:
+                set_vim_mode(False)
             window.close()
 
     def test_file_and_element_preview_tabs_reuse_until_pinned_or_dirty(self):
@@ -2594,12 +2605,31 @@ class KantSmokeTest(unittest.TestCase):
             assert len(tab.tree.body) == body_count_before + 1
             new_node = tab.tree.body[-1]
             assert new_node.tag == 'FN' and new_node.name == 'nuova_funzione'
-            assert tab.dirty
+            # regression: the left "Codice" tree reads from disk (_rebuild_tree re-parses files),
+            # never from in-memory tab state — _prompt_add_element used to only mark_dirty() and
+            # wait up to 2s for autosave, so the tree wouldn't show a just-added element for a
+            # while (or not at all, if the fs-watcher missed the eventual autosave's directory
+            # event). It now saves immediately, so the tab is clean again and the file on disk
+            # already has the new element.
+            assert not tab.dirty
+            assert 'nuova_funzione' in source.read_text(encoding='utf-8')
+            # regression: build_new_element_node used to write the CATEGORY line as just the bare
+            # description (no name — e.g. "[FN CATEGORY] fa qualcosa" instead of "... nuova_funzione
+            # — fa qualcosa") and never emitted a tag line at all, so every element created through
+            # this UI silently violated the KANT convention from the moment it was inserted
+            assert new_node.category_raw is not None and 'nuova_funzione' in new_node.category_raw
+            assert new_node.tag_raw is not None and 'nuova_funzione' in new_node.tag_raw
 
             text = serialize_kant(tab.tree)
             assert 'def nuova_funzione():' in text
             reparsed = parse_kant(text)
             assert reparsed.body[-1].name == 'nuova_funzione'
+            # the file's pre-existing 'alpha'/MOD markers are a deliberately bare legacy-style
+            # fixture (no CATEGORY/tagline at all) and still warn on their own — only assert the
+            # newly generated element itself introduces no errors or warnings
+            audit = audit_kant_headers(text)
+            assert audit['errors'] == []
+            assert not any('nuova_funzione' in w['message'] for w in audit['warnings'])
             window.close()
 
     def test_add_file_block_creates_and_opens_language_aware_file(self):
@@ -2694,6 +2724,28 @@ class KantSmokeTest(unittest.TestCase):
             assert window.fs_refresh_timer.isActive()
             window._refresh_after_fs_change()
             assert not window.fs_refresh_timer.isActive()
+            window.close()
+
+    def test_saving_a_tab_arms_the_left_tree_refresh_timer(self):
+        # regression: the left "Codice" tree only ever repopulated via _rebuild_tree, which itself
+        # only ran through the QFileSystemWatcher noticing a directory change — _on_tab_saved never
+        # triggered a refresh directly, so an in-place atomic save (write_file_atomic: mkstemp +
+        # os.replace over the SAME filename) could leave the tree stale if the OS/Qt watcher backend
+        # didn't treat that as a directory change. Saving now arms the same debounce timer directly,
+        # exactly like create/rename/delete already do for their own filesystem mutations.
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            source = project / 'sample.py'
+            source.write_text('# [MOD OPEN] sample.py\npass\n# [MOD CLOSED] sample.py\n', encoding='utf-8')
+            window = MainWindow()
+            window.project_root_path = str(project)
+            assert window._open_file(str(source))
+            tab = window.open_tabs[str(source)]
+            assert not window.fs_refresh_timer.isActive()
+            tab.tree.body.append(build_new_element_node('FN', 'added_later', 'desc', 'Python'))
+            tab.mark_dirty()
+            assert tab.save()
+            assert window.fs_refresh_timer.isActive()  # armed directly by the save, not left to chance
             window.close()
 
     def test_rollback_snapshot_reports_undeletable_directories_instead_of_swallowing(self):
@@ -3185,6 +3237,8 @@ class KantSmokeTest(unittest.TestCase):
             w._xref_pending_generation = None
             w.map_dialog = None
             w._map_sync_generation = 0
+            w._map_sync_running = False
+            w._map_sync_rerun_needed = False
             w._run_background = lambda work, done: done(work(), None)
             MainWindow._sync_kant_map(w)
             map_path = root / f'KANT_{root.name}.md'
@@ -3228,6 +3282,47 @@ class KantSmokeTest(unittest.TestCase):
             _review, resolved = offered[0]
             resolved('apply', {'app.py': set()}, {})  # reject every hunk, but resolve the review
             assert sync_calls == [True]  # only now, after resolution, did the map-sync path run
+            window.close()
+
+    def test_ai_review_apply_generates_first_map_and_surfaces_warnings(self):
+        # regression for a real bug found in code review: resolved()'s apply branch used to call
+        # validate_kant_project() directly with a stale self.kant_map_path (never refreshed via
+        # _check_kant_map first) and never appended `warnings` to the chat message — so a first-ever
+        # AI-driven tagging run showed a confusing "manca KANT_*.md" error in chat even while
+        # silently creating the file in the background, and every audit_kant_headers warning
+        # (missing headers, unknown tags, cross-file duplicate ids) was dropped after every apply.
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'app.py').write_text(
+                '# [MOD OPEN #abc] app.py\nprint(1)\n# [MOD CLOSED #abc] app.py\n', encoding='utf-8',
+            )
+            # a second tagged file with no CATEGORY/tagline at all — a real audit_kant_headers
+            # warning, present from the start so it's still there after the (unrelated) AI edit
+            (root / 'warn.py').write_text(
+                '# [FN OPEN #def] helper\npass\n# [FN CLOSED #def] helper\n', encoding='utf-8',
+            )
+            window = MainWindow()
+            window.project_root_path = str(root)
+            window._run_background = lambda work, done: done(work(), None)  # deterministic, no race
+            assert not (root / f'KANT_{root.name}.md').exists()  # no map yet — starts 'assente'
+            window._ai_snapshot = create_snapshot(str(root), set())
+            (root / 'app.py').write_text(
+                '# [MOD OPEN #abc] app.py\nprint(2)\n# [MOD CLOSED #abc] app.py\n', encoding='utf-8',
+            )
+            window.claude_pane.auto_permissions.setChecked(False)
+            offered = []
+            window.claude_pane.offer_ai_review = lambda review, render_text, resolved: offered.append((review, resolved))
+            messages = []
+            window.claude_pane.write_info = lambda text: messages.append(text)
+
+            window._finish_ai_review()
+            _review, resolved = offered[0]
+            resolved('apply', {'app.py': {0}}, {})
+
+            assert (root / f'KANT_{root.name}.md').exists()  # generated even though state was 'assente'
+            combined = '\n'.join(messages)
+            assert 'manca KANT' not in combined  # stale error text no longer shown alongside the fix
+            assert 'CATEGORY mancante' in combined or 'tagline mancante' in combined  # warnings now surface
             window.close()
 
     def test_ai_review_rollback_does_not_normalize_ids_or_touch_map(self):

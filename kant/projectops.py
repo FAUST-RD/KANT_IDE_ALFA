@@ -11,7 +11,7 @@ from pathlib import Path
 from kant import theme
 from kant.fileio import file_fingerprint
 from kant.model import Node, read_top_level_label, read_top_level_label_result
-from kant.syntax import audit_kant_headers, check_kant_markers
+from kant.syntax import audit_kant_headers
 
 
 def iter_project_text_files(root):
@@ -106,8 +106,8 @@ def _collect_uids(tree, rel, into):
 
 
 # [FN CATEGORY] validate_kant_project — single project-wide scan: per-file marker validation (hard
-# errors from check_kant_markers/audit_kant_headers, soft warnings from audit_kant_headers plus
-# cross-file duplicate #id detection) feeding one of five mutually exclusive map states. Structural
+# errors and soft warnings, both from audit_kant_headers) plus cross-file duplicate #id detection,
+# feeding one of five mutually exclusive map states. Structural
 # marker errors take precedence over the map comparison — a broken source file means the canonical
 # map can't be trusted to represent it, so map sync is never even evaluated in that case.
 # [FN] validate_kant_project — full marker + canonical map-sync validation for a project
@@ -134,12 +134,10 @@ def validate_kant_project(root, map_path):
             errors.append(f'{rel}: non leggibile: {error}')
             continue
         checked_markers += 1
-        result = check_kant_markers(text)
-        if not result['ok']:
-            line = result.get('line', 1)
-            message = result.get('message', 'marker KANT non valido')
-            errors.append(f'{rel}:{line} {message}')
-            visual_errors.append((path, rel, line, message))
+        # audit_kant_headers's hard-error set is a strict superset of check_kant_markers's (parse
+        # errors + duplicate #id, plus tag/name coherence and orphaned headers) — calling both here
+        # reported every parse/duplicate-id error twice; check_kant_markers stays the live/cheap
+        # per-keystroke check elsewhere, this full-project scan only needs the richer one.
         audit = audit_kant_headers(text)
         for entry in audit['errors']:
             errors.append(f"{rel}:{entry['line']} {entry['message']}")

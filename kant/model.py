@@ -440,11 +440,16 @@ def build_new_element_node(tag, name, desc, language):
 
     uid = secrets.token_hex(4)
     code = element_skeleton(tag, name, language)
+    # convention requires "Name — description" on both the CATEGORY and tag lines (see
+    # kant-comment-standard/SKILL.md) — a bare description with no name prefix fails the
+    # CATEGORY/tagline-vs-OPEN name-consistency check (kant/syntax.py:audit_kant_headers)
+    header = f'{name} — {desc}' if desc else name
     return Node(
         tag=tag, name=name,
         open_raw=marker(f'[{tag} OPEN #{uid}] {name}'),
         closed_raw=marker(f'[{tag} CLOSED #{uid}] {name}'),
-        category_raw=marker(f'[{tag} CATEGORY] {desc}') if desc else None,
+        category_raw=marker(f'[{tag} CATEGORY] {header}') if desc else None,
+        tag_raw=marker(f'[{tag}] {header}'),
         desc=desc, category_desc=desc or None, uid=uid,
         body=[Run(lines=code.split('\n'))] if code.strip() else [],
     )
@@ -550,6 +555,18 @@ def serialize_kant(node: Node) -> str:
 # always re-read, never on content hash (a stat() is one syscall; hashing still means reading the
 # whole file, which is exactly the cost this exists to avoid).
 _label_cache = {}
+# ponytail: caps memory growth across a long session that opens many different projects (nothing
+# ever evicts on project switch otherwise) — plain insertion-order eviction of the oldest half, not
+# true LRU, since a fresh hit doesn't move an entry to the end; good enough to bound growth without
+# tracking access order for something this cheap to recompute on a miss.
+_LABEL_CACHE_MAX = 5000
+
+
+def _cache_label(abspath, stat_key, result):
+    if len(_label_cache) >= _LABEL_CACHE_MAX:
+        for stale_path in list(_label_cache)[:_LABEL_CACHE_MAX // 2]:
+            _label_cache.pop(stale_path, None)
+    _label_cache[abspath] = (stat_key, result)
 
 
 # [FN CATEGORY] read_top_level_label — reads a file and parses it just to find its first top-level
@@ -577,17 +594,17 @@ def read_top_level_label_result(path):
             text = f.read()
     except (UnicodeDecodeError, OSError):
         result = (None, None)
-        _label_cache[abspath] = (stat_key, result)
+        _cache_label(abspath, stat_key, result)
         return result
     try:
         tree = parse_kant(text)
     except KantParseError as e:
         result = (None, e)
-        _label_cache[abspath] = (stat_key, result)
+        _cache_label(abspath, stat_key, result)
         return result
     top = next((c for c in tree.body if isinstance(c, Node)), None)
     result = (None, None) if top is None else ((top.tag, (top.desc or top.name), tree, top), None)
-    _label_cache[abspath] = (stat_key, result)
+    _cache_label(abspath, stat_key, result)
     return result
 
 

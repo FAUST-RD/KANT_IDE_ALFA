@@ -194,6 +194,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._test_run_pending = False
         self._ai_snapshot = None
         self._map_sync_generation = 0
+        self._map_sync_running = False
+        self._map_sync_rerun_needed = False
+        self._splitter_save_timers = {}
         self.syntax_timer = QTimer(self)
         self.syntax_timer.setSingleShot(True)
         self.syntax_timer.timeout.connect(self._update_syntax_status)
@@ -298,6 +301,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._closing = True
         for timer in (self.syntax_timer, self.lsp_timer, self.fs_refresh_timer):
             timer.stop()
+        # QApplication is a process-wide singleton that outlives this window — without this, its
+        # focusChanged connection keeps a strong reference to self forever, so this MainWindow (and
+        # everything it owns) is never garbage-collected even after close()
+        QApplication.instance().focusChanged.disconnect(self._on_focus_changed)
         self._background.shutdown(wait=False, cancel_futures=True)
         for proc in (self.terminal.process, self.claude_pane.process):
             if proc is not None:
@@ -333,6 +340,19 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _finish_background(self, done, value, error):
         if not self._closing:
             done(value, error)
+
+    # [FN] _debounce_splitter_save — coalesces a splitter's own QSettings write to one per pause in
+    # dragging, instead of once per mouse-move tick splitterMoved otherwise fires on
+    # [FN OPEN] _debounce_splitter_save
+    def _debounce_splitter_save(self, key, splitter):
+        timer = self._splitter_save_timers.get(key)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self.settings.setValue(key, splitter.sizes()))
+            self._splitter_save_timers[key] = timer
+        timer.start(200)
+    # [FN CLOSED] _debounce_splitter_save
 
     # [FN CATEGORY] _check_crash_recovery — a "session/cleanExit" flag is set False the moment a run
     # starts and only set True again in closeEvent; if it's still False on the NEXT startup, the
@@ -954,7 +974,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         else:
             self.workspace_splitter.setSizes([theme.TREE_MIN_WIDTH, 900])
         self.workspace_splitter.splitterMoved.connect(
-            lambda *_: self.settings.setValue('workspaceSplitterSizes', self.workspace_splitter.sizes())
+            lambda *_: self._debounce_splitter_save('workspaceSplitterSizes', self.workspace_splitter)
         )
 
         self.main_splitter = QSplitter(Qt.Vertical)
@@ -968,7 +988,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         else:
             self.main_splitter.setSizes([650, 180])
         self.main_splitter.splitterMoved.connect(
-            lambda *_: self.settings.setValue('mainVerticalSplitterSizes', self.main_splitter.sizes())
+            lambda *_: self._debounce_splitter_save('mainVerticalSplitterSizes', self.main_splitter)
         )
 
         self.splitter = QSplitter(Qt.Horizontal)
@@ -982,7 +1002,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         else:
             self.splitter.setSizes([1320, 460])
         self.splitter.splitterMoved.connect(
-            lambda *_: self.settings.setValue('splitterSizes', self.splitter.sizes())
+            lambda *_: self._debounce_splitter_save('splitterSizes', self.splitter)
         )
         self.splitter.splitterMoved.connect(lambda *_: self._position_claude_tab())
         root_layout.addWidget(self.splitter, 1)
@@ -2291,11 +2311,23 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         path = self.kant_map_path or os.path.join(project_root, f'KANT_{project_name}.md')
         self._map_sync_generation += 1
         generation = self._map_sync_generation
+        if self._map_sync_running:
+            # a build is already in flight for an older generation; it'll see this one and skip its
+            # own write, so just note another sync is owed instead of queuing a second full-project
+            # os.walk on top of the one already running — every save (_on_tab_saved) calls this
+            self._map_sync_rerun_needed = True
+            return
+        self._map_sync_running = True
 
         def build_map():
             return build_kant_map(project_root, project_name)
 
         def save_map(text, error):
+            self._map_sync_running = False
+            if self._map_sync_rerun_needed:
+                self._map_sync_rerun_needed = False
+                self._sync_kant_map()
+                return
             if error or generation != self._map_sync_generation or project_root != self.project_root_path:
                 return
             if os.path.isfile(path):
@@ -2317,30 +2349,45 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._run_background(build_map, save_map)
     # [FN CLOSED] _sync_kant_map
 
+    # [FN CATEGORY] _validate_kant_project — the single place that composes a validate_kant_project()
+    # call into user-facing result text: refreshes kant_map_path first (a map created moments ago,
+    # e.g. by an AI review, wouldn't otherwise be seen), self-heals a fixable desync, and appends
+    # warnings. extra_sync_states lets a caller broaden which map_state values trigger a self-heal
+    # beyond the default 'non_sincronizzata' — the post-AI-apply sequence also wants to generate a
+    # brand new map when one didn't exist yet ('assente'), which the manual "Verifica" button
+    # shouldn't do unprompted.
     # [FN] _validate_kant_project — validates the generated KANT map and marker structure after AI runs
     # [FN OPEN] _validate_kant_project
-    def _validate_kant_project(self):
+    def _validate_kant_project(self, extra_sync_states=()):
         if not self.project_root_path:
             return ''
         self._check_kant_map(self.project_root_path)
         result, errors, visual_errors, map_state, warnings = validate_kant_project(self.project_root_path, self.kant_map_path)
 
-        if map_state == 'non_sincronizzata':
+        # states _sync_kant_map can actually resolve outright: an out-of-date map, or none at all
+        # yet. 'errore_generazione' (unreadable existing file / generation itself raised) is NOT
+        # included here even when a caller widens extra_sync_states to include it — a sync attempt
+        # may well hit the same underlying I/O problem, so its error is never assumed fixed/hidden.
+        fixable_error_prefixes = {'non_sincronizzata': 'KANT map non coerente', 'assente': 'manca KANT_'}
+        fixable_states = {state for state in ('non_sincronizzata', *extra_sync_states) if state in fixable_error_prefixes}
+        if map_state in fixable_states:
             # the one validation failure that's mechanically, deterministically fixable — it's
             # exactly what _sync_kant_map already regenerates from source. No reason to surface it
             # as an error the user has to notice and manually resync themselves; self-heal instead
             # and only report whatever real (marker-syntax) errors remain, if any. Deliberately NOT
             # done when map_state == 'marker_invalidi' — regenerating a map from source that itself
             # fails validation would just write a different-but-still-wrong map.
-            errors = [e for e in errors if not e.startswith('KANT map non coerente')]
+            errors = [e for e in errors if not e.startswith(fixable_error_prefixes[map_state])]
             self._sync_kant_map()
-            note = 'mappa KANT non coerente con il codice — rigenerata automaticamente'
+            note = 'mappa KANT rigenerata automaticamente'
             if errors:
                 sample = '\n'.join(f'- {error}' for error in errors[:8])
                 extra = f'\n- ... altri {len(errors) - 8} errori' if len(errors) > 8 else ''
                 result = f'# KANT verifica: ERRORI\n{sample}{extra}\n# ({note})'
             else:
                 result = f'# KANT verifica: OK ({note})'
+        elif map_state in extra_sync_states:
+            self._sync_kant_map()  # attempt it anyway, but don't claim/hide anything unverified
 
         if warnings:
             sample = '\n'.join(f'- {warning}' for warning in warnings[:8])
@@ -4078,6 +4125,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         node = build_new_element_node(tag, name, desc, language)
         tab.tree.body.append(node)
         tab.mark_dirty()
+        # save now instead of waiting on the 2s autosave timer — the left "Codice" tree only
+        # reflects what's on disk (_rebuild_tree re-reads/re-parses files, it never looks at
+        # in-memory tab state), so without this the new element wouldn't show up there for however
+        # long autosave takes to catch up, even though the coding board already shows it
+        tab.save()
         self._invalidate_xref()
         self._render_view(tab, tab.filter_uid)
         self._update_tab_title(tab)
@@ -4295,6 +4347,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if node.outgoing_raw:
             node.outgoing_raw = self._rewrite_marker_line(node.outgoing_raw, f'[{tag} OUTGOING]', f'{name} — {node.outgoing or ""}')
         tab.mark_dirty()
+        tab.save()  # same reasoning as _prompt_add_element — the left tree reads disk, not tab.tree
         self._render_view(tab, tab.filter_uid)
         self._update_tab_title(tab)
 
