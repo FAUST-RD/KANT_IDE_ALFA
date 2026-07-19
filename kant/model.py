@@ -548,6 +548,24 @@ def serialize_kant(node: Node) -> str:
 # [FN CLOSED] serialize_kant
 
 
+# [FN CATEGORY] strip_kant_markers — the inverse of tagging: walks the same tree serialize_kant
+# does, but emits only Run lines, dropping every CATEGORY/tagline/OPEN/CLOSED/INCOMING/OUTGOING
+# marker entirely — the code itself, exactly as it was, with no structural comments left. Used by
+# the "wipe and retag deterministically" project action (kant/mainwindow.py) so a full re-tag
+# starts from genuinely bare code instead of layering a fresh skeleton over stale markers.
+# [FN] strip_kant_markers — reconstructs source text with all KANT markers removed
+# [FN OPEN] strip_kant_markers
+def strip_kant_markers(node: Node) -> str:
+    out = []
+    for item in node.body:
+        if isinstance(item, Run):
+            out.append('\n'.join(item.lines))
+        else:
+            out.append(strip_kant_markers(item))
+    return '\n'.join(out)
+# [FN CLOSED] strip_kant_markers
+
+
 # [CST] _label_cache — abspath -> ((mtime_ns, size), result) for read_top_level_label_result.
 # Every caller (project tree rebuild, xref rebuild, has_any_kant_tags, the KANT map) re-scans every
 # project file on its own schedule; without this, a large project re-reads and re-parses every

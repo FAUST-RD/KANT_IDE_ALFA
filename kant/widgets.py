@@ -3016,7 +3016,7 @@ class TitleBar(QWidget):
         file_menu = self.menu_bar.addMenu('File')
         file_menu.setToolTipsVisible(True)
         self.file_menu_btn = file_menu.menuAction()
-        self.file_menu_btn.setToolTip('Comandi sul file attivo: salva, annulla/ripeti, verifica KANT, esegui, esegui test')
+        self.file_menu_btn.setToolTip('Comandi sul file attivo: salva, annulla/ripeti, esegui, esegui test')
         self.save_menu_action = file_menu.addAction('Salva')
         self.save_menu_action.setToolTip('Salva il file attivo su disco (Ctrl+S)')
         self.save_menu_action.triggered.connect(window._save_file)
@@ -3026,17 +3026,38 @@ class TitleBar(QWidget):
         self.redo_menu_action = file_menu.addAction('Ripeti file')
         self.redo_menu_action.setToolTip("Ripristina la modifica appena annullata (Ctrl+Y)")
         self.redo_menu_action.triggered.connect(window._redo_file)
-        self.validate_kant_menu_action = file_menu.addAction('Verifica KANT')
-        self.validate_kant_menu_action.setToolTip(
-            'Controlla che i marcatori KANT (tag/#id, apertura/chiusura) di tutto il progetto siano validi'
-        )
-        self.validate_kant_menu_action.triggered.connect(window._run_kant_validation)
         self.run_menu_action = file_menu.addAction('Esegui')
         self.run_menu_action.setToolTip("Esegue il file attivo con l'interprete/comando adatto al suo tipo (Ctrl+R)")
         self.run_menu_action.triggered.connect(window._run_current_file)
         self.run_tests_menu_action = file_menu.addAction('Esegui test (Ctrl+Shift+T)')
         self.run_tests_menu_action.setToolTip('Esegue l\'intera suite pytest del progetto e mostra i risultati')
         self.run_tests_menu_action.triggered.connect(window._run_tests)
+
+        # every KANT-convention-specific action in one place, separate from File's plain file
+        # operations: verifying markers, tagging deterministically (one file or, destructively,
+        # the whole project from scratch)
+        kant_menu = self.menu_bar.addMenu('KANT')
+        kant_menu.setToolTipsVisible(True)
+        self.kant_menu_btn = kant_menu.menuAction()
+        self.kant_menu_btn.setToolTip('Verifica e generazione della struttura KANT')
+        self.validate_kant_menu_action = kant_menu.addAction('Verifica KANT')
+        self.validate_kant_menu_action.setToolTip(
+            'Controlla che i marcatori KANT (tag/#id, apertura/chiusura) di tutto il progetto siano validi'
+        )
+        self.validate_kant_menu_action.triggered.connect(window._run_kant_validation)
+        self.tag_current_file_menu_action = kant_menu.addAction('Genera struttura (file corrente)')
+        self.tag_current_file_menu_action.setToolTip(
+            'Aggiunge deterministicamente (tag/nesting/#id, senza AI) i marker mancanti nel file '
+            'attivo — le stesse regole del tasto ✨ nella barra azioni in modalità File'
+        )
+        self.tag_current_file_menu_action.triggered.connect(window._deterministic_tag_current_file)
+        kant_menu.addSeparator()
+        self.wipe_retag_menu_action = kant_menu.addAction('Rimuovi e rigenera tutto (deterministico)')
+        self.wipe_retag_menu_action.setToolTip(
+            'ATTENZIONE: rimuove ogni marker KANT (incluse le descrizioni) da tutto il progetto e '
+            'ricrea la struttura da zero in modo deterministico — le descrizioni andranno riscritte'
+        )
+        self.wipe_retag_menu_action.triggered.connect(window._wipe_and_retag_project)
 
         search_menu = self.menu_bar.addMenu('Cerca')
         search_menu.setToolTipsVisible(True)

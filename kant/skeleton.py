@@ -381,3 +381,41 @@ def apply_skeleton_to_project(root):
         changed.append((os.path.relpath(path, root), count))
     return changed, skipped
 # [FN CLOSED] apply_skeleton_to_project
+
+
+# [FN CATEGORY] wipe_and_reskeleton_project — the "wipe and rebuild deterministically" project
+# action (kant/mainwindow.py's KANT menu): strips every existing KANT marker (model.py's
+# strip_kant_markers — CATEGORY/tagline/OPEN/CLOSED and any legacy INCOMING/OUTGOING) back to bare
+# code, then runs the ordinary skeleton pass on that bare code as if it were never tagged at all.
+# Hand-written CATEGORY/tagline text is genuinely discarded here, not preserved — that's the whole
+# point of "wipe." A file whose existing markers don't even parse is skipped rather than stripped
+# blind, same caution apply_skeleton_to_project already takes.
+# [FN] wipe_and_reskeleton_project — strips all markers, then re-tags every file from scratch
+# [FN OPEN] wipe_and_reskeleton_project
+def wipe_and_reskeleton_project(root):
+    from kant.projectops import iter_project_text_files
+    from kant.model import parse_kant, strip_kant_markers, KantParseError
+
+    changed, skipped = [], []
+    for path, text in iter_project_text_files(root):
+        language = language_for_path(path)
+        if language is None:
+            continue
+        try:
+            tree = parse_kant(text)
+        except KantParseError:
+            skipped.append(os.path.relpath(path, root))
+            continue
+        bare = strip_kant_markers(tree)
+        elements, _method = scan_source(bare, path)
+        if not elements:
+            continue
+        new_text, count = insert_skeleton(bare, elements, language)
+        try:
+            write_file_atomic(path, new_text)
+        except OSError:
+            skipped.append(os.path.relpath(path, root))
+            continue
+        changed.append((os.path.relpath(path, root), count))
+    return changed, skipped
+# [FN CLOSED] wipe_and_reskeleton_project

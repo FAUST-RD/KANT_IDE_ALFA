@@ -27,7 +27,7 @@ from kant import mainwindow as kant_mainwindow_module
 from kant import widgets as kant_widgets_module
 from kant.mainwindow import MainWindow, ROLE_KIND, ROLE_PATH, ROLE_ORDER, ROLE_UID, ROLE_TEXT, ROLE_LINE, ROLE_KEY
 from kant.lsp import file_uri, LspClient
-from kant.model import Node, Run, build_new_element_node, parse_kant, serialize_kant, read_top_level_label_result
+from kant.model import Node, Run, build_new_element_node, parse_kant, serialize_kant, read_top_level_label_result, strip_kant_markers
 from kant.pyenv import (
     dependency_file, detect_venvs, has_module, interpreter_label, interpreter_version,
     is_python_majority_project, load_interpreter, save_interpreter,
@@ -390,7 +390,12 @@ class KantSmokeTest(unittest.TestCase):
             MainWindow._launch_kant_fill_blanks(window, 'claude')
             assert len(launch_args) == 1
             prompt = launch_args[0][0][0]
-            assert 'alpha' in prompt and 'a.py' in prompt and 'COME funziona' in prompt
+            # the listing/instructions ride a referenced markdown file, not the visible prompt
+            # itself — same "path named in the prompt, the CLI's own Read tool opens it" delivery
+            # already used for user-attached documents
+            assert 'Leggi' in prompt and prompt.strip().endswith('istruzioni.')
+            md_content = Path(prompt.split('Leggi ', 1)[1].split('.md:', 1)[0] + '.md').read_text(encoding='utf-8')
+            assert 'alpha' in md_content and 'a.py' in md_content and 'COME funziona' in md_content
 
     def test_launch_kant_fill_blanks_does_nothing_when_no_blanks_exist(self):
         with _temp_dir() as tmp:
@@ -433,10 +438,42 @@ class KantSmokeTest(unittest.TestCase):
         assert not messages
         assert len(prompts) == 1
         prompt, effort = prompts[0]
-        assert 'alpha' in prompt and '[FN]' in prompt and 'mod.py' in prompt
+        assert 'Leggi' in prompt and prompt.strip().endswith('istruzioni.')
+        md_content = Path(prompt.split('Leggi ', 1)[1].split('.md:', 1)[0] + '.md').read_text(encoding='utf-8')
+        assert 'alpha' in md_content and '[FN]' in md_content and 'mod.py' in md_content
         assert effort is None
         # the skeleton insertion replaced the tab's tree with a marked-up one, in place
         assert tab.tree.body and any(getattr(n, 'name', None) == 'alpha' for n in tab.tree.body if hasattr(n, 'name'))
+
+    def test_ai_fill_kant_blanks_scopes_to_the_currently_isolated_leaf(self):
+        # alpha is already tagged (a leaf, #leaf1) but blank; beta is genuinely untagged and sits
+        # right after alpha in the same file. Isolating on alpha (filter_uid='leaf1' — the same
+        # attribute _active_filter_uid reads for a whole-file tab with no separate element page)
+        # must list only alpha's own blanks, even though beta also gets a fresh skeleton inserted
+        # by this same call — proving leaves work as an isolation target, not just parent elements.
+        src = '\n'.join([
+            '# [FN CATEGORY] alpha —',
+            '# [FN] alpha —',
+            '# [FN OPEN #leaf1] alpha',
+            'def alpha():',
+            '    pass',
+            '# [FN CLOSED #leaf1] alpha',
+            '',
+            'def beta():',
+            '    pass',
+        ])
+        tab = type('Tab', (), {
+            'path': 'mod.py', 'tree': parse_kant(src), 'filter_uid': 'leaf1',
+            'remember_undo_state': lambda _self: None, 'mark_dirty': lambda _self: None,
+        })()
+        window, prompts, messages = self._fake_ai_fill_window(tab)
+        MainWindow._ai_fill_kant_blanks(window)
+        assert not messages
+        assert len(prompts) == 1
+        prompt, _effort = prompts[0]
+        md_content = Path(prompt.split('Leggi ', 1)[1].split('.md:', 1)[0] + '.md').read_text(encoding='utf-8')
+        assert 'alpha' in md_content
+        assert 'beta' not in md_content  # untagged too, but outside the isolated leaf's own span
 
     def test_ai_fill_kant_blanks_reports_when_nothing_is_blank(self):
         src = '\n'.join([
@@ -455,6 +492,81 @@ class KantSmokeTest(unittest.TestCase):
         MainWindow._ai_fill_kant_blanks(window)
         assert not prompts
         assert messages and 'Nessun campo KANT vuoto' in messages[0][1]
+
+    def test_deterministic_tag_current_file_tags_without_any_ai_call(self):
+        src = 'def alpha():\n    pass\n'
+        tab = type('Tab', (), {
+            'path': 'mod.py', 'tree': parse_kant(src), 'filter_uid': None,
+            'remember_undo_state': lambda _self: None, 'mark_dirty': lambda _self: None,
+        })()
+        window = MainWindow.__new__(MainWindow)
+        window.tabs = type('Tabs', (), {'currentWidget': lambda _self: tab})()
+        window._render_view = lambda _tab, _uid: None
+        window._update_tab_title = lambda _tab: None
+        messages = []
+        window._ide_message = lambda title, message: messages.append((title, message))
+        MainWindow._deterministic_tag_current_file(window)
+        assert not hasattr(window, 'claude_pane')  # never touched the AI pane at all
+        assert '[FN OPEN' in serialize_kant(tab.tree) and 'alpha' in serialize_kant(tab.tree)
+        assert messages and 'generata' in messages[0][1]
+
+    def test_deterministic_tag_current_file_reports_when_nothing_to_tag(self):
+        src = '\n'.join([
+            '# [FN CATEGORY] alpha — already documented',
+            '# [FN] alpha — does a thing',
+            '# [FN OPEN] alpha', 'def alpha():', '    pass', '# [FN CLOSED] alpha',
+        ])
+        tab = type('Tab', (), {
+            'path': 'mod.py', 'tree': parse_kant(src), 'filter_uid': None,
+            'remember_undo_state': lambda _self: None, 'mark_dirty': lambda _self: None,
+        })()
+        window = MainWindow.__new__(MainWindow)
+        window.tabs = type('Tabs', (), {'currentWidget': lambda _self: tab})()
+        messages = []
+        window._ide_message = lambda title, message: messages.append((title, message))
+        MainWindow._deterministic_tag_current_file(window)
+        assert messages and 'Nessun elemento da taggare' in messages[0][1]
+
+    def test_strip_kant_markers_leaves_only_the_real_code(self):
+        src = '\n'.join([
+            '# [MOD CATEGORY] shop/coupons.py — defines discount rules',
+            '# [MOD shop/coupons.py] — coupon discounts',
+            '# [MOD OPEN] shop/coupons.py',
+            '# [FN CATEGORY] discount_for — resolves a coupon code',
+            '# [FN] discount_for — computes discount',
+            '# [FN OPEN] discount_for',
+            'def discount_for(code):',
+            '    return 0',
+            '# [FN CLOSED] discount_for',
+            '# [FN INCOMING] discount_for — code',
+            '# [FN OUTGOING] discount_for — amount',
+            '# [MOD CLOSED] shop/coupons.py',
+        ])
+        tree = parse_kant(src)
+        stripped = strip_kant_markers(tree)
+        assert '[' not in stripped and 'CATEGORY' not in stripped and 'INCOMING' not in stripped
+        assert 'def discount_for(code):' in stripped and 'return 0' in stripped
+        compile(stripped, 'coupons.py', 'exec')  # still valid, runnable Python
+
+    def test_wipe_and_reskeleton_project_discards_descriptions_and_retags_fresh(self):
+        with _temp_dir() as tmp:
+            root = Path(tmp)
+            (root / 'a.py').write_text(
+                '# [FN CATEGORY] alpha — hand-written, about to be discarded\n'
+                '# [FN] alpha — hand-written too\n'
+                '# [FN OPEN #keep1] alpha\ndef alpha():\n    pass\n# [FN CLOSED #keep1] alpha\n',
+                encoding='utf-8',
+            )
+            (root / 'b.py').write_text('def beta():\n    pass\n', encoding='utf-8')  # never tagged
+            (root / 'broken.py').write_text('# [FN OPEN] x\ndef x(): pass\n# [FN CLOSED] y\n', encoding='utf-8')
+            changed, skipped = skeleton.wipe_and_reskeleton_project(str(root))
+            changed_files = dict(changed)
+            assert changed_files == {'a.py': 1, 'b.py': 1}
+            assert skipped == ['broken.py']
+            a_text = (root / 'a.py').read_text(encoding='utf-8')
+            assert 'hand-written' not in a_text  # old description genuinely discarded
+            assert '[FN CATEGORY] alpha —' in a_text  # re-tagged fresh, blank again
+            assert '[FN OPEN] beta' in (root / 'b.py').read_text(encoding='utf-8')
 
     def test_agent_command_building(self):
         automatic = _agent_command('codex', 'tagga', True)[1]
@@ -839,6 +951,33 @@ class KantSmokeTest(unittest.TestCase):
             if window.night_mode:
                 window._toggle_theme()  # back to day, tidy for anything after this test
             window.close()
+
+    def test_opening_an_untagged_file_switches_left_tree_to_file_mode(self):
+        with _temp_dir() as tmp:
+            project = Path(tmp)
+            (project / 'plain.py').write_text('def alpha():\n    pass\n', encoding='utf-8')
+            (project / 'tagged.py').write_text('# [MOD OPEN] tagged.py\n# [MOD CLOSED] tagged.py\n', encoding='utf-8')
+            window = MainWindow()
+            window._ide_yes_no = lambda *a, **k: False
+            window._open_project_folder(str(project))
+            assert window.view_mode == 'code'
+
+            assert window._open_file(str(project / 'plain.py'))
+            assert window.view_mode == 'file'  # untagged -> auto-switched
+            # the sparkle-slot button follows: plain deterministic tagging while in File mode
+            assert 'senza AI' in window.action_toolbar_buttons['sparkle'].toolTip()
+
+            window._set_view_mode('code')
+            assert window._open_file(str(project / 'tagged.py'))
+            assert window.view_mode == 'code'  # already-tagged file -> left alone
+            assert "Chiedi all'AI" in window.action_toolbar_buttons['sparkle'].toolTip()
+            window.close()
+
+    def test_kant_menu_has_verify_tag_and_wipe_actions(self):
+        window = MainWindow()
+        for attr in ('validate_kant_menu_action', 'tag_current_file_menu_action', 'wipe_retag_menu_action'):
+            assert hasattr(window.title_bar, attr)
+        window.close()
 
     def test_welcome_theme_toggle_button_flips_mode_and_stays_pinned_to_corner(self):
         # regression for "metti un selettore notte e giorno in basso a destra nella home": the
@@ -2802,10 +2941,19 @@ class KantSmokeTest(unittest.TestCase):
             assert len(add_buttons) == 1
 
             window._ide_new_element_form = lambda **kwargs: ('FN', 'nuova_funzione', 'fa qualcosa', 'Python')
-            body_count_before = len(tab.tree.body)
+            mod_node = tab.tree.body[0]
+            body_count_before = len(mod_node.body)
             add_buttons[0].click()
-            assert len(tab.tree.body) == body_count_before + 1
-            new_node = tab.tree.body[-1]
+            # regression: this used to append to tab.tree.body (the ROOT wrapper) unconditionally,
+            # landing the new element as a SECOND top-level node structurally outside the file's
+            # own [MOD OPEN]...[MOD CLOSED] span — the coding board rendered it anyway (it walks
+            # tab.tree.body flatly) but the left tree never did (_build_project_tree only walks the
+            # first top-level node's own children), which is exactly the reported "left tree
+            # doesn't update after adding an element" symptom. A file with exactly one top-level
+            # wrapper now gets the new element nested inside it instead.
+            assert len(tab.tree.body) == 1
+            assert len(mod_node.body) == body_count_before + 1
+            new_node = mod_node.body[-1]
             assert new_node.tag == 'FN' and new_node.name == 'nuova_funzione'
             # regression: the left "Codice" tree reads from disk (_rebuild_tree re-parses files),
             # never from in-memory tab state — _prompt_add_element used to only mark_dirty() and
@@ -2815,6 +2963,23 @@ class KantSmokeTest(unittest.TestCase):
             # already has the new element.
             assert not tab.dirty
             assert 'nuova_funzione' in source.read_text(encoding='utf-8')
+            # regression: the disk content was already correct even before this fix (tab.save()
+            # writes it), but the left "Codice" tree widget itself only reflects a save via a
+            # 400ms-debounced fs-watcher callback — a real, reported race where the tree could sit
+            # stale after clicking "+ Aggiungi un elemento". _prompt_add_element now rebuilds the
+            # tree synchronously instead of waiting on that debounce.
+            def find_section(name):
+                stack = [window.tree.invisibleRootItem().child(i) for i in range(window.tree.invisibleRootItem().childCount())]
+                while stack:
+                    c = stack.pop()
+                    if c.data(0, ROLE_KIND) == 'section' and name in window.tree.itemWidget(c, 0).text():
+                        return c
+                    stack.extend(c.child(i) for i in range(c.childCount()))
+                return None
+            # the tree label shows the element's own description when it has one ("fa qualcosa",
+            # the dialog answer used above), not its bare name — the same _tree_label rule every
+            # other tagged element already follows (child.desc or child.name)
+            assert find_section('fa qualcosa') is not None
             # regression: build_new_element_node used to write the CATEGORY line as just the bare
             # description (no name — e.g. "[FN CATEGORY] fa qualcosa" instead of "... nuova_funzione
             # — fa qualcosa") and never emitted a tag line at all, so every element created through
@@ -2828,7 +2993,7 @@ class KantSmokeTest(unittest.TestCase):
             assert generated.index('[FN OPEN') < generated.index('def nuova_funzione') < generated.index('[FN CLOSED')
             assert 'def nuova_funzione():' in text
             reparsed = parse_kant(text)
-            assert reparsed.body[-1].name == 'nuova_funzione'
+            assert reparsed.body[0].body[-1].name == 'nuova_funzione'
             # the file's pre-existing 'alpha'/MOD markers are a deliberately bare legacy-style
             # fixture (no CATEGORY/tagline at all) and still warn on their own — only assert the
             # newly generated element itself introduces no errors or warnings

@@ -61,6 +61,7 @@ from kant.widgets import (
     ProjectTree, ScanlineOverlay, make_app_icon, make_app_pixmap, RecentFolderCard, TitleBar, FileTab,
     MODEL_DEFAULT, CLAUDE_MODELS, CODEX_MODELS, _tag_header_html, _markdown_to_html,
     set_vim_mode, vim_mode_enabled, show_code_hover_popup, hide_code_hover_popup,
+    _write_system_prompt_file,
 )
 from kant.mappa import XrefMapDialog
 
@@ -77,21 +78,28 @@ ROLE_KEY = Qt.UserRole + 7   # xref element key '<rel_path>::<uid>', on Incoming
 ROLE_ORDER = Qt.UserRole + 8
 
 
-# [FN] _kant_fill_prompt — the fill-blanks instruction body shared by the single-file button
-# (_ai_fill_kant_blanks) and the project-wide launcher (_launch_kant_fill_blanks) — same WHAT/HOW
-# framing and the same "structure is already correct, don't touch it" guardrail either way
-# [FN OPEN] _kant_fill_prompt
-def _kant_fill_prompt(intro, listing):
-    return (
-        f'{intro}\n{listing}\n\n'
-        'Per ciascuno, compila SOLO il testo mancante, in questo formato in due parti:\n'
-        "1. Riga descrittiva (subito sotto CATEGORY, l'unica riga con solo \"[TAG] Nome\"): "
+# [FN CATEGORY] _write_kant_fill_markdown — writes the blanks listing + fill instructions to a
+# temp .md file instead of folding them into the visible chat prompt — the same "the path is
+# named in the prompt, the CLI's own Read tool opens it" delivery ClaudePane._attach_files already
+# uses for user-attached documents, so a listing of dozens of elements never turns into one huge
+# command line. Shared by the single-file button (_ai_fill_kant_blanks) and the project-wide
+# launcher (_launch_kant_fill_blanks) — same WHAT/HOW framing and the same "structure is already
+# correct, don't touch it" guardrail either way.
+# [FN] _write_kant_fill_markdown — writes a fill-blanks instruction file, returns its path
+# [FN OPEN] _write_kant_fill_markdown
+def _write_kant_fill_markdown(intro, listing):
+    body = (
+        f'# Campi KANT da compilare\n\n{intro}\n\n{listing}\n\n'
+        '## Istruzioni\n\n'
+        'Per ciascuno degli elementi elencati sopra, compila SOLO il testo mancante, in due parti:\n\n'
+        "1. **Riga descrittiva** (subito sotto CATEGORY, l'unica riga con solo `[TAG] Nome`): "
         'spiegazione di COSA fa quel pezzo di codice, max 8 parole.\n'
-        '2. Riga CATEGORY: spiegazione di COME funziona, non semplicemente cosa è.\n'
+        '2. **Riga CATEGORY**: spiegazione di COME funziona, non semplicemente cosa è.\n\n'
         'Non aggiungere, spostare o rinominare marker OPEN/CLOSED, non cambiare tag, nesting o '
         '#id, non toccare elementi che hanno già una descrizione.'
     )
-# [FN CLOSED] _kant_fill_prompt
+    return _write_system_prompt_file(body)
+# [FN CLOSED] _write_kant_fill_markdown
 
 
 # [FN CATEGORY] _TreeItemLabel — tree rows use setItemWidget with a rich-HTML QLabel instead of plain
@@ -648,6 +656,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             )
             for key, btn in self.action_toolbar_buttons.items():
                 btn.setIcon(draw_icon(key, btn.iconSize().width()))
+            self._style_kant_quick_button()  # overrides the generic 'sparkle' icon set just above —
+            # this one slot's icon/tooltip depends on view_mode, not just the theme
             for btn in self.terminal_sidebar_group.buttons():
                 btn.setIcon(draw_icon(btn.property('kantIcon'), btn.iconSize().width()))
             map_open = self.map_dialog is not None and self.map_dialog.isVisible()
@@ -705,18 +715,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.action_toolbar_buttons[key] = btn
         layout.addStretch(1)
         # centered between the two button groups (not grouped with either one) — a quick, one-file-
-        # scoped action, distinct from /kant-code-map's whole-project sweep
+        # scoped action, distinct from /kant-code-map's whole-project sweep. Icon/tooltip/behavior
+        # swap between the AI-fill-blanks action and the plain deterministic-tagging action
+        # depending on the left tree's view mode — see _style_kant_quick_button/_kant_quick_action
         ai_fill_btn = QToolButton()
-        ai_fill_btn.setIcon(draw_icon('sparkle', 18))
         ai_fill_btn.setIconSize(QSize(18, 18))
-        ai_fill_btn.setToolTip(
-            "Chiedi all'AI (agente/modello/effort attualmente selezionati nella plancia AI) di "
-            'compilare i campi CATEGORY e descrizione vuoti della convenzione KANT in questo file. '
-            'Tag, nesting, marker OPEN/CLOSED e #id restano quelli già calcolati deterministicamente '
-            "dall'IDE — l'AI scrive solo il testo."
-        )
         ai_fill_btn.setFixedSize(32, 28)
-        ai_fill_btn.clicked.connect(self._ai_fill_kant_blanks)
+        ai_fill_btn.clicked.connect(self._kant_quick_action)
         layout.addWidget(ai_fill_btn)
         self.action_toolbar_buttons['sparkle'] = ai_fill_btn
         layout.addStretch(1)
@@ -749,8 +754,49 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 layout.addWidget(self.run_target_label)
         self.action_toolbar = bar
         self._style_action_toolbar()
+        self._style_kant_quick_button()
         return bar
     # [FN CLOSED] _build_action_toolbar
+
+    # [FN] _kant_quick_action — the sparkle-slot button's click handler: AI-fill-blanks while the
+    # left tree is in KANT mode, plain deterministic tagging (no AI) while it's in File mode
+    # [FN OPEN] _kant_quick_action
+    def _kant_quick_action(self):
+        if self.view_mode == 'code':
+            self._ai_fill_kant_blanks()
+        else:
+            self._deterministic_tag_current_file()
+    # [FN CLOSED] _kant_quick_action
+
+    # [FN CATEGORY] _style_kant_quick_button — the action-toolbar's sparkle-slot button reads as a
+    # completely different action depending on the left tree's view mode, not just a differently-
+    # themed icon: KANT mode means there's already real structure to isolate/inspect, so "ask the
+    # AI to fill in the blanks it finds" makes sense; File mode is the state an untagged file opens
+    # into (see _open_file), where there's no structure yet for blanks to exist in, so the same
+    # slot instead offers the plain deterministic pass with no AI involved at all.
+    # [FN] _style_kant_quick_button — sets the sparkle-slot button's icon/tooltip for the current
+    # view mode
+    # [FN OPEN] _style_kant_quick_button
+    def _style_kant_quick_button(self):
+        btn = self.action_toolbar_buttons.get('sparkle')
+        if btn is None:
+            return
+        if self.view_mode == 'code':
+            btn.setIcon(draw_icon('sparkle', 18))
+            btn.setToolTip(
+                "Chiedi all'AI (agente/modello/effort attualmente selezionati nella plancia AI) di "
+                'compilare i campi CATEGORY e descrizione vuoti della convenzione KANT in quello che '
+                "e' attualmente visualizzato nella plancia di coding (l'intero file, o solo "
+                "l'elemento isolato — anche una foglia). Tag, nesting, marker OPEN/CLOSED e #id "
+                "restano quelli già calcolati deterministicamente dall'IDE — l'AI scrive solo il testo."
+            )
+        else:
+            btn.setIcon(draw_icon('nest', 18))
+            btn.setToolTip(
+                'Genera la struttura KANT (tag, nesting, #id) in modo deterministico, senza AI, '
+                'per il file aperto nella plancia di coding.'
+            )
+    # [FN CLOSED] _style_kant_quick_button
 
     def _style_action_toolbar(self):
         self.action_toolbar.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
@@ -1403,6 +1449,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.title_bar.undo_menu_action.setEnabled(bool(has_tab and self.active_tab.undo_stack))
         self.title_bar.redo_menu_action.setEnabled(bool(has_tab and self.active_tab.redo_stack))
         self.title_bar.validate_kant_menu_action.setEnabled(bool(self.project_root_path))
+        self.title_bar.tag_current_file_menu_action.setEnabled(has_tab)
+        self.title_bar.wipe_retag_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.run_menu_action.setEnabled(has_tab)
         self.title_bar.find_menu_action.setEnabled(has_tab)
         self.action_toolbar_buttons['save'].setEnabled(has_tab)
@@ -1807,6 +1855,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._style_view_mode_bar()
         self.tree.setStyleSheet(self._tree_stylesheet())
         self._rebuild_tree()
+        if hasattr(self, 'action_toolbar_buttons'):
+            self._style_kant_quick_button()
     # [FN CLOSED] _set_view_mode
 
     # [FN CATEGORY] _rebuild_tree — rebuilds the left project tree for the current folder using
@@ -3417,6 +3467,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._set_ai_context_page(tab)
         self._update_lsp_diagnostics()
         self.settings.setValue('session/openFile', path)
+        # a KANT-mode left tree labels files/sections by their tags — for a file with none at all,
+        # that view has nothing to show; File mode (plain names) is the useful one to land on, and
+        # it's what puts the deterministic-tagging button in the action toolbar's sparkle slot
+        # (see _style_kant_quick_button) instead of the AI-fill-blanks one
+        if self.view_mode == 'code' and not any(isinstance(item, Node) for item in tree.body):
+            self._set_view_mode('file')
         return True
     # [FN CLOSED] _open_file
 
@@ -4255,37 +4311,122 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.terminal.run_debug_python(tab.path, lines, os.path.dirname(tab.path) or None, self._active_python())
     # [FN CLOSED] _debug_current_file
 
+    # [FN CATEGORY] _apply_skeleton_to_tab — runs the deterministic skeleton pass on a tab's current
+    # content and, if it added anything, replaces the tab's tree with the marked-up one as an
+    # ordinary undoable edit — the exact same in-place-update sequence _ai_fill_kant_blanks and
+    # _deterministic_tag_current_file both need, factored out once so they can't drift apart.
+    # [FN] _apply_skeleton_to_tab — inserts a deterministic KANT skeleton into a tab; None if no-op
+    # [FN OPEN] _apply_skeleton_to_tab
+    def _apply_skeleton_to_tab(self, tab):
+        text = serialize_kant(tab.tree)
+        result = skeleton.apply_skeleton(text, tab.path)
+        if result is None:
+            return None
+        new_text, _inserted = result
+        try:
+            new_tree = parse_kant(new_text)
+        except KantParseError as e:
+            self._ide_message('KANT', f'Impossibile inserire lo scheletro dei marker: {e}')
+            return None
+        tab.remember_undo_state()
+        tab.tree = new_tree
+        tab.mark_dirty()
+        self._render_view(tab, tab.filter_uid)
+        self._update_tab_title(tab)
+        return new_text
+    # [FN CLOSED] _apply_skeleton_to_tab
+
+    # [FN] _kant_node_span — (tag, name, start_line, closed_line) for a uid in tab's CURRENT tree,
+    # or None; a leaf's own span works exactly the same way a parent's does, no special-casing.
+    # start_line is the earliest of category_line/tagline_line/open_line, not open_line alone —
+    # audit_kant_headers reports a blank/missing CATEGORY or tagline at ITS OWN line, which sits
+    # one or two lines ABOVE open_line, so anchoring the scope on open_line alone would silently
+    # exclude exactly the warnings this scoping exists to catch.
+    # [FN OPEN] _kant_node_span
+    def _kant_node_span(self, tab, uid):
+        if uid is None:
+            return None
+        node = self._find_node_by_uid(tab.tree, uid)
+        if node is None or node.open_line is None or node.closed_line is None:
+            return None
+        start_line = min(l for l in (node.category_line, node.tagline_line, node.open_line) if l is not None)
+        return node.tag, node.name, start_line, node.closed_line
+    # [FN CLOSED] _kant_node_span
+
+    # [FN CATEGORY] _deterministic_tag_current_file — the File-view-mode counterpart to
+    # _ai_fill_kant_blanks: no AI involved at all, just the deterministic skeleton pass on whatever
+    # file is open in the coding board. This is what the action-toolbar's sparkle-slot button runs
+    # while the left tree is in File mode (an untagged/lightly-tagged file, where "ask the AI to
+    # fill blanks" doesn't make sense yet — there's no structure for it to find blanks in).
+    # [FN] _deterministic_tag_current_file — tags the open file deterministically, no AI
+    # [FN OPEN] _deterministic_tag_current_file
+    def _deterministic_tag_current_file(self):
+        tab = self.active_tab
+        if tab is None:
+            return
+        if self._apply_skeleton_to_tab(tab) is None:
+            self._ide_message(
+                'KANT', 'Nessun elemento da taggare in questo file (già completo, o linguaggio non supportato).',
+            )
+            return
+        self._ide_message('KANT', 'Struttura KANT generata deterministicamente per questo file.')
+    # [FN CLOSED] _deterministic_tag_current_file
+
+    # [FN CATEGORY] _wipe_and_retag_project — strips every KANT marker (including hand-written
+    # CATEGORY/tagline text — that's genuinely discarded, not preserved) from the whole project,
+    # then re-tags every file from scratch as if it had never been marked at all. Destructive
+    # enough to need its own explicit, danger-styled confirmation rather than the plain yes/no
+    # every other project-level action here uses. Any currently open tab for an affected file is
+    # reloaded from disk afterward — the wipe writes straight to disk, so an open tab's still-in-
+    # memory pre-wipe tree would otherwise silently overwrite the fresh result on its next save.
+    # [FN] _wipe_and_retag_project — removes and deterministically regenerates the whole project's
+    # KANT structure
+    # [FN OPEN] _wipe_and_retag_project
+    def _wipe_and_retag_project(self):
+        if not self.project_root_path:
+            return
+        if not self._ide_yes_no(
+            'Rimuovi e rigenera struttura KANT',
+            'Questo rimuove OGNI marker KANT (comprese le descrizioni CATEGORY/riga breve scritte '
+            'a mano) da tutti i file del progetto e ricrea la struttura da zero in modo '
+            'deterministico (tag/nesting/#id). Le descrizioni andranno riscritte da capo. '
+            "Non può essere annullata con Ctrl+Z. Continuare?",
+            danger=True,
+        ):
+            return
+        changed, skipped = skeleton.wipe_and_reskeleton_project(self.project_root_path)
+        for rel, _count in changed:
+            tab = self._tab_for_path(os.path.join(self.project_root_path, rel))
+            if tab is not None:
+                self._reload_tab_from_disk(tab)
+        self._refresh_after_fs_change()
+        total = sum(count for _rel, count in changed)
+        summary = f'{len(changed)} file rigenerati, {total} elementi taggati.'
+        if skipped:
+            summary += f'\n{len(skipped)} file saltati (marker non validi): ' + ', '.join(skipped)
+        self._ide_message('Rimuovi e rigenera struttura KANT', summary)
+    # [FN CLOSED] _wipe_and_retag_project
+
     # [FN CATEGORY] _ai_fill_kant_blanks — the deterministic/AI split for KANT comments, applied to
-    # one file: tag, name, nesting, OPEN/CLOSED placement and #id are never left to the AI to decide
-    # — kant/skeleton.py works those out from the code's own structure (exact for Python via ast,
-    # heuristic-but-tested for other languages) and inserts them as an ordinary undoable edit on
-    # this tab, same as any other in-place change. audit_kant_headers (already the full-project
-    # validator's own auditor) then lists every element whose CATEGORY/tagline is still blank —
-    # freshly inserted ones and any older hand-added-but-undescribed ones alike — and that exact
-    # list is handed to whichever agent/model/effort is currently selected in the AI pane, with an
-    # explicit instruction to write text only, never structure. Refuses to proceed if the file's
-    # existing markers don't even parse — "Verifica KANT" is the right tool for that, not this one.
-    # [FN] _ai_fill_kant_blanks — inserts a deterministic KANT skeleton, then asks the AI to fill it
+    # exactly what's currently isolated in the coding board — a single leaf, a parent and its
+    # descendants, or (uid is None) the whole file. Tag, name, nesting, OPEN/CLOSED placement, and
+    # #id are never left to the AI to decide — kant/skeleton.py works those out from the code's own
+    # structure and inserts them first, as an ordinary undoable edit. audit_kant_headers then lists
+    # every element whose CATEGORY/tagline is still blank, filtered to the visible node's own line
+    # span when one is isolated (the uid is captured BEFORE the skeleton insertion, since that can
+    # shift line numbers — the span is always re-resolved from the tab's post-insertion tree, never
+    # reused from before it). Refuses to proceed if the file's existing markers don't even parse.
+    # [FN] _ai_fill_kant_blanks — inserts a deterministic KANT skeleton, then asks the AI to fill
+    # only the blanks inside whatever's currently visible
     # [FN OPEN] _ai_fill_kant_blanks
     def _ai_fill_kant_blanks(self):
         tab = self.active_tab
         if tab is None:
             return
-        text = serialize_kant(tab.tree)
-        result = skeleton.apply_skeleton(text, tab.path)
-        if result is not None:
-            new_text, _inserted = result
-            try:
-                new_tree = parse_kant(new_text)
-            except KantParseError as e:
-                self._ide_message('KANT', f'Impossibile inserire lo scheletro dei marker: {e}')
-                return
-            tab.remember_undo_state()
-            tab.tree = new_tree
-            tab.mark_dirty()
-            self._render_view(tab, tab.filter_uid)
-            self._update_tab_title(tab)
-            text = new_text
+        scope_uid = self._active_filter_uid()
+        new_text = self._apply_skeleton_to_tab(tab)
+        text = new_text if new_text is not None else serialize_kant(tab.tree)
+        scope = self._kant_node_span(tab, scope_uid)
 
         audit = audit_kant_headers(text)
         if audit['errors']:
@@ -4297,12 +4438,27 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             w for w in audit['warnings']
             if w['message'] in ('CATEGORY mancante', 'CATEGORY vuota', 'tagline mancante', 'tagline vuota')
         ]
+        if scope is not None:
+            _tag, _name, open_line, closed_line = scope
+            blanks = [w for w in blanks if open_line <= w['line'] <= closed_line]
         if not blanks:
-            self._ide_message('KANT', 'Nessun campo KANT vuoto da compilare in questo file.')
+            where = f' in [{scope[0]}] {scope[1]}' if scope is not None else ''
+            self._ide_message('KANT', f'Nessun campo KANT vuoto da compilare{where}.')
             return
 
         listing = '\n'.join(f'- riga {b["line"]}: [{b["tag"]}] {b["name"]} — {b["message"]}' for b in blanks)
-        prompt = _kant_fill_prompt(f'Nel file {tab.path} questi elementi KANT hanno CATEGORY e/o la riga descrittiva ancora vuoti:', listing)
+        if scope is not None:
+            intro = (
+                f'Nel file {tab.path}, dentro [{scope[0]}] {scope[1]} (righe {scope[2]}-{scope[3]}), '
+                'questi elementi KANT hanno CATEGORY e/o la riga descrittiva ancora vuoti:'
+            )
+        else:
+            intro = f'Nel file {tab.path} questi elementi KANT hanno CATEGORY e/o la riga descrittiva ancora vuoti:'
+        md_path = _write_kant_fill_markdown(intro, listing)
+        prompt = (
+            f'Leggi {md_path}: elenca gli elementi KANT con descrizione mancante e le istruzioni '
+            'per compilarla. Applica esattamente quelle istruzioni.'
+        )
         effort = self.claude_pane.effort_select.currentText().strip()
         if effort == MODEL_DEFAULT:
             effort = None
@@ -4341,9 +4497,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         lines, _broken = self._project_kant_blanks(self.project_root_path)
         if not lines:
             return
-        prompt = _kant_fill_prompt(
+        md_path = _write_kant_fill_markdown(
             'In questo progetto questi elementi KANT hanno CATEGORY e/o la riga descrittiva ancora vuoti:',
             '\n'.join(lines),
+        )
+        prompt = (
+            f'Leggi {md_path}: elenca gli elementi KANT con descrizione mancante in questo progetto '
+            'e le istruzioni per compilarla. Applica esattamente quelle istruzioni.'
         )
         self.claude_pane.run_prompt(prompt, agent=agent, auto_permissions_once=True, effort=effort)
     # [FN CLOSED] _launch_kant_fill_blanks
@@ -4524,14 +4684,30 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         tag, name, desc, language = result
         tab.remember_undo_state()
         node = build_new_element_node(tag, name, desc, language)
-        tab.tree.body.append(node)
+        # a file already wrapped in exactly one top-level MOD/CFG element gets the new element
+        # appended INSIDE that wrapper's own body, not as a second sibling at tab.tree's root —
+        # appending to the root placed it structurally outside the module (after its own [[TAG]
+        # CLOSED] line), which the coding board rendered anyway (it walks tab.tree.body flatly,
+        # no notion of "the" file wrapper) but which _build_project_tree's left-tree builder never
+        # sees, since it only ever walks the first top-level node's own children. Multiple existing
+        # top-level nodes (a flat file with no single wrapper) or zero (nothing tagged yet) both
+        # keep the previous root-level append, unambiguous either way.
+        top_level_nodes = [item for item in tab.tree.body if isinstance(item, Node)]
+        if len(top_level_nodes) == 1:
+            top_level_nodes[0].body.append(node)
+        else:
+            tab.tree.body.append(node)
         tab.mark_dirty()
         # save now instead of waiting on the 2s autosave timer — the left "Codice" tree only
         # reflects what's on disk (_rebuild_tree re-reads/re-parses files, it never looks at
         # in-memory tab state), so without this the new element wouldn't show up there for however
-        # long autosave takes to catch up, even though the coding board already shows it
+        # long autosave takes to catch up, even though the coding board already shows it. tab.save()
+        # does arm _on_tab_saved's 400ms debounced _refresh_after_fs_change on its own, but that's
+        # an async race this doesn't need to take: rebuild the tree synchronously right here instead
+        # of waiting on it, so the new element is guaranteed visible the instant this returns.
         tab.save()
         self._invalidate_xref()
+        self._rebuild_tree()
         self._render_view(tab, tab.filter_uid)
         self._update_tab_title(tab)
         new_widget = tab.section_widgets.get(node.uid)
