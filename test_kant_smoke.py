@@ -417,6 +417,7 @@ class KantSmokeTest(unittest.TestCase):
     def _fake_ai_fill_window(self, tab):
         prompts, messages = [], []
         window = MainWindow.__new__(MainWindow)
+        window.project_root_path = None
         window.tabs = type('Tabs', (), {'currentWidget': lambda _self: tab})()
         window._render_view = lambda _tab, _uid: None
         window._update_tab_title = lambda _tab: None
@@ -500,6 +501,7 @@ class KantSmokeTest(unittest.TestCase):
             'remember_undo_state': lambda _self: None, 'mark_dirty': lambda _self: None,
         })()
         window = MainWindow.__new__(MainWindow)
+        window.project_root_path = None
         window.tabs = type('Tabs', (), {'currentWidget': lambda _self: tab})()
         window._render_view = lambda _tab, _uid: None
         window._update_tab_title = lambda _tab: None
@@ -521,6 +523,7 @@ class KantSmokeTest(unittest.TestCase):
             'remember_undo_state': lambda _self: None, 'mark_dirty': lambda _self: None,
         })()
         window = MainWindow.__new__(MainWindow)
+        window.project_root_path = None
         window.tabs = type('Tabs', (), {'currentWidget': lambda _self: tab})()
         messages = []
         window._ide_message = lambda title, message: messages.append((title, message))
@@ -3613,11 +3616,16 @@ class KantSmokeTest(unittest.TestCase):
         result = skeleton.apply_skeleton(src, 'mod.py')
         assert result is not None
         new_text, count = result
-        assert count == 1  # only beta was unmarked
+        # beta (unmarked) plus the file's own MOD wrapper, needed now that there are two
+        # top-level elements instead of alpha alone -- both converge in this one call, not a
+        # second pass, since the wrapper check runs against the already-tagged result
+        assert count == 2
         assert 'already documented' in new_text  # alpha's existing marker untouched
         assert '[FN OPEN] beta' in new_text
-        parse_kant(new_text)  # round-trips cleanly
-        assert skeleton.apply_skeleton(new_text, 'mod.py') is None  # nothing left to insert
+        assert '[MOD OPEN] mod.py' in new_text and '[MOD CLOSED] mod.py' in new_text
+        tree = parse_kant(new_text)  # round-trips cleanly
+        assert len([n for n in tree.body if isinstance(n, Node)]) == 1  # one wrapper, not two loose elements
+        assert skeleton.apply_skeleton(new_text, 'mod.py') is None  # nothing left to insert or wrap
 
     def test_apply_skeleton_refuses_when_existing_markers_are_broken(self):
         broken = '# [FN OPEN] alpha\ndef alpha(): pass\n# [FN CLOSED] beta\n'

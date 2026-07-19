@@ -4319,7 +4319,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN OPEN] _apply_skeleton_to_tab
     def _apply_skeleton_to_tab(self, tab):
         text = serialize_kant(tab.tree)
-        result = skeleton.apply_skeleton(text, tab.path)
+        result = skeleton.apply_skeleton(text, tab.path, self.project_root_path)
         if result is None:
             return None
         new_text, _inserted = result

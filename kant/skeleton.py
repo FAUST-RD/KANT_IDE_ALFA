@@ -4,7 +4,11 @@ Given source that is unmarked (or only partially marked), finds every still-unma
 construct — module-level class/function/constant/mutable-global/test — and reports its tag, name,
 and exact line span. ``insert_skeleton`` then writes OPEN/CATEGORY/tagline/CLOSED markers for those
 spans, with the CATEGORY/tagline description left as an explicit blank (``Name —``, nothing after
-the dash) for a human or an AI to fill in afterward.
+the dash) for a human or an AI to fill in afterward. ``apply_skeleton``/``apply_skeleton_to_project``
+also add the file's own MOD (or TST, for a standalone test file) wrapper whenever one doesn't
+already exist — the individual-construct scanners only ever find things INSIDE a file, never the
+file as a KANT element in its own right, so without this every tagged file would end up with its
+top-level constructs as loose, unwrapped siblings instead of children of the file's own element.
 
 Tag, name, nesting, span, and #id are never left to an AI to decide — they're facts about the code,
 extracted deterministically. Only the description is left blank. Python gets exact results via the
@@ -42,6 +46,14 @@ LANGUAGE_BY_EXT.update({
 # syntax with { }-delimited bodies. SQL/HTML/Generico have no equivalent notion of a top-level
 # function/class body here, so they're left out rather than guessed at badly.
 _BRACE_LANGUAGES = {'JavaScript', 'TypeScript', 'Go', 'Java', 'C++', 'C#', 'Rust'}
+
+# languages apply_skeleton/apply_skeleton_to_project will also add a file-level MOD/TST wrapper
+# for — anything scan_source can actually find real constructs in. SQL/HTML/Generico (an explicit
+# "Generico" -> .txt catch-all meant only for the "+ Aggiungi elemento" dialog's manual language
+# picker, not for auto-detection here) have no scanner at all, so there's no reliable notion of
+# "this file's own top-level construct" for them — wrapping their whole content in a MOD shell
+# would just be a guess, exactly the kind _BRACE_LANGUAGES' own exclusion already avoids.
+_WRAPPABLE_LANGUAGES = {'Python'} | _BRACE_LANGUAGES
 
 
 @dataclass
@@ -329,21 +341,89 @@ def insert_skeleton(text, elements, language):
 # [FN CLOSED] insert_skeleton
 
 
+# [CST] _TEST_FILE_RE — a whole FILE counts as a test file (gets TST instead of MOD as its own
+# wrapper tag) by the same naming convention already used for individual test functions/methods
+_TEST_FILE_RE = re.compile(r'(?i)^test_|_test$|\.test$|\.spec$')
+
+
+def _file_wrapper_tag(file_path):
+    stem = os.path.splitext(os.path.basename(file_path))[0]
+    return 'TST' if _TEST_FILE_RE.search(stem) else 'MOD'
+
+
+# [FN] _needs_file_wrapper — True unless the file already has exactly one top-level KANT element
+# (its own MOD/CFG/TST wrapper) — zero (untagged) or more than one (individually-tagged elements
+# with nothing enclosing them, e.g. everything insert_skeleton has tagged so far) both need one
+# [FN OPEN] _needs_file_wrapper
+def _needs_file_wrapper(text):
+    try:
+        tree = parse_kant(text)
+    except KantParseError:
+        return False
+    return len([item for item in tree.body if isinstance(item, Node)]) != 1
+# [FN CLOSED] _needs_file_wrapper
+
+
+# [FN CATEGORY] _wrap_whole_file — wraps already-processed text (individual elements already
+# tagged, still lacking a file-level wrapper) in one MOD/TST OPEN...CLOSED pair spanning the whole
+# file — the parent every KANT-tagged file is supposed to have, per the convention's own "MOD |
+# file/module" row, that scan_python/scan_regex/the toolchain scanners never produce themselves
+# (they only ever find constructs INSIDE a file, never the file as a construct in its own right).
+# Named by its path relative to project_root when known (matching the map's own path convention),
+# basename otherwise — e.g. a lone file with no project context yet.
+# [FN] _wrap_whole_file — adds the missing file-level MOD/TST wrapper around already-tagged text
+# [FN OPEN] _wrap_whole_file
+def _wrap_whole_file(text, language, file_path, project_root=None):
+    leader = ELEMENT_LANGUAGES.get(language, ELEMENT_LANGUAGES['Generico'])
+    prefix, suffix = leader['comment'], leader['suffix']
+    tail = f' {suffix}' if suffix else ''
+
+    def marker(bracket_text):
+        return f'{prefix} {bracket_text}{tail}'
+
+    tag = _file_wrapper_tag(file_path)
+    name = (
+        os.path.relpath(file_path, project_root).replace(os.sep, '/')
+        if project_root else os.path.basename(file_path)
+    )
+    header = f'{name} —'
+    return '\n'.join([
+        marker(f'[{tag} CATEGORY] {header}'),
+        marker(f'[{tag}] {header}'),
+        marker(f'[{tag} OPEN] {name}'),
+        text,
+        marker(f'[{tag} CLOSED] {name}'),
+    ])
+# [FN CLOSED] _wrap_whole_file
+
+
 # [FN CATEGORY] apply_skeleton — the single entry point the IDE and the AI-facing tooling both use:
-# scan, filter out what's already marked, insert skeletons for the rest. Returns None (no change)
-# rather than raising when the file's language isn't recognized or its existing markers don't
-# parse — callers decide how to surface that, this stays a pure best-effort transform.
+# scan, filter out what's already marked, insert skeletons for the rest, then add the file's own
+# MOD/TST wrapper if it doesn't already have exactly one. Returns None (no change) rather than
+# raising when the file's language isn't recognized or its existing markers don't parse — callers
+# decide how to surface that, this stays a pure best-effort transform.
 # [FN] apply_skeleton — scans a file's text and returns (new_text, inserted_count) or None
 # [FN OPEN] apply_skeleton
-def apply_skeleton(text, file_path):
+def apply_skeleton(text, file_path, project_root=None):
     language = language_for_path(file_path)
     if language is None:
         return None
     elements, _method = scan_source(text, file_path)
     unmarked = unmarked_elements(text, elements)
-    if not unmarked:
+    if unmarked is None:
         return None
-    new_text, count = insert_skeleton(text, unmarked, language)
+    new_text, count = text, 0
+    if unmarked:
+        new_text, count = insert_skeleton(new_text, unmarked, language)
+    # checked against new_text, AFTER inserting — a file with one already-tagged element and one
+    # still-bare one looks like it only has a single top-level node until that second element
+    # actually becomes one; checking the pre-insertion text here would need a second call to
+    # notice the wrapper is needed once both are real nodes, instead of converging in one pass
+    if language in _WRAPPABLE_LANGUAGES and _needs_file_wrapper(new_text):
+        new_text = _wrap_whole_file(new_text, language, file_path, project_root)
+        count += 1
+    elif count == 0:
+        return None
     return new_text, count
 # [FN CLOSED] apply_skeleton
 
@@ -370,9 +450,15 @@ def apply_skeleton_to_project(root):
         if unmarked is None:
             skipped.append(os.path.relpath(path, root))
             continue
-        if not unmarked:
+        new_text, count = text, 0
+        if unmarked:
+            new_text, count = insert_skeleton(new_text, unmarked, language)
+        # checked against new_text, AFTER inserting — see apply_skeleton's own comment on why
+        if language in _WRAPPABLE_LANGUAGES and _needs_file_wrapper(new_text):
+            new_text = _wrap_whole_file(new_text, language, path, root)
+            count += 1
+        elif count == 0:
             continue
-        new_text, count = insert_skeleton(text, unmarked, language)
         try:
             write_file_atomic(path, new_text)
         except OSError:
@@ -399,7 +485,10 @@ def wipe_and_reskeleton_project(root):
     changed, skipped = [], []
     for path, text in iter_project_text_files(root):
         language = language_for_path(path)
-        if language is None:
+        # SQL/HTML/Generico have no scanner and so no reliable way to re-tag anything at all —
+        # wiping their markers without being able to rebuild would just be a loss, so they're left
+        # alone entirely, same as an unrecognized language
+        if language not in _WRAPPABLE_LANGUAGES:
             continue
         try:
             tree = parse_kant(text)
@@ -407,10 +496,15 @@ def wipe_and_reskeleton_project(root):
             skipped.append(os.path.relpath(path, root))
             continue
         bare = strip_kant_markers(tree)
+        if not bare.strip():
+            continue  # genuinely empty file — nothing worth wrapping either
         elements, _method = scan_source(bare, path)
-        if not elements:
-            continue
-        new_text, count = insert_skeleton(bare, elements, language)
+        new_text, count = bare, 0
+        if elements:
+            new_text, count = insert_skeleton(new_text, elements, language)
+        # stripped text never has a wrapper of its own left — always add a fresh one
+        new_text = _wrap_whole_file(new_text, language, path, root)
+        count += 1
         try:
             write_file_atomic(path, new_text)
         except OSError:
