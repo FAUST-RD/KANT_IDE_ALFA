@@ -26,6 +26,7 @@ import ast
 import os
 import re
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 
 from kant.model import ELEMENT_LANGUAGES, Node, parse_kant, KantParseError
 from kant.fileio import write_file_atomic
@@ -53,7 +54,7 @@ _BRACE_LANGUAGES = {'JavaScript', 'TypeScript', 'Go', 'Java', 'C++', 'C#', 'Rust
 # picker, not for auto-detection here) have no scanner at all, so there's no reliable notion of
 # "this file's own top-level construct" for them — wrapping their whole content in a MOD shell
 # would just be a guess, exactly the kind _BRACE_LANGUAGES' own exclusion already avoids.
-_WRAPPABLE_LANGUAGES = {'Python'} | _BRACE_LANGUAGES
+_WRAPPABLE_LANGUAGES = {'Python', 'SQL', 'HTML'} | _BRACE_LANGUAGES
 
 
 @dataclass
@@ -63,6 +64,12 @@ class SkeletonElement:
     start_line: int   # 1-based, inclusive — the declaration's own first line (decorators included)
     end_line: int      # 1-based, inclusive — the construct's last line
     depth: int = 0
+    # override the file's own comment leader/suffix for just this element's markers — needed for
+    # JavaScript dissected out of an HTML <script> block: its markers sit inside JS, not HTML, so
+    # they need `//`, never the file's own `<!-- -->` (which JS would read as broken syntax, not
+    # a comment). None (the default) means "use the file's own language leader," same as before.
+    comment: str = None
+    comment_suffix: str = ''
 
 
 def language_for_path(path):
@@ -242,6 +249,164 @@ def _brace_span_end(lines, start_index):
     return None  # never closed — don't guess a span that might be wrong
 
 
+# same CREATE-statement tag mapping the "+ Aggiungi elemento" dialog's own SQL skeletons already
+# use (kant/model.py's _ELEMENT_SKELETONS['SQL']) — TABLE/VIEW as CLS, FUNCTION/PROCEDURE as FN,
+# TYPE as TYP — so a scanned element and a manually-added one land on the identical convention
+_SQL_DECL_RE = re.compile(
+    r'(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(TABLE|VIEW|FUNCTION|PROCEDURE|TYPE)\s+'
+    r'(?:IF\s+NOT\s+EXISTS\s+)?["\[`]?(\w+)["\]`]?'
+)
+_SQL_TAG_BY_KIND = {
+    'TABLE': 'CLS', 'VIEW': 'CLS', 'FUNCTION': 'FN', 'PROCEDURE': 'FN', 'TYPE': 'TYP',
+}
+
+
+# [FN CATEGORY] scan_sql — top-level CREATE TABLE/VIEW/FUNCTION/PROCEDURE/TYPE statements, by the
+# same keyword-declaration approach as scan_regex, adapted for SQL's actual terminator: a `;` not
+# inside a string, a `--` line comment, or a dollar-quoted body (`$$...$$`/`$tag$...$tag$`, the
+# common Postgres way to write a function body containing its own semicolons) — SQL statements
+# don't nest the way brace languages do, so no depth tracking is needed, only finding the right
+# terminating semicolon.
+# [FN] scan_sql — top-level tag/name/span extraction for SQL source
+# [FN OPEN] scan_sql
+def scan_sql(text, file_path=''):
+    lines = text.split('\n')
+    elements = []
+    i = 0
+    while i < len(lines):
+        m = _SQL_DECL_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        tag = _SQL_TAG_BY_KIND[m.group(1).upper()]
+        name = m.group(2)
+        end = _sql_statement_end(lines, i)
+        if end is None:
+            i += 1
+            continue
+        elements.append(SkeletonElement(tag, name, i + 1, end + 1, 0))
+        i = end + 1
+    return elements
+# [FN CLOSED] scan_sql
+
+
+def _sql_statement_end(lines, start_index):
+    in_string = None  # "'" or a dollar-tag like '$$'/'$tag$'
+    for idx in range(start_index, len(lines)):
+        line = lines[idx]
+        j = 0
+        while j < len(line):
+            ch = line[j]
+            if in_string:
+                if in_string == "'":
+                    if line[j:j + 2] == "''":
+                        j += 2
+                        continue
+                    if ch == "'":
+                        in_string = None
+                    j += 1
+                    continue
+                if line[j:j + len(in_string)] == in_string:
+                    j += len(in_string)
+                    in_string = None
+                    continue
+                j += 1
+                continue
+            if ch == '-' and j + 1 < len(line) and line[j + 1] == '-':
+                break  # rest of line is a comment
+            if ch == "'":
+                in_string = "'"
+                j += 1
+                continue
+            if ch == '$':
+                m = re.match(r'\$\w*\$', line[j:])
+                if m:
+                    in_string = m.group(0)
+                    j += len(in_string)
+                    continue
+            if ch == ';':
+                return idx
+            j += 1
+    return None  # never terminated — don't guess a span that might be wrong
+
+
+# tags matching the "+ Aggiungi elemento" dialog's own HTML skeletons (_ELEMENT_SKELETONS['HTML']):
+# a <section id> is CLS, everything else with an id defaults to FN, <style id> is CFG (styling is
+# configuration data, no further dissection — CSS has no function/class concept to find inside
+# it), and <script id> is FN too but its BODY gets dissected with the real JavaScript scanner —
+# real "on par with other languages" treatment for embedded JS, not just a single opaque blob
+_HTML_CLASS_TAGS = {'section'}
+
+
+# [FN CATEGORY] scan_html — uses the stdlib html.parser (no dependency) to walk real element
+# nesting instead of guessing at regex/braces, which HTML's own tag soup doesn't reliably support
+# (attributes can contain '>', tags can be unclosed, etc.). Only elements with an id attribute are
+# tagged — id is HTML's own stable, human-chosen name, the same role a KANT element's name always
+# plays; untagged markup stays untouched, same as any code with no name to hang a marker on.
+# [FN] scan_html — dissects HTML into id-named elements, recursing into <script> as real JS
+# [FN OPEN] scan_html
+def scan_html(text, file_path=''):
+    parser = _HtmlElementParser()
+    try:
+        parser.feed(text)
+    except Exception:
+        return []
+    return parser.elements
+# [FN CLOSED] scan_html
+
+
+class _HtmlElementParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.elements = []
+        self._stack = []
+
+    def handle_starttag(self, tag, attrs):
+        line, _col = self.getpos()
+        self._stack.append({
+            'tag': tag, 'name': dict(attrs).get('id'), 'start_line': line,
+            'depth': len(self._stack), 'text': [],
+        })
+
+    def handle_data(self, data):
+        if self._stack and self._stack[-1]['tag'] in ('script', 'style'):
+            top = self._stack[-1]
+            top.setdefault('content_start_line', self.getpos()[0])
+            top['text'].append(data)
+
+    def handle_endtag(self, tag):
+        for i in range(len(self._stack) - 1, -1, -1):
+            if self._stack[i]['tag'] == tag:
+                entry = self._stack.pop(i)
+                del self._stack[i:]  # anything still open above it is malformed — drop, don't guess
+                self._finish(entry, self.getpos()[0])
+                return
+        # no matching open tag at all — malformed HTML, ignore rather than guess
+
+    def _finish(self, entry, end_line):
+        name, tag, depth = entry['name'], entry['tag'], entry['depth']
+        if tag == 'style':
+            if name:
+                self.elements.append(SkeletonElement('CFG', name, entry['start_line'], end_line, depth))
+            return
+        if tag == 'script':
+            if name:
+                self.elements.append(SkeletonElement('FN', name, entry['start_line'], end_line, depth))
+            body = ''.join(entry['text'])
+            if body.strip():
+                offset = entry.get('content_start_line', entry['start_line'] + 1) - 1
+                sub_elements, _method = scan_source(body, 'inline.js')
+                for e in sub_elements:
+                    self.elements.append(SkeletonElement(
+                        e.tag, e.name, offset + e.start_line, offset + e.end_line,
+                        depth + 1 + e.depth, comment='//', comment_suffix='',
+                    ))
+            return
+        if name:
+            kant_tag = 'CLS' if tag in _HTML_CLASS_TAGS else 'FN'
+            self.elements.append(SkeletonElement(kant_tag, name, entry['start_line'], end_line, depth))
+
+
 # [FN CATEGORY] scan_source — dispatches by extension: Python always gets the exact ast-based
 # scanner; Go/TS/JS/C#/Java/C++ try their real toolchain scanner first (kant/toolchains.py) and
 # only fall back to the regex heuristic if that toolchain isn't installed or its output doesn't
@@ -252,6 +417,10 @@ def scan_source(text, file_path):
     language = language_for_path(file_path)
     if language == 'Python':
         return scan_python(text, file_path), 'ast'
+    if language == 'SQL':
+        return scan_sql(text, file_path), 'sql'
+    if language == 'HTML':
+        return scan_html(text, file_path), 'html'
     if language in toolchains.SCANNERS:
         result = toolchains.SCANNERS[language](text, file_path)
         if result is not None:
@@ -311,10 +480,14 @@ def insert_skeleton(text, elements, language):
     if not elements:
         return text, 0
     leader = ELEMENT_LANGUAGES.get(language, ELEMENT_LANGUAGES['Generico'])
-    prefix, suffix = leader['comment'], leader['suffix']
-    tail = f' {suffix}' if suffix else ''
+    default_prefix, default_suffix = leader['comment'], leader['suffix']
 
-    def marker(bracket_text):
+    def marker(elem, bracket_text):
+        # an element can override the file's own comment leader (JS dissected out of an HTML
+        # <script> block needs `//`, never the file's `<!-- -->` — see SkeletonElement.comment)
+        prefix = elem.comment or default_prefix
+        suffix = elem.comment_suffix if elem.comment else default_suffix
+        tail = f' {suffix}' if suffix else ''
         return f'{prefix} {bracket_text}{tail}'
 
     lines = text.split('\n')
@@ -323,11 +496,11 @@ def insert_skeleton(text, elements, language):
     for elem in elements:
         header = f'{elem.name} —'
         entries.append((elem.start_line - 1, 1, elem.depth, [
-            marker(f'[{elem.tag} CATEGORY] {header}'),
-            marker(f'[{elem.tag}] {header}'),
-            marker(f'[{elem.tag} OPEN] {elem.name}'),
+            marker(elem, f'[{elem.tag} CATEGORY] {header}'),
+            marker(elem, f'[{elem.tag}] {header}'),
+            marker(elem, f'[{elem.tag} OPEN] {elem.name}'),
         ]))
-        entries.append((elem.end_line, 0, -elem.depth, [marker(f'[{elem.tag} CLOSED] {elem.name}')]))
+        entries.append((elem.end_line, 0, -elem.depth, [marker(elem, f'[{elem.tag} CLOSED] {elem.name}')]))
     entries.sort(key=lambda e: (e[0], e[1], e[2]))
 
     inserts = {}

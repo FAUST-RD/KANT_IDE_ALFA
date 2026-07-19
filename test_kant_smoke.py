@@ -3657,6 +3657,67 @@ class KantSmokeTest(unittest.TestCase):
             assert skipped == ['broken.py']
             assert '[FN OPEN] alpha' in (root / 'a.py').read_text(encoding='utf-8')
 
+    def test_scan_sql_finds_tables_functions_and_types(self):
+        src = '\n'.join([
+            'CREATE TABLE users (', '    id serial primary key', ');', '',
+            'CREATE FUNCTION get_user(uid int) RETURNS text AS $$',
+            'BEGIN', '    RETURN (SELECT name FROM users WHERE id = uid);', 'END;',
+            '$$ LANGUAGE plpgsql;', '',
+            'CREATE TYPE status AS (', '    code int', ');',
+        ])
+        elements = skeleton.scan_sql(src, 'schema.sql')
+        by_name = {e.name: e for e in elements}
+        assert by_name['users'].tag == 'CLS' and by_name['users'].end_line == 3
+        # the dollar-quoted function body has its own semicolons -- the real statement terminator
+        # is the one after $$ LANGUAGE plpgsql, not the first one inside BEGIN...END
+        assert by_name['get_user'].tag == 'FN' and by_name['get_user'].end_line == 9
+        assert by_name['status'].tag == 'TYP'
+
+    def test_apply_skeleton_sql_wraps_and_round_trips(self):
+        # two top-level statements -- a lone one is left unwrapped (same "exactly one top-level
+        # element already reads as wrapped" rule every other language follows), but two or more
+        # genuinely need the file's own MOD to contain them
+        src = 'CREATE TABLE users (\n    id serial primary key\n);\n\nCREATE TYPE status AS (\n    code int\n);\n'
+        result = skeleton.apply_skeleton(src, 'schema.sql')
+        assert result is not None
+        new_text, count = result
+        assert count == 3  # the table, the type, and the file's own MOD wrapper
+        assert '-- [CLS OPEN] users' in new_text and '-- [MOD OPEN] schema.sql' in new_text
+        audit = audit_kant_headers(new_text)
+        assert audit['errors'] == []
+        parse_kant(new_text)  # round-trips cleanly
+        assert skeleton.apply_skeleton(new_text, 'schema.sql') is None  # idempotent
+
+    def test_scan_html_dissects_elements_and_recurses_into_script_as_real_js(self):
+        src = '\n'.join([
+            '<section id="hero">', '  <div id="cta">Click me</div>', '</section>',
+            '<style id="theme">', 'body { color: red; }', '</style>',
+            '<script id="app">', 'function loadUser(id) {', '  return id;', '}', '</script>',
+        ])
+        elements = skeleton.scan_html(src, 'index.html')
+        by_name = {e.name: e for e in elements}
+        assert by_name['hero'].tag == 'CLS'  # <section id> -> CLS, matching the "+" dialog's own convention
+        assert by_name['cta'].tag == 'FN'  # any other id-bearing tag defaults to FN
+        assert by_name['theme'].tag == 'CFG'  # <style id> -> CFG, no further dissection of CSS
+        assert by_name['app'].tag == 'FN'  # <script id> is itself an FN...
+        assert by_name['loadUser'].tag == 'FN'  # ...but its JS body is dissected for its own elements
+        assert by_name['loadUser'].comment == '//'  # never <!-- --> inside a <script>, that's invalid JS
+        assert by_name['loadUser'].depth > by_name['app'].depth  # nested inside the <script> element
+
+    def test_apply_skeleton_html_wraps_and_round_trips_without_breaking_the_script(self):
+        src = '<div id="cta">Click me</div>\n<script id="app">\nfunction loadUser(id) {\n  return id;\n}\n</script>\n'
+        result = skeleton.apply_skeleton(src, 'index.html')
+        assert result is not None
+        new_text, count = result
+        assert '<!-- [FN OPEN] cta -->' in new_text
+        assert '// [FN OPEN] loadUser' in new_text  # JS marker uses //, not an HTML comment
+        script_inner = new_text.split('<script', 1)[1].split('</script>', 1)[0]
+        assert '<!--' not in script_inner  # no HTML comment landed inside the script tag's own body
+        audit = audit_kant_headers(new_text)
+        assert audit['errors'] == []
+        parse_kant(new_text)  # round-trips cleanly
+        assert skeleton.apply_skeleton(new_text, 'index.html') is None  # idempotent
+
     def test_elements_from_json_drops_malformed_entries(self):
         good = {'tag': 'FN', 'name': 'alpha', 'start_line': 1, 'end_line': 2, 'depth': 0}
         missing_key = {'tag': 'FN', 'name': 'beta', 'start_line': 1}
