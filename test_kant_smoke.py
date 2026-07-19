@@ -564,12 +564,18 @@ class KantSmokeTest(unittest.TestCase):
             (root / 'broken.py').write_text('# [FN OPEN] x\ndef x(): pass\n# [FN CLOSED] y\n', encoding='utf-8')
             changed, skipped = skeleton.wipe_and_reskeleton_project(str(root))
             changed_files = dict(changed)
-            assert changed_files == {'a.py': 1, 'b.py': 1}
+            # each file gets its FN re-tagged (1) plus its own fresh MOD wrapper (1) -- stripping
+            # always removes any prior wrapper too, so wipe_and_reskeleton_project adds one back
+            # unconditionally
+            assert changed_files == {'a.py': 2, 'b.py': 2}
             assert skipped == ['broken.py']
             a_text = (root / 'a.py').read_text(encoding='utf-8')
             assert 'hand-written' not in a_text  # old description genuinely discarded
             assert '[FN CATEGORY] alpha —' in a_text  # re-tagged fresh, blank again
-            assert '[FN OPEN] beta' in (root / 'b.py').read_text(encoding='utf-8')
+            assert '[MOD OPEN] a.py' in a_text and '[MOD CLOSED] a.py' in a_text
+            b_text = (root / 'b.py').read_text(encoding='utf-8')
+            assert '[FN OPEN] beta' in b_text
+            assert '[MOD OPEN] b.py' in b_text and '[MOD CLOSED] b.py' in b_text
 
     def test_agent_command_building(self):
         automatic = _agent_command('codex', 'tagga', True)[1]

@@ -1,5 +1,8 @@
 KANT IDE changelog
 
+2026-07-19 (81)
+- Fixed the deterministic skeleton system not marking parents: apply_skeleton/apply_skeleton_to_project/wipe_and_reskeleton_project now add the file's own MOD (or TST for a standalone test file) wrapper whenever one doesn't already exist. The individual-construct scanners only ever found things INSIDE a file, never the file as a KANT element in its own right, so a freshly-tagged file ended up with its classes/functions/constants as loose, unwrapped top-level siblings instead of children of one proper parent. The wrapper check runs against the already-tagged result (not the pre-insertion text), so a file converges to a fully-wrapped state in one pass instead of needing a second call. Gated to languages the scanners actually understand (Python plus the brace-heuristic set) — SQL/HTML/Generico have no scanner and so no reliable notion of "this file's own construct" to wrap around, and are left untouched exactly as before.
+
 2026-07-19 (80)
 - The AI-fill-blanks button (sparkle) is now scoped to exactly what's isolated in the coding board, not always the whole file — a single leaf works identically to a parent and its descendants, since the scope is just a line span either way. The isolated uid is captured before the deterministic skeleton insertion and the span re-resolved from the tab's tree afterward, since insertion can shift line numbers.
 - The fill-blanks listing and instructions now ride a referenced temp markdown file instead of one long visible prompt line — the same "path named in the prompt, the CLI's own Read tool opens it" delivery already used for user-attached documents.
