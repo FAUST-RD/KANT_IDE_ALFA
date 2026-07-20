@@ -119,7 +119,14 @@ def build_ai_review(root, snapshot, ignored=()):
             review.append(item)
             continue
         matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
-        item['opcodes'] = matcher.get_opcodes()
+        # a list() copy, not the bare return value: SequenceMatcher.get_opcodes() caches and hands
+        # back its OWN internal list, and get_grouped_opcodes() below (used for item['hunks']) trims
+        # that same cached list's first/last 'equal' opcode down to n=3 lines of context IN PLACE —
+        # without this copy, item['opcodes'] would silently lose whatever old/unchanged lines sit
+        # outside that 3-line window the moment hunks are built, and render_review_text (which
+        # leans on item['opcodes'] being the FULL, untrimmed partition) would drop them for real on
+        # every apply, not just display them wrong.
+        item['opcodes'] = list(matcher.get_opcodes())
         unified = list(difflib.unified_diff(old_lines, new_lines, f'a/{rel}', f'b/{rel}', n=3))
         header, diff_groups, current = ''.join(unified[:2]), [], []
         for line in unified[2:]:
@@ -320,7 +327,14 @@ class WorkspaceMixin:
         tab = self._tab_for_path(path)
         if tab is None:
             return
-        if self._ai_snapshot is not None and self.claude_pane.process is not None:
+        # a pending snapshot alone means "there's an unresolved AI review in flight" — requiring
+        # claude_pane.process too (as this used to) left a real gap: the CLI process exits (process
+        # becomes None) well before the review is resolved (_finish_ai_review's own diff-building,
+        # then — outside auto_permissions — however long the user takes to click Accetta/Rivedi/
+        # Rifiuta). Any fs_watcher event landing in that window used to run straight through to
+        # conflict-detection/reload-from-disk on a tab that was really just showing the AI's own
+        # still-pending, not-yet-reviewed edit.
+        if self._ai_snapshot is not None:
             self._watch_open_file(path)
             return
         current = file_fingerprint(path)
@@ -536,8 +550,23 @@ class WorkspaceMixin:
             discard_snapshot(snapshot)
             self._ai_snapshot = None
             self._clear_ai_snapshot_marker()
+            self._exit_ai_review_mode()
             for tab in list(self.open_tabs.values()):
-                self._on_fs_file_changed(tab.path)
+                # a tab _enter_ai_review_mode put into its merged diff view needs a forced reload
+                # here, not the usual fingerprint-gated _on_fs_file_changed: on 'apply' the accepted
+                # content is often byte-identical to what was already on disk (no per-hunk selection
+                # left to change it), so the fingerprint wouldn't move and the stale read-only diff
+                # view would never clear on its own.
+                if getattr(tab, '_ai_review_lines', None) is not None:
+                    del tab._ai_review_lines
+                    if os.path.isfile(tab.path):
+                        self._reload_tab_from_disk(tab)
+                    else:
+                        index = self.tabs.indexOf(tab)
+                        if index != -1:
+                            self._close_tab(index, flush=False)
+                else:
+                    self._on_fs_file_changed(tab.path)
             self.claude_pane.validate_after_finish = False
             if action == 'apply':
                 normalized, id_skipped = normalize_missing_ids(self.project_root_path, kept)
@@ -564,13 +593,15 @@ class WorkspaceMixin:
 
         # automatic mode means the user asked not to be interrupted for permission decisions either
         # — extending that to the review step too: accept everything silently instead of offering a
-        # decision nobody's going to make by hand. Non-automatic mode gets a small inline chat card
-        # (offer_ai_review) instead of the full review window popping up unasked; the window is only
-        # one click away via that card's "Rivedi" button.
+        # decision nobody's going to make by hand. Non-automatic mode shows the diff live, in place
+        # (_enter_ai_review_mode: every changed file re-rendered as one merged, read-only, green/red
+        # -marked block, plus the same coloring on that file's tree row) and a small inline chat card
+        # with just Accetta/Annulla — no separate review window to open first.
         if self.claude_pane.auto_permissions.isChecked():
             resolved('apply', {item['path']: set(range(len(item['hunks']))) for item in review}, {})
             return
-        self.claude_pane.offer_ai_review(review, render_review_text, resolved)
+        self._enter_ai_review_mode(review)
+        self.claude_pane.offer_ai_review(review, resolved)
 
     def _create_new_file(self, target_dir):
         if not target_dir:

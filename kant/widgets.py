@@ -2,7 +2,8 @@
 
 AI navigation:
 - editor/terminal primitives: ``KantHighlighter`` through ``TerminalPane``;
-- agent process and review UI: ``ClaudePane`` and ``_AiReviewCard``;
+- agent process and review UI: ``ClaudePane`` (its ``offer_ai_review`` is the whole review UI now —
+  the diff itself renders live in the coding board, see ``mainwindow.py``'s ``_enter_ai_review_mode``);
 - KANT section/tree chrome: section widgets, ``ProjectTree``, and ``TitleBar``;
 - file state: ``FileTab``.
 
@@ -37,8 +38,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame,
     QGraphicsDropShadowEffect, QGraphicsItem, QGraphicsPathItem, QGraphicsScene, QGraphicsSimpleTextItem, QGraphicsView,
     QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMenuBar, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QStyle, QStyleOptionComboBox, QStylePainter,
+    QMainWindow, QMenu, QMenuBar, QPlainTextEdit, QPushButton, QScrollArea,
+    QSizePolicy, QSizeGrip, QSplitter, QStackedWidget, QStyle, QStyleOptionButton, QStyleOptionComboBox, QStylePainter,
     QTabWidget, QToolButton, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
@@ -104,41 +105,6 @@ class KantHighlighter(QSyntaxHighlighter):
 # [FN CLOSED] KantHighlighter
 
 
-# [FN CATEGORY] DiffHighlighter — colors whole unified-diff lines by their leading character
-# (+/-/@@), the same one-format-per-block shape as KantHighlighter but keyed on the line's start
-# instead of a token regex. Background is the foreground color at low alpha rather than a literal
-# hex tint, so it reads correctly against CODE_BG in both day and night theme without a second
-# color pair to keep in sync.
-# [FN] DiffHighlighter — green/red backgrounds for added/removed unified-diff lines
-# [FN OPEN] DiffHighlighter
-class DiffHighlighter(QSyntaxHighlighter):
-    def __init__(self, document):
-        super().__init__(document)
-        self.fmt_added = self._fmt(theme.OK)
-        self.fmt_removed = self._fmt(theme.TAG_COLORS['TST'])
-        self.fmt_header = self._fmt(theme.ACCENT, bold=True, tint=False)
-
-    @staticmethod
-    def _fmt(color, bold=False, tint=True):
-        fmt = QTextCharFormat()
-        fmt.setForeground(QColor(color))
-        if bold:
-            fmt.setFontWeight(QFont.Bold)
-        if tint:
-            bg = QColor(color)
-            bg.setAlpha(30)
-            fmt.setBackground(bg)
-        return fmt
-
-    def highlightBlock(self, text):
-        if text.startswith('+++') or text.startswith('---') or text.startswith('@@'):
-            self.setFormat(0, len(text), self.fmt_header)
-        elif text.startswith('+'):
-            self.setFormat(0, len(text), self.fmt_added)
-        elif text.startswith('-'):
-            self.setFormat(0, len(text), self.fmt_removed)
-# [FN CLOSED] DiffHighlighter
-
 
 # [FN CATEGORY] LineNumberArea — thin companion widget painted in CodeEdit's left viewport margin;
 # the standard Qt pattern for QPlainTextEdit line numbers (there's no built-in gutter)
@@ -179,6 +145,23 @@ def vim_mode_enabled():
 # element and pasting into another must work, so this can't live on a single widget.
 _VIM_REGISTER = {'text': '', 'linewise': False}
 
+# [CST] _IMPORT_LINE_PATTERNS — recognizes a Python import line and captures the module being
+# imported ("Modifica import"'s entry point). Python-only, matching mainwindow's resolution support
+# (importlib against the project's active interpreter) — a menu item that always fails for other
+# languages would be worse than not offering one; see _start_import_edit's own scope note.
+_IMPORT_LINE_PATTERNS = (
+    re.compile(r'^\s*from\s+([\w.]+)\s+import\s+'),
+    re.compile(r'^\s*import\s+([\w.]+)\s*(?:as\s+\w+)?\s*$'),
+)
+
+
+def _detect_import_module(line_text):
+    for pattern in _IMPORT_LINE_PATTERNS:
+        m = pattern.match(line_text)
+        if m:
+            return m.group(1)
+    return None
+
 
 # [FN CATEGORY] CodeEdit — an editable, syntax-highlighted code block that auto-grows to fit its
 # content instead of scrolling internally, mirroring the HTML version's contenteditable blocks.
@@ -201,10 +184,10 @@ class CodeEdit(QPlainTextEdit):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.setStyleSheet(
-            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:4px; padding:4px;'
-        )
+        # no border/radius of its own — a continuous coding surface, not one bordered card per
+        # block; the CODE_BG/PANEL tonal difference against the section around it is separation
+        # enough, per the redesign's "no nested cards" rule
+        self.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:4px;')
         self.highlighter = KantHighlighter(self.document())
         # QSyntaxHighlighter's first pass is deferred to the next paint, which fires textChanged
         # with no real edit — forcing it now (signals blocked) keeps that pass from reaching the
@@ -243,9 +226,10 @@ class CodeEdit(QPlainTextEdit):
         self.cursorPositionChanged.connect(self._clear_ghost_suggestion)
 
         # PyCharm-style quick-doc-on-hover: mainwindow sets hover_provider to a callable(edit,
-        # cursor, global_pos) that fires an async LSP textDocument/hover (or a local fallback) and
-        # shows the result via show_code_hover_popup (a themed popup, not the native QToolTip) —
-        # same 450ms delay already used for MAPPA's own hover popups
+        # cursor, global_pos) that checks a keyword-statement doc first (kant/syntax.py's
+        # KEYWORD_DOCS), then falls back to an async LSP textDocument/hover or a local symbol
+        # lookup, and shows whichever result via show_code_hover_popup (a themed popup, not the
+        # native QToolTip) — 700ms delay (see mouseMoveEvent)
         self.hover_provider = None
         self.setMouseTracking(True)
         self._hover_pos = None
@@ -259,6 +243,14 @@ class CodeEdit(QPlainTextEdit):
         # above)
         self.definition_provider = None
         self.rename_provider = None
+
+        # right-click on an import line offers "Modifica import" — mainwindow sets this to a
+        # callable(edit, module, line_text) that resolves the module's real source, makes a local
+        # editable copy, and drives the rest of that flow (see _start_import_edit). Detection of
+        # "is this line an import, and what module" is plain regex here (presentation-only, no
+        # project/interpreter knowledge needed), same callback-not-import split as the providers
+        # above; resolving whether that module can actually be edited is mainwindow's job.
+        self.import_edit_provider = None
 
         # VIM state — 'normal' is where vim mode always starts (matching real vim); irrelevant
         # whenever vim_mode_enabled() is False, since keyPressEvent skips the vim dispatch entirely
@@ -331,7 +323,7 @@ class CodeEdit(QPlainTextEdit):
             if block.isVisible() and bottom >= event.rect().top():
                 if block_number in self.breakpoints:
                     painter.setPen(Qt.NoPen)
-                    painter.setBrush(QColor('#e5484d'))
+                    painter.setBrush(QColor(theme.DANGER))
                     dot = min(10, self.fontMetrics().height() - 4)
                     painter.drawEllipse(2, top + (self.fontMetrics().height() - dot) // 2, dot, dot)
                 painter.setPen(QColor(theme.DIM))
@@ -722,6 +714,19 @@ class CodeEdit(QPlainTextEdit):
             self.definition_provider(self)
     # [FN CLOSED] mousePressEvent
 
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        if self.import_edit_provider is not None:
+            line_text = self.cursorForPosition(event.pos()).block().text()
+            module = _detect_import_module(line_text)
+            if module:
+                menu.addSeparator()
+                action = menu.addAction(f'Modifica import "{module}"')
+                action.triggered.connect(
+                    lambda _=False, m=module, t=line_text: self.import_edit_provider(self, m, t)
+                )
+        menu.exec(event.globalPos())
+
     def _on_text_changed_for_completion(self):
         # the suggestion just became stale (the text it was computed against no longer matches) —
         # drop it immediately rather than leaving it on screen for the 200ms debounce to catch up
@@ -799,7 +804,10 @@ class CodeEdit(QPlainTextEdit):
         super().mouseMoveEvent(event)
         hide_code_hover_popup()
         self._hover_pos = event.position().toPoint()
-        self._hover_timer.start(450)
+        # bumped from 450ms — with keyword-statement docs now showing on plain hover too (not
+        # just LSP/symbol info), a short delay meant just passing the mouse over ordinary code on
+        # the way somewhere else kept popping explanations up unintentionally
+        self._hover_timer.start(700)
     # [FN CLOSED] mouseMoveEvent
 
     def leaveEvent(self, event):
@@ -1479,6 +1487,34 @@ class _PromptEdit(QPlainTextEdit):
 # [FN CLOSED] _PromptEdit
 
 
+# [FN CATEGORY] _ElidedLabel — a QLabel whose sizeHint is ignored by whatever layout holds it
+# (SizePolicy.Ignored) and whose displayed text is elided to its OWN current width on every
+# resize, instead of letting a long string (e.g. ClaudePane's focus_label — a full relative path
+# plus an isolated element's description) demand extra width and force a parent splitter to grow.
+# The full text is still reachable via tooltip.
+# [FN] _ElidedLabel — QLabel that elides to its own width instead of demanding more of it
+# [FN OPEN] _ElidedLabel
+class _ElidedLabel(QLabel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._full_text = ''
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+    def setFullText(self, text):
+        self._full_text = text or ''
+        self.setToolTip(self._full_text)
+        self._apply_elision()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_elision()
+
+    def _apply_elision(self):
+        elided = self.fontMetrics().elidedText(self._full_text, Qt.ElideMiddle, max(self.width(), 0))
+        super().setText(elided)
+# [FN CLOSED] _ElidedLabel
+
+
 # [FN CATEGORY] ScanlineOverlay — a very faint repeating horizontal-line texture (old CRT look)
 # painted over EVERYTHING underneath, app-wide, instead of picking one specific panel's background
 # color to match — a transparent, click-through, always-on-top sibling covering the whole shell, not
@@ -1520,13 +1556,96 @@ class ScanlineOverlay(QWidget):
 # [FN OPEN] IconOnlyCombo
 class IconOnlyCombo(QComboBox):
     def paintEvent(self, event):
-        painter = QStylePainter(self)
         opt = QStyleOptionComboBox()
         self.initStyleOption(opt)
         opt.currentText = ''
-        painter.drawComplexControl(QStyle.CC_ComboBox, opt)
-        painter.drawControl(QStyle.CE_ComboBoxLabel, opt)
+        # CE_ComboBoxLabel (native icon+text painting) lays the icon out assuming text follows
+        # it — flush against the left edge of the edit-field sub-control, not centered — so with
+        # an icon-only combo it rendered clipped/off-center against the box's left border. Suppress
+        # the native icon too and draw it ourselves, centered in the actual edit-field rect. One
+        # plain QPainter for the whole method (not QStylePainter mixed with a manual drawPixmap —
+        # that combination segfaulted) styled via QStyle.draw*(..., painter, widget) directly.
+        opt.currentIcon = QIcon()
+        painter = QPainter(self)
+        style = self.style()
+        style.drawComplexControl(QStyle.CC_ComboBox, opt, painter, self)
+        style.drawControl(QStyle.CE_ComboBoxLabel, opt, painter, self)
+        # QComboBox has no currentIcon() — itemIcon(currentIndex()) is the actual API (an
+        # AttributeError here previously left this method's QPainter unfinished mid-paint, which
+        # didn't just fail this frame — it corrupted paint state badly enough to segfault the
+        # next repaint)
+        icon = self.itemIcon(self.currentIndex())
+        if not icon.isNull():
+            rect = style.subControlRect(QStyle.CC_ComboBox, opt, QStyle.SC_ComboBoxEditField, self)
+            size = self.iconSize()
+            pixmap = icon.pixmap(size)
+            x = rect.x() + (rect.width() - size.width()) // 2
+            y = rect.y() + (rect.height() - size.height()) // 2
+            painter.drawPixmap(x, y, pixmap)
+        painter.end()
 # [FN CLOSED] IconOnlyCombo
+
+
+# [FN CATEGORY] ToggleSwitch — every on/off checkbox in the app (auto_permissions, the new-project
+# starter/git-init checks) used to be a plain QCheckBox styled via theme.CHECKBOX_STYLE's
+# qradialgradient thumb trick — that gradient's coordinates are scaled against the CHECKBOX'S OWN
+# FULL bounding rect (indicator + label text), not the ::indicator sub-control's own small rect, a
+# real Qt stylesheet limitation. A short label ("Automatico") and a long one (the new-project
+# dialog's checks) need different coordinate fractions to land the thumb correctly against the
+# same fixed-size indicator — no single shared QSS string can get both right, which is exactly why
+# the thumb barely moved between states. Hand-painting the indicator (track + thumb) directly
+# sidesteps the whole problem: real pixel geometry, not a gradient fraction guessed against the
+# wrong box.
+# [FN] ToggleSwitch — QCheckBox with a hand-painted track/thumb indicator, not a QSS gradient hack
+# [FN OPEN] ToggleSwitch
+class ToggleSwitch(QCheckBox):
+    TRACK_W, TRACK_H = 34, 18
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._text_color = None
+        self._bold = False
+        # reserve real layout space for the indicator (Qt still uses this for text placement even
+        # though paintEvent below draws the indicator itself, ignoring this stylesheet's own
+        # border/background — only width/height are read for layout purposes)
+        self.setStyleSheet(f'QCheckBox::indicator {{ width:{self.TRACK_W}px; height:{self.TRACK_H}px; }}')
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_text_color(self, color, bold=False):
+        self._text_color = color
+        self._bold = bold
+        self.update()
+
+    def paintEvent(self, event):
+        opt = QStyleOptionButton()
+        self.initStyleOption(opt)
+        indicator_rect = self.style().subElementRect(QStyle.SE_CheckBoxIndicator, opt, self)
+        text_rect = self.style().subElementRect(QStyle.SE_CheckBoxContents, opt, self)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        checked = self.isChecked()
+        cy = indicator_rect.center().y()
+        track = QRectF(indicator_rect.x(), cy - self.TRACK_H / 2, self.TRACK_W, self.TRACK_H)
+        # unchecked fill was PANEL2 — nearly identical to PANEL, the background this control
+        # actually sits on in every real usage (ClaudePane's controls bar, dialog bodies), so the
+        # whole track all but vanished, leaving only a floating thumb with no visible pill around
+        # it. BORDER/TEXT_DISABLED are both a real perceptible step lighter than PANEL/PANEL2 in
+        # both themes, so the OFF state reads as a track regardless of what it's drawn over.
+        painter.setPen(QPen(QColor(theme.ACCENT if checked else theme.TEXT_DISABLED), 1))
+        painter.setBrush(QColor(theme.ACCENT if checked else theme.BORDER))
+        painter.drawRoundedRect(track, self.TRACK_H / 2, self.TRACK_H / 2)
+        thumb_d = self.TRACK_H - 6
+        thumb_x = track.right() - thumb_d - 3 if checked else track.left() + 3
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor('#ffffff'))
+        painter.drawEllipse(QRectF(thumb_x, cy - thumb_d / 2, thumb_d, thumb_d))
+        font = self.font()
+        font.setBold(self._bold)
+        painter.setFont(font)
+        painter.setPen(QColor(self._text_color or theme.TEXT))
+        painter.drawText(text_rect, int(Qt.AlignVCenter | Qt.AlignLeft), self.text())
+        painter.end()
+# [FN CLOSED] ToggleSwitch
 
 
 class ClaudePane(QWidget):
@@ -1605,7 +1724,7 @@ class ClaudePane(QWidget):
         self.effort_select.setFixedWidth(44)
         header.addWidget(self.effort_select)
         header.addStretch(1)
-        self.auto_permissions = QCheckBox('Automatico')
+        self.auto_permissions = ToggleSwitch('Automatico')
         self.auto_permissions.setToolTip('Approva i permessi Claude; le modifiche restano soggette alla revisione finale.')
         self.auto_permissions.toggled.connect(self._automatic_permissions_changed)
         header.addWidget(self.auto_permissions)
@@ -1630,7 +1749,11 @@ class ClaudePane(QWidget):
         # a quiet line under the selector row surfacing what focus_hint() currently resolves to —
         # the implicit scoping (isolated element / whole file / whole project) is otherwise silent,
         # riding the hidden system-prompt channel with nothing to show for it in the chat UI itself
-        self.focus_label = QLabel('')
+        # _ElidedLabel, not a plain QLabel: focus text (a relative path, sometimes with an
+        # isolated element's description prepended) used to demand full width on one line with no
+        # wrap, forcing the whole AI pane/splitter to grow whenever a longer one was shown — see
+        # _ElidedLabel and refresh_focus_label below
+        self.focus_label = _ElidedLabel('')
         self.focus_label.setFont(QFont('Consolas', theme.CODE_FONT_PT - 1))
         self.focus_label.setContentsMargins(10, 0, 10, 0)
         layout.addWidget(self.focus_label)
@@ -1663,39 +1786,55 @@ class ClaudePane(QWidget):
         # (not tucked under the chat like before) and a checkable pill with a token icon + a name
         # that actually says what it saves, instead of a plain "Immagini compresse" checkbox that
         # read as an image-quality setting rather than a token-budget one.
-        self.lossy_images = QPushButton(' Risparmia token')
-        self.lossy_images.setIcon(draw_icon('tokens', 14))
-        self.lossy_images.setIconSize(QSize(14, 14))
-        self.lossy_images.setCheckable(True)
-        self.lossy_images.setCursor(Qt.PointingHandCursor)
-        self.lossy_images.setToolTip(
-            "Modalità risparmio token (lossy): le immagini allegate vengono ridimensionate e "
-            "ricompresse prima dell'invio, per far leggere meno token al modello a scapito della "
-            "qualità. I documenti (PDF, DOCX, ...) non sono affetti da questa opzione."
-        )
-        lossy_row = QHBoxLayout()
-        lossy_row.setContentsMargins(0, 0, 0, 4)
-        lossy_row.addWidget(self.lossy_images)
-        lossy_row.addStretch(1)
-        layout.addLayout(lossy_row)
-
+        # composer grows with content instead of a fixed 90px box (capped so it can't eat the
+        # whole pane) — see _autosize_prompt, wired to textChanged below
         self.prompt = _PromptEdit()
-        self.prompt.setFixedHeight(90)
         self.prompt.setFont(QFont('Consolas', theme.CODE_FONT_PT))
-        self.prompt.setStyleSheet(
-            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:8px; padding:8px;'
-        )
+        # min height must fit the placeholder text's own wrap (2 lines on any pane width this
+        # splitter allows) — a fixed 42px guess used to clip its second line at the bottom edge,
+        # since document().size() (what _autosize_prompt measures) doesn't count placeholder text
+        # at all. Derived from the actual font metrics instead of another magic-number guess, so
+        # it stays correct across DPI/font differences.
+        line_h = self.prompt.fontMetrics().lineSpacing()
+        self._prompt_min_h, self._prompt_max_h = line_h * 2 + 16, line_h * 7 + 16
+        self.prompt.setFixedHeight(self._prompt_min_h)
+        self.prompt.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         # Return sends; Ctrl+Return inserts a newline instead (see _PromptEdit)
         self.prompt.send_requested.connect(self._send)
+        self.prompt.textChanged.connect(self._autosize_prompt)
         self.prompt.setPlaceholderText('Chiedi, modifica o analizza il codice… (Invio invia · Ctrl+Invio va a capo)')
-        composer = QHBoxLayout()
-        self.attach_btn = QPushButton('')
-        self.attach_btn.setIcon(draw_icon('attach', 18))
-        self.attach_btn.setIconSize(QSize(18, 18))
-        self.attach_btn.setFixedSize(36, 42)
+
+        self.attach_btn = QToolButton()
+        self.attach_btn.setIcon(draw_icon('attach', 16))
+        self.attach_btn.setIconSize(QSize(16, 16))
+        self.attach_btn.setFixedSize(theme.ICON_BTN, theme.ICON_BTN)
         self.attach_btn.setCursor(Qt.PointingHandCursor)
         self.attach_btn.setToolTip('Allega documenti o immagini da far leggere a Claude/Codex')
         self.attach_btn.clicked.connect(self._attach_files)
+
+        # a compact icon toggle, right-aligned directly above the send button — not stacked under
+        # attach (read as "attachment-related", easy to miss) and not its own wide row under the
+        # chat (the original placement, disconnected from the composer it actually affects)
+        self.lossy_images = QToolButton()
+        self.lossy_images.setIcon(draw_icon('tokens', 16))
+        self.lossy_images.setIconSize(QSize(16, 16))
+        self.lossy_images.setText(' Cheap mode')
+        self.lossy_images.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.lossy_images.setCheckable(True)
+        self.lossy_images.setCursor(Qt.PointingHandCursor)
+        self.lossy_images.setFixedHeight(theme.ICON_BTN)
+        self.lossy_images.setToolTip(
+            "Modalità risparmio token (lossy) — attiva/disattiva: le immagini allegate vengono "
+            "ridimensionate e ricompresse prima dell'invio, per far leggere meno token al modello a "
+            "scapito della qualità. I documenti (PDF, DOCX, ...) non sono affetti da questa opzione."
+        )
+        token_row = QHBoxLayout()
+        token_row.setContentsMargins(0, 0, 0, 2)
+        token_row.addStretch(1)
+        token_row.addWidget(self.lossy_images)
+        layout.addLayout(token_row)
+
+        composer = QHBoxLayout()
         composer.addWidget(self.attach_btn, 0, Qt.AlignBottom)
         composer.addWidget(self.prompt, 1)
         self.send_btn = QPushButton(' Invia')
@@ -1704,7 +1843,7 @@ class ClaudePane(QWidget):
         self.send_btn.setCursor(Qt.PointingHandCursor)
         self.send_btn.setToolTip('Invia il messaggio (Invio); se un comando è in corso, lo interrompe')
         self.send_btn.clicked.connect(self._send)
-        self.send_btn.setFixedHeight(42)
+        self.send_btn.setFixedHeight(theme.ICON_BTN * 2 + 4)
         composer.addWidget(self.send_btn, 0, Qt.AlignBottom)
         layout.addLayout(composer)
 
@@ -1719,23 +1858,13 @@ class ClaudePane(QWidget):
 
     def apply_style(self):
         self.setStyleSheet(f'background:{theme.PANEL}; border-left:1px solid {theme.BORDER};')
-        self.controls_bar.setStyleSheet(
-            f'#claudeControlsBar {{ background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; border-radius:9px; }}'
-        )
-        self.output.setStyleSheet(f'QScrollArea {{ background:{theme.CODE_BG}; border:none; border-radius:12px; }}')
+        # one flat compact header (bottom border only), not a bordered rounded card floating
+        # inside the pane
+        self.controls_bar.setStyleSheet(f'#claudeControlsBar {{ {theme.panel_header_style()} }}')
+        self.output.setStyleSheet(f'QScrollArea {{ background:{theme.CODE_BG}; border:none; border-radius:{theme.RADIUS}px; }}')
         self.chat.setStyleSheet(f'background:{theme.CODE_BG};')
-        self.prompt.setStyleSheet(
-            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:8px; padding:8px;'
-        )
-        # solid pill background (not just a bare border) so each combo reads as its own control
-        # against the controls bar's own CODE_BG fill, instead of blending flat into it
-        combo_style = (
-            f'QComboBox {{ background:{theme.PANEL}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:12px; padding:5px 10px; font-weight:600; }} '
-            f'QComboBox:hover {{ border-color:{theme.ACCENT}; color:{theme.ACCENT}; }} '
-            f'QComboBox:disabled {{ color:{theme.DIM}; border-color:#e2e8f0; background:#f1f5f9; }} '
-            f'QComboBox::drop-down {{ border:none; width:16px; }}'
-        )
+        self.prompt.setStyleSheet(theme.input_style())
+        combo_style = theme.input_style() + 'QComboBox { font-weight:600; }'
         self.agent_select.setStyleSheet(combo_style)
         # model/effort: icon-only closed face (compact, on request — the full value is still in the
         # tooltip), but the OPEN dropdown always shows real, unabbreviated names — color:{theme.TEXT}
@@ -1745,46 +1874,53 @@ class ClaudePane(QWidget):
         # rule can't express, so it's set in code rather than the stylesheet string.
         icon_combo_style = (
             f'QComboBox {{ background:{theme.PANEL}; color:transparent; border:1px solid {theme.BORDER}; '
-            f'border-radius:8px; padding:4px 15px 4px 5px; }} '
+            f'border-radius:{theme.RADIUS}px; padding:4px 15px 4px 5px; }} '
             f'QComboBox:hover {{ border-color:{theme.ACCENT}; }} '
             f'QComboBox::drop-down {{ border:none; width:14px; }} '
             f'QComboBox QAbstractItemView {{ background:{theme.PANEL}; color:{theme.TEXT}; '
-            f'border:1px solid {theme.BORDER}; selection-background-color:{theme.CODE_BG}; }}'
+            f'border:1px solid {theme.BORDER}; selection-background-color:{theme.PANEL2}; }}'
         )
         self.model_select.setStyleSheet(icon_combo_style)
         self.model_select.view().setMinimumWidth(180)
         self.effort_select.setStyleSheet(icon_combo_style)
         self.effort_select.view().setMinimumWidth(120)
-        self.auto_permissions.setStyleSheet(
-            theme.CHECKBOX_STYLE + f'QCheckBox {{ color:{theme.ACCENT}; font-weight:600; }}'
-        )
+        self.auto_permissions.set_text_color(theme.ACCENT, bold=True)
         self.global_mode_btn.setStyleSheet(
             theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
         )
         self.focus_label.setStyleSheet(f'color:{theme.DIM};')
-        self.lossy_images.setStyleSheet(
-            theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
-        )
-        self.attach_btn.setStyleSheet(
-            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:1px solid {theme.BORDER}; '
-            f'border-radius:8px; font-size:15pt; }} '
-            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
-        )
+        self.lossy_images.setStyleSheet(theme.icon_button_style())
+        self.attach_btn.setStyleSheet(theme.icon_button_style())
         self._refresh_attachment_chips()
         self.global_mode_btn.setIcon(draw_icon('globe', 14))
-        self.lossy_images.setIcon(draw_icon('tokens', 14))
-        self.attach_btn.setIcon(draw_icon('attach', 18))
-        self.send_btn.setIcon(draw_icon('arrow-right', 14, '#111827'))
+        self.lossy_images.setIcon(draw_icon('tokens', 16))
+        self.attach_btn.setIcon(draw_icon('attach', 16))
+        # accent fill is a primary action (Send) — the one QPushButton this pane deliberately
+        # keeps filled, per the accent-discipline rule
+        self.send_btn.setIcon(draw_icon('arrow-right', 14, theme.BG if theme.NIGHT else '#111827'))
         self._refresh_selector_icons()
         self.send_btn.setStyleSheet(
-            f'QPushButton {{ background:{theme.ACCENT}; color:#111827; border:none; border-radius:9px; '
-            f'padding:7px 15px; font-weight:700; }} '
+            f'QPushButton {{ background:{theme.ACCENT}; color:{theme.BG if theme.NIGHT else "#111827"}; border:none; '
+            f'border-radius:{theme.RADIUS}px; padding:7px 15px; font-weight:700; }} '
             f'QPushButton:hover {{ background:{theme.ACCENT}; }} '
             f'QPushButton:pressed {{ background:{theme.TEXT}; }} '
-            f'QPushButton:disabled {{ background:#cbd5e1; color:#ffffff; }}'
+            f'QPushButton:disabled {{ background:{theme.PANEL2}; color:{theme.TEXT_DISABLED}; }}'
         )
         for role, frame, name, label in self._messages:
             self._style_message(role, frame, name, label)
+
+    # [FN CATEGORY] _autosize_prompt — QPlainTextEdit uses QPlainTextDocumentLayout, where
+    # document().size().height() is a LINE COUNT, not pixels (unlike QTextDocument's default rich-
+    # text layout) — has to be multiplied by fontMetrics().lineSpacing() to get real pixels before
+    # clamping between _prompt_min_h/_prompt_max_h, or every height stays clamped to the minimum
+    # regardless of content (silently never grows).
+    # [FN] _autosize_prompt — grows the composer height to fit its content
+    # [FN OPEN] _autosize_prompt
+    def _autosize_prompt(self):
+        line_h = self.prompt.fontMetrics().lineSpacing()
+        doc_h = int(self.prompt.document().size().height() * line_h) + 16
+        self.prompt.setFixedHeight(max(self._prompt_min_h, min(doc_h, self._prompt_max_h)))
+    # [FN CLOSED] _autosize_prompt
 
     def _agent(self):
         return self.agent_select.currentData() or 'claude'
@@ -1894,9 +2030,9 @@ class ClaudePane(QWidget):
             button.setToolTip(tooltip)
             button.setStyleSheet(
                 f'QPushButton {{ background:{theme.PANEL}; color:{accent}; border:1px solid {accent}; '
-                f'border-radius:8px; padding:6px 12px; font-weight:700; }} '
+                f'border-radius:{theme.RADIUS}px; padding:6px 12px; font-weight:700; }} '
                 f'QPushButton:hover {{ background:{accent}; color:#ffffff; }} '
-                f'QPushButton:disabled {{ color:{theme.DIM}; border-color:#e2e8f0; background:#f1f5f9; }}'
+                f'QPushButton:disabled {{ color:{theme.TEXT_DISABLED}; border-color:{theme.BORDER_WEAK}; background:{theme.PANEL2}; }}'
             )
             actions.addWidget(button)
         buttons[0].clicked.connect(lambda: self._decide_permission(request, status, buttons, 'deny'))
@@ -1921,7 +2057,7 @@ class ClaudePane(QWidget):
             'session': 'Consentito per la sessione', 'auto': 'Consentito automaticamente',
         }
         status.setText(labels[decision])
-        status.setStyleSheet(f"color:{theme.OK if allow else '#ef4444'}; border:none;")
+        status.setStyleSheet(f"color:{theme.OK if allow else theme.DANGER}; border:none;")
         for button in buttons:
             button.setEnabled(False)
 
@@ -1939,7 +2075,7 @@ class ClaudePane(QWidget):
 
     def refresh_focus_label(self):
         text = self.focus_hint() if self.focus_hint else None
-        self.focus_label.setText(f'Focus: {text}' if text else '')
+        self.focus_label.setFullText(f'Focus: {text}' if text else '')
 
     def _write_log(self, text):
         try:
@@ -1950,7 +2086,10 @@ class ClaudePane(QWidget):
 
     def _style_message(self, role, frame, name, label):
         if role == 'user':
-            bg, fg, border = theme.ACCENT, '#ffffff', theme.ACCENT
+            # dark text on the gold bubble, not a hardcoded white — white-on-gold is ~1.6:1
+            # contrast (fails WCAG AA badly) regardless of theme; a dark foreground reads clearly
+            # in both, same fix already applied to send_btn/welcome_open_btn
+            bg, fg, border = theme.ACCENT, (theme.BG if theme.NIGHT else '#111827'), theme.ACCENT
         elif role == 'assistant':
             bg, fg, border = theme.PANEL, theme.TEXT, theme.BORDER
         else:
@@ -2322,14 +2461,16 @@ class ClaudePane(QWidget):
         self._reset_process()
 
     # [FN CATEGORY] offer_ai_review — a small inline chat card (same shape as a permission-request
-    # card) instead of popping the full review window unasked: an AI turn that changed files just
-    # gets a quiet "N file changed, want to look?" — "Rivedi" opens show_ai_review's full window,
-    # "Accetta tutto"/"Rifiuta tutto" resolve immediately without ever opening it. Never called at
-    # all when auto_permissions is on (see workspace._finish_ai_review) — automatic mode means the
-    # user asked not to be interrupted for this either.
-    # [FN] offer_ai_review — posts the review as a dismissible chat card instead of a popped window
+    # card): the diff itself is already visible live in the coding board and the project tree (see
+    # MainWindow._enter_ai_review_mode — green/red-underlined merged view per changed file, colored
+    # tree rows) by the time this card appears, so the card's only job is the accept/reject decision
+    # — Accetta/Annulla, nothing else. Replaces the old three-button card (Rifiuta tutto/Rivedi/
+    # Accetta tutto) that opened a separate review window; that window is gone. Never called at all
+    # when auto_permissions is on (see workspace._finish_ai_review) — automatic mode means the user
+    # asked not to be interrupted for this either.
+    # [FN] offer_ai_review — posts the review as a dismissible accept/cancel chat card
     # [FN OPEN] offer_ai_review
-    def offer_ai_review(self, review, render_text, on_resolved):
+    def offer_ai_review(self, review, on_resolved):
         total_add = sum(item.get('additions', 0) for item in review)
         total_del = sum(item.get('deletions', 0) for item in review)
         row = QWidget()
@@ -2345,16 +2486,19 @@ class ClaudePane(QWidget):
         file_list = QLabel('\n'.join(f"{item['status']}: {item['path']}" for item in review)[:600])
         file_list.setWordWrap(True)
         file_list.setStyleSheet(f'color:{theme.DIM}; border:none;')
+        hint = QLabel('La differenza è già visibile nella plancia e nel codice (verde = aggiunto, rosso = eliminato).')
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f'color:{theme.DIM}; font-style:italic; border:none;')
         content.addWidget(title)
         content.addWidget(file_list)
+        content.addWidget(hint)
         actions = QHBoxLayout()
-        buttons = [QPushButton(label) for label in ('Rifiuta tutto', 'Rivedi', 'Accetta tutto')]
+        buttons = [QPushButton(label) for label in ('Annulla', 'Accetta')]
         button_tooltips = (
             'Annulla tutte le modifiche di questo turno e ripristina lo snapshot',
-            "Apri la revisione completa (diff per file/blocco, risultato modificabile)",
-            'Applica tutte le modifiche cosi come sono, senza aprire la revisione',
+            'Applica tutte le modifiche cosi come sono',
         )
-        for button, accent, tooltip in zip(buttons, (theme.TAG_COLORS['TST'], theme.ACCENT, theme.OK), button_tooltips):
+        for button, accent, tooltip in zip(buttons, (theme.TAG_COLORS['TST'], theme.OK), button_tooltips):
             button.setCursor(Qt.PointingHandCursor)
             button.setToolTip(tooltip)
             button.setStyleSheet(
@@ -2378,317 +2522,13 @@ class ClaudePane(QWidget):
                 on_resolved('cancel', {}, {})
 
         buttons[0].clicked.connect(lambda: resolve_inline('cancel'))
-        buttons[1].clicked.connect(lambda: (row.setParent(None), self.show_ai_review(review, render_text, on_resolved)))
-        buttons[2].clicked.connect(lambda: resolve_inline('apply'))
+        buttons[1].clicked.connect(lambda: resolve_inline('apply'))
     # [FN CLOSED] offer_ai_review
-
-    # [FN CATEGORY] show_ai_review — a large separate window (framed header, no native title bar —
-    # same look as the Git panel/MAPPA dialog) instead of embedding the card in the chat transcript,
-    # so a multi-file review gets real screen space instead of a 720px-wide bubble. Non-modal like
-    # the app's other internal windows, not blocking the rest of the IDE. on_resolved(action,
-    # accepted, manual_text) fires exactly once, when the user applies or cancels; the caller does
-    # the actual apply/rollback and reports the outcome as a follow-up chat message.
-    # [FN] show_ai_review — opens the AI review in its own window
-    # [FN OPEN] show_ai_review
-    def show_ai_review(self, review, render_text, on_resolved):
-        dialog = QDialog(self)
-        dialog.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
-        dialog.resize(1100, 760)
-        dialog.setStyleSheet(f'QDialog {{ background:{theme.BG}; border:1px solid {theme.BORDER}; }}')
-
-        outer = QVBoxLayout(dialog)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        header = QWidget()
-        header.setFixedHeight(34)
-        header.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
-        header_row = QHBoxLayout(header)
-        header_row.setContentsMargins(14, 0, 8, 0)
-        title = QLabel(f"Revisione modifiche AI — {len(review)} file")
-        title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
-        title.setStyleSheet(f'color:{theme.TEXT}; letter-spacing:1px; border:none;')
-        header_row.addWidget(title)
-        header_row.addStretch(1)
-        close_btn = QPushButton('×')
-        close_btn.setFixedSize(26, 24)
-        close_btn.setToolTip('Chiudi (annulla le modifiche proposte, come Annulla ↶)')
-        close_btn.setStyleSheet(theme.BUTTON_STYLE)
-        header_row.addWidget(close_btn)
-        outer.addWidget(header)
-
-        card = _AiReviewCard(review, render_text, in_dialog=True)
-        outer.addWidget(card, 1)
-
-        def fire(action):
-            card.set_resolved()
-            on_resolved(action, card.accepted(), card.manual_text)
-            dialog.close()
-
-        card.resolved.connect(fire)
-        close_btn.clicked.connect(lambda: card.resolved.emit('cancel'))
-        dialog.show()
-    # [FN CLOSED] show_ai_review
-
-
-# [FN CATEGORY] _AiReviewCard — the AI change review UI: a compact summary (file count, +/- totals,
-# per-file rows) that "Controllo" expands into a file/hunk checklist plus a diff/editable-result
-# tab view. In its own window (in_dialog=True, the only way it's used now — see show_ai_review),
-# the summary's own Controllo/Annulla buttons are redundant with the details panel's own action row
-# and the window's own close button, so they're skipped and details are shown immediately instead
-# of waiting for a click. Emits resolved('apply'|'cancel') exactly once and then locks its action
-# buttons.
-# [FN] _AiReviewCard — AI review widget (file/hunk selection, diff, editable result)
-# [FN OPEN] _AiReviewCard
-class _AiReviewCard(QWidget):
-    DATA_ROLE = Qt.UserRole
-    resolved = Signal(str)
-
-    def __init__(self, review, render_text, in_dialog=False):
-        super().__init__()
-        self.review = review
-        self.render_text = render_text
-        self.in_dialog = in_dialog
-        self.by_path = {item['path']: item for item in review}
-        self.file_items = {}
-        self.manual_text = {}
-        self._current_path = None
-        self._loading_editor = False
-        self._action_buttons = []
-        if not in_dialog:
-            self.setMaximumWidth(720)
-        self.setStyleSheet(
-            f'#aiReviewBubble, #aiReviewDetails {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:12px; }} '
-            f'QLabel {{ color:{theme.TEXT}; }} QTreeWidget, QPlainTextEdit {{ background:{theme.CODE_BG}; '
-            f'color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:8px; }} '
-            f'QTabWidget::pane {{ border:1px solid {theme.BORDER}; border-radius:8px; background:{theme.CODE_BG}; }}'
-        )
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(8)
-        root.addWidget(self._build_summary())
-        self.details = self._build_details()
-        self.details.hide()
-        root.addWidget(self.details, 1)
-        if in_dialog:
-            self._show_details()
-
-    def _button(self, text, slot, action=False):
-        button = QPushButton(text)
-        button.setStyleSheet(theme.BUTTON_STYLE)
-        button.clicked.connect(slot)
-        if action:
-            self._action_buttons.append(button)
-        return button
-
-    def _build_summary(self):
-        panel = QWidget()
-        panel.setObjectName('aiReviewBubble')
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 8, 12, 9)
-        layout.setSpacing(3)
-        if not self.in_dialog:
-            # same name-label treatment as a normal assistant chat bubble (_style_message), so this
-            # reads as another message in the conversation rather than a separate card bolted on
-            sender = QLabel('Assistente AI')
-            sender.setStyleSheet(f'color:{theme.TEXT}; font-weight:600; background:transparent;')
-            layout.addWidget(sender)
-        header = QHBoxLayout()
-        totals = QVBoxLayout()
-        if not self.in_dialog:
-            # in a dialog this is redundant with the window's own title bar ("... — N file")
-            title = QLabel(f"{len(self.review)} file {'modificato' if len(self.review) == 1 else 'modificati'}")
-            title.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
-            totals.addWidget(title)
-        added = sum(item['additions'] for item in self.review)
-        deleted = sum(item['deletions'] for item in self.review)
-        counts = QLabel(f'<span style="color:{theme.OK}">+{added}</span>  <span style="color:#ef4444">-{deleted}</span>')
-        totals.addWidget(counts)
-        header.addLayout(totals)
-        header.addStretch(1)
-        if not self.in_dialog:
-            # redundant in a dialog: the window's own close button cancels, and details are
-            # already shown immediately instead of waiting for a "Controllo" click
-            cancel_btn = self._button('Annulla ↶', lambda: self.resolved.emit('cancel'), action=True)
-            cancel_btn.setToolTip('Annulla tutte le modifiche proposte dall\'AI, ripristinando i file com\'erano')
-            header.addWidget(cancel_btn)
-            review_btn = self._button('Controllo', self._show_details)
-            review_btn.setToolTip('Apri la revisione dettagliata riga per riga delle modifiche proposte')
-            header.addWidget(review_btn)
-        layout.addLayout(header)
-
-        self.summary_rows = []
-        for index, item in enumerate(self.review):
-            row = QWidget()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            path_button = QPushButton(item['path'])
-            path_button.setStyleSheet(
-                f'QPushButton {{ text-align:left; padding:5px 0; border:none; color:{theme.TEXT}; background:transparent; }} '
-                f'QPushButton:hover {{ color:{theme.ACCENT}; }}'
-            )
-            path_button.setToolTip('Apri la revisione dettagliata di questo file')
-            path_button.clicked.connect(lambda _checked=False, path=item['path']: self._show_details(path))
-            row_layout.addWidget(path_button, 1)
-            added_label = QLabel(f"+{item['additions']}")
-            added_label.setStyleSheet(f'color:{theme.OK};')
-            deleted_label = QLabel(f"-{item['deletions']}")
-            deleted_label.setStyleSheet('color:#ef4444;')
-            row_layout.addWidget(added_label)
-            row_layout.addWidget(deleted_label)
-            row.setVisible(index < 3)
-            layout.addWidget(row)
-            self.summary_rows.append(row)
-        hidden = max(0, len(self.review) - 3)
-        self.more_btn = self._button(f'Mostra altri {hidden} file ⌄', self._toggle_summary)
-        self.more_btn.setToolTip('Mostra o nascondi il resto dei file modificati')
-        self.more_btn.setVisible(bool(hidden))
-        layout.addWidget(self.more_btn)
-        return panel
-
-    def _toggle_summary(self):
-        expanded = not self.summary_rows[-1].isVisible()
-        for row in self.summary_rows[3:]:
-            row.setVisible(expanded)
-        self.more_btn.setText('Mostra meno ⌃' if expanded else f'Mostra altri {len(self.review) - 3} file ⌄')
-
-    def _build_details(self):
-        panel = QWidget()
-        panel.setObjectName('aiReviewDetails')
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 8, 12, 10)
-        splitter = QSplitter(Qt.Horizontal)
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(['File e blocchi da mantenere'])
-        self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.tree.setMinimumWidth(220)
-        for item in self.review:
-            file_item = QTreeWidgetItem([item['path']])
-            file_item.setData(0, self.DATA_ROLE, (item['path'], None))
-            file_item.setFlags(file_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate)
-            file_item.setCheckState(0, Qt.Checked)
-            for index, hunk in enumerate(item['hunks']):
-                child = QTreeWidgetItem([hunk['title']])
-                child.setData(0, self.DATA_ROLE, (item['path'], index))
-                child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
-                child.setCheckState(0, Qt.Checked)
-                file_item.addChild(child)
-            self.tree.addTopLevelItem(file_item)
-            self.file_items[item['path']] = file_item
-        self.tree.expandAll()
-        self.tree.currentItemChanged.connect(self._show_tree_item)
-        self.tree.itemChanged.connect(self._selection_changed)
-        splitter.addWidget(self.tree)
-
-        self.tabs = QTabWidget()
-        self.diff_view = QPlainTextEdit()
-        self.diff_view.setReadOnly(True)
-        self.diff_view.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.diff_highlighter = DiffHighlighter(self.diff_view.document())
-        self.result_editor = QPlainTextEdit()
-        self.result_editor.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.result_editor.textChanged.connect(self._editor_changed)
-        self.tabs.addTab(self.diff_view, 'Differenze')
-        self.tabs.addTab(self.result_editor, 'Risultato modificabile')
-        splitter.addWidget(self.tabs)
-        splitter.setSizes([240, 560])
-        layout.addWidget(splitter, 1)
-
-        note = QLabel('I blocchi selezionati saranno mantenuti. Cambiare una selezione ripristina il risultato del file e scarta i ritocchi manuali su quel file.')
-        note.setWordWrap(True)
-        note.setStyleSheet(f'color:{theme.DIM};')
-        layout.addWidget(note)
-        actions = QHBoxLayout()
-        reject_selected_btn = self._button('Rifiuta selezionati', lambda: self._set_selected(False))
-        reject_selected_btn.setToolTip("Deseleziona i blocchi correntemente evidenziati nell'albero (non li applica)")
-        actions.addWidget(reject_selected_btn)
-        accept_selected_btn = self._button('Accetta selezionati', lambda: self._set_selected(True))
-        accept_selected_btn.setToolTip("Seleziona i blocchi correntemente evidenziati nell'albero (li applica)")
-        actions.addWidget(accept_selected_btn)
-        actions.addStretch(1)
-        cancel_all_btn = self._button('Annulla tutto', lambda: self.resolved.emit('cancel'), action=True)
-        cancel_all_btn.setToolTip("Scarta tutte le modifiche proposte, i file restano com'erano")
-        actions.addWidget(cancel_all_btn)
-        accept_all_btn = self._button('Accetta tutto', self._accept_all, action=True)
-        accept_all_btn.setToolTip('Seleziona ogni blocco di ogni file (non applica ancora)')
-        actions.addWidget(accept_all_btn)
-        apply_btn = self._button('Applica scelte', lambda: self.resolved.emit('apply'), action=True)
-        apply_btn.setToolTip('Scrive su disco solo i blocchi attualmente selezionati')
-        actions.addWidget(apply_btn)
-        layout.addLayout(actions)
-        return panel
-
-    def _show_details(self, path=None):
-        self.details.setVisible(True)
-        self.details.setMinimumHeight(420)
-        if path:
-            self.tree.setCurrentItem(self.file_items[path])
-        elif self.tree.currentItem() is None and self.review:
-            self.tree.setCurrentItem(self.file_items[self.review[0]['path']])
-
-    def _show_tree_item(self, current, _previous=None):
-        if current is None:
-            return
-        path, hunk_index = current.data(0, self.DATA_ROLE)
-        item = self.by_path[path]
-        self._current_path = path
-        diff = item['hunks'][hunk_index]['diff'] if hunk_index is not None else '\n'.join(h['diff'] for h in item['hunks'])
-        self.diff_view.setPlainText(diff)
-        self._loading_editor = True
-        if item['binary']:
-            self.result_editor.setPlainText('[file binario: disponibile solo accettazione o rifiuto]')
-            self.result_editor.setReadOnly(True)
-        else:
-            self.result_editor.setReadOnly(False)
-            selected = self.accepted_hunks(path)
-            self.result_editor.setPlainText(self.manual_text.get(path, self.render_text(item, selected)))
-            self.result_editor.document().setModified(path in self.manual_text)
-        self._loading_editor = False
-
-    def _selection_changed(self, tree_item, _column):
-        data = tree_item.data(0, self.DATA_ROLE)
-        if not data:
-            return
-        path, _index = data
-        self.manual_text.pop(path, None)
-        if path == self._current_path:
-            self._show_tree_item(tree_item)
-
-    def _editor_changed(self):
-        if not self._loading_editor and self._current_path and not self.by_path[self._current_path]['binary']:
-            self.manual_text[self._current_path] = self.result_editor.toPlainText()
-
-    def _set_selected(self, checked):
-        state = Qt.Checked if checked else Qt.Unchecked
-        for selected in self.tree.selectedItems():
-            if selected.childCount():
-                for index in range(selected.childCount()):
-                    selected.child(index).setCheckState(0, state)
-            else:
-                selected.setCheckState(0, state)
-
-    def accepted_hunks(self, path):
-        parent = self.file_items[path]
-        return {index for index in range(parent.childCount()) if parent.child(index).checkState(0) == Qt.Checked}
-
-    def accepted(self):
-        return {path: self.accepted_hunks(path) for path in self.file_items}
-
-    def _accept_all(self):
-        for parent in self.file_items.values():
-            for index in range(parent.childCount()):
-                parent.child(index).setCheckState(0, Qt.Checked)
-        self.resolved.emit('apply')
-
-    def set_resolved(self):
-        for button in self._action_buttons:
-            button.setEnabled(False)
-# [FN CLOSED] _AiReviewCard
 
 
 def _tag_header_html(tag, name, desc, bold_name=False):
     color = theme.TAG_COLORS.get(tag, theme.TEXT)
-    bg = theme.TAG_BACKGROUNDS.get(tag, '#eef2f7')
+    bg = theme.TAG_BACKGROUNDS.get(tag, theme.PANEL2)
     label = desc or name
     html = (
         f'<span style="color:{color}; background-color:{bg}; font-weight:700; '
@@ -2719,18 +2559,16 @@ def _build_header_row(owner, node, show_label=True):
     else:
         header_row.addStretch(1)
     meta_btn = QToolButton()
-    meta_btn.setText('⋮')
+    meta_btn.setIcon(draw_icon('more', 14))
+    meta_btn.setIconSize(QSize(14, 14))
     meta_btn.setToolTip('Modifica metadati KANT')
     meta_btn.setCursor(Qt.PointingHandCursor)
-    # fixed size so the bigger glyph (bigger per user request) doesn't stretch the whole header
-    # row's height via QToolButton's own sizeHint — that would put empty space back around every
-    # element's header, the opposite of the density this row is built for
-    meta_btn.setFixedSize(24, 22)
-    meta_btn.setStyleSheet(
-        f'QToolButton {{ border:none; background:transparent; color:{theme.DIM}; '
-        f'font-weight:900; font-size:{theme.CODE_FONT_PT + 8}pt; padding:0; }} '
-        f'QToolButton:hover {{ color:{theme.ACCENT}; }}'
-    )
+    # fixed size so the icon doesn't stretch the whole header row's height via QToolButton's own
+    # sizeHint — that would put empty space back around every element's header, the opposite of
+    # the density this row is built for. Transparent-by-default/accent-on-hover (icon_button_style)
+    # keeps this near-invisible until hovered, instead of a constantly-prominent control.
+    meta_btn.setFixedSize(20, 20)
+    meta_btn.setStyleSheet(theme.icon_button_style())
     meta_btn.clicked.connect(lambda _checked=False, n=node: owner.editMetadata.emit(n))
     header_row.addWidget(meta_btn)
     return header_row, header
@@ -2752,12 +2590,18 @@ class CollapsibleSection(QWidget):
     def __init__(self, node: Node, show_header=True):
         super().__init__()
         self.setObjectName('collapsible')
+        # flat block, not a card: a thin top separator + a tag-colored left gutter bar (matching
+        # the same tag color used in the header badge/tree row, so the gutter reads as "which kind
+        # of element this is" rather than a generic accent stripe) — no fill, no full border, no
+        # rounded corners. ACCENT itself is reserved for selection/focus/primary-action per the
+        # redesign's accent-discipline rule, not spent on every block's edge.
+        gutter = theme.TAG_COLORS.get(node.tag, theme.BORDER)
         self.setStyleSheet(
-            f'#collapsible {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; '
-            f'border-left:4px solid {theme.ACCENT}; border-radius:10px; }}'
+            f'#collapsible {{ background:transparent; border:none; border-top:1px solid {theme.BORDER_WEAK}; '
+            f'border-left:3px solid {gutter}; }}'
         )
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(3, 1, 2, 1)
+        outer.setContentsMargins(theme.SPACE_1, theme.SPACE_1, 2, theme.SPACE_1)
         outer.setSpacing(1)
 
         if show_header:
@@ -2870,9 +2714,79 @@ class LeafSection(QWidget):
 # [FN] ProjectTree — project tree that re-wraps its item labels on resize
 # [FN OPEN] ProjectTree
 class ProjectTree(QTreeWidget):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # set by MainWindow after construction — callable(local_file_paths: list[str], target_item
+        # or None) invoked on a drop; None means "no drop handling right now" (e.g. KANT/Gruppi
+        # view mode, or no project open), in which case drops are simply rejected rather than
+        # silently doing nothing unexpected
+        self.file_drop_handler = None
+        # internal item-reorder drag (KANT elements within the same file/parent) — kept fully
+        # role-agnostic here (this class has no access to mainwindow.py's ROLE_KIND/ROLE_UID
+        # constants without a circular import), so both the validity check and the actual sync-to-
+        # file work are callbacks MainWindow supplies, same shape as file_drop_handler above.
+        # reorder_allowed(dragged_item, target_item_or_None, dropped_on_item: bool) -> bool
+        # reorder_handler(parent_item_or_None, ordered_child_items) — called after Qt's own native
+        # move already happened, with the new sibling order for MainWindow to apply to the source
+        self.reorder_allowed = None
+        self.reorder_handler = None
+        self.setAcceptDrops(True)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._rewrap_labels()
+
+    def _reorder_drag_ok(self, event):
+        if event.source() is not self or self.reorder_handler is None:
+            return None
+        dragged = self.currentItem()
+        if dragged is None:
+            return False
+        target = self.itemAt(event.position().toPoint())
+        on_item = self.dropIndicatorPosition() == QAbstractItemView.OnItem
+        if self.reorder_allowed is not None and not self.reorder_allowed(dragged, target, on_item):
+            return False
+        return True
+
+    def dragEnterEvent(self, event):
+        ok = self._reorder_drag_ok(event)
+        if ok:
+            event.acceptProposedAction()
+            return
+        if ok is None and self.file_drop_handler is not None and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        ok = self._reorder_drag_ok(event)
+        if ok:
+            event.acceptProposedAction()
+            return
+        if ok is None and self.file_drop_handler is not None and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        ok = self._reorder_drag_ok(event)
+        if ok is not None:
+            if not ok:
+                event.ignore()
+                return
+            dragged = self.currentItem()
+            parent_item = dragged.parent()
+            super().dropEvent(event)
+            if parent_item is not None:
+                siblings = [parent_item.child(i) for i in range(parent_item.childCount())]
+            else:
+                siblings = [self.topLevelItem(i) for i in range(self.topLevelItemCount())]
+            self.reorder_handler(parent_item, siblings)
+            return
+        if self.file_drop_handler is None:
+            return
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile()]
+        if not paths:
+            return
+        item = self.itemAt(event.position().toPoint())
+        self.file_drop_handler(paths, item)
+        event.acceptProposedAction()
 
     def _rewrap_labels(self):
         avail = self.viewport().width() - 12
@@ -3165,6 +3079,10 @@ class TitleBar(QWidget):
         self.syntax_label = QLabel('')
         layout.addWidget(self.syntax_label)
 
+        # index where a second widget (the action toolbar) gets spliced in later via
+        # embed_toolbar() — consolidates menu row + action row into the ONE top bar the redesign
+        # calls for, instead of two stacked bars each with their own background/border
+        self._toolbar_slot_index = layout.count()
         layout.addStretch(1)
         self.buttons = [self.back_btn]
 
@@ -3177,14 +3095,22 @@ class TitleBar(QWidget):
         chrome_tooltips = {'−': 'Riduci a icona', '□': 'Massimizza/ripristina la finestra', '×': "Chiudi l'IDE"}
         for text, callback in (('−', window.showMinimized), ('□', self._toggle_maximized), ('×', window.close)):
             btn = QPushButton(text)
-            btn.setFixedSize(36, 26)
+            btn.setFixedSize(theme.ICON_BTN, 26)
             btn.setToolTip(chrome_tooltips[text])
             btn.clicked.connect(callback)
             self.buttons.append(btn)
-            btn.setStyleSheet(theme.BUTTON_STYLE)
             chrome_row.addWidget(btn)
         layout.addLayout(chrome_row)
         self.apply_style()
+
+    # [FN CATEGORY] embed_toolbar — inserts the widget at _toolbar_slot_index, right before the
+    # trailing stretch/window-chrome items already in this bar's own QHBoxLayout, so it reads as
+    # one consolidated top bar instead of a second stacked row underneath
+    # [FN] embed_toolbar — splices a widget into this bar's own row
+    # [FN OPEN] embed_toolbar
+    def embed_toolbar(self, widget):
+        self.layout().insertWidget(self._toolbar_slot_index, widget)
+    # [FN CLOSED] embed_toolbar
 
     def apply_style(self):
         self.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
@@ -3204,22 +3130,18 @@ class TitleBar(QWidget):
             f'QMenuBar::item:selected {{ background:{theme.CODE_BG}; color:{theme.ACCENT}; }} '
             f'QMenuBar::item:pressed {{ background:{theme.ACCENT}; color:#ffffff; }} '
             f'QMenu {{ background:{theme.PANEL}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:5px; padding:2px; }} '
-            f'QMenu::item {{ background:transparent; padding:5px 18px 5px 10px; border-radius:4px; '
+            f'border-radius:{theme.RADIUS}px; padding:2px; }} '
+            f'QMenu::item {{ background:transparent; padding:5px 18px 5px 10px; border-radius:{theme.RADIUS}px; '
             f'font-size:{theme.CODE_FONT_PT}pt; }} '
             f'QMenu::item:selected {{ background:{theme.CODE_BG}; color:{theme.ACCENT}; }} '
             f'QMenu::item:disabled {{ color:{theme.DIM}; }} '
             f'QMenu::separator {{ height:1px; background:{theme.BORDER}; margin:3px 6px; }}'
         )
-        tool_button_style = theme.BUTTON_STYLE.replace('QPushButton', 'QToolButton')
-        # back_btn is icon-only now — theme.BUTTON_STYLE's 7px/13px padding (sized for a text
-        # label) was squeezing its 16px icon down to a sliver inside the fixed 32x28 button
-        icon_button_style = theme.BUTTON_STYLE.replace('padding:7px 13px;', 'padding:4px;')
+        # every chrome/back button here is icon-only (or a single glyph standing in for one) — the
+        # square icon-button variant, not the padded text-button one, for all of them
+        style = theme.icon_button_style()
         for btn in self.buttons:
-            if btn is self.back_btn:
-                btn.setStyleSheet(icon_button_style.replace('QPushButton', 'QToolButton') if isinstance(btn, QToolButton) else icon_button_style)
-            else:
-                btn.setStyleSheet(tool_button_style if isinstance(btn, QToolButton) else theme.BUTTON_STYLE)
+            btn.setStyleSheet(style)
         active = self.window.active_tab if hasattr(self.window, 'tabs') else None
         dirty = active.dirty if active else False
         self.filename_label.setStyleSheet(f'color:{theme.ACCENT if dirty else theme.DIM};')

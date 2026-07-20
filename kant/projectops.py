@@ -4,6 +4,8 @@ Search, replace discovery, KANT-map generation, validation, and local symbol loo
 Callers own threading, confirmation, display, and writes; ``MainWindow`` runs expensive scans in
 the background and ``WorkspaceMixin`` owns mutations.
 """
+import csv
+import io
 import os
 import re
 from pathlib import Path
@@ -12,6 +14,7 @@ from kant import theme
 from kant.fileio import file_fingerprint
 from kant.model import Node, read_top_level_label, read_top_level_label_result
 from kant.syntax import audit_kant_headers
+from kant.xref import build_xref
 
 
 def iter_project_text_files(root):
@@ -91,6 +94,40 @@ def build_kant_map(root, project_name):
     return '\n'.join([*lines, '```', ''])
 
 
+# [FN CATEGORY] build_kant_flow_csv — same file-discovery pass as build_kant_map (every KANT-
+# tagged file's already-parsed tree, keyed by project-relative path), fed into build_xref for the
+# incoming/outgoing graph. A plain flat CSV, not a real .xlsx — this project has no dependency
+# beyond PySide6/pytest and stdlib csv already opens fine as a spreadsheet in Excel/Sheets without
+# adding one. One row per KANT element; Incoming/Outgoing cells list "file::name" for each
+# referencing/referenced element, semicolon-separated, resolved through the same graph rather than
+# left as raw '<rel_path>::<uid>' keys.
+# [FN] build_kant_flow_csv — CSV of every element's incoming/outgoing cross-references
+# [FN OPEN] build_kant_flow_csv
+def build_kant_flow_csv(root):
+    trees = {}
+    for path in iter_kant_tagged_files(root):
+        label = read_top_level_label(path)
+        if label is not None:
+            _tag, _desc, tree, _top_node = label
+            trees[os.path.relpath(path, root).replace(os.sep, '/')] = tree
+    graph = build_xref(trees)
+
+    def label_for(key):
+        el = graph.get(key)
+        return f'{el.file}::{el.name}' if el is not None else key
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(['File', 'Tag', 'Nome', 'Descrizione', 'Incoming', 'Outgoing'])
+    for key in sorted(graph, key=lambda k: (graph[k].file, graph[k].order)):
+        el = graph[key]
+        incoming = '; '.join(sorted(label_for(k) for k in el.incoming))
+        outgoing = '; '.join(sorted(label_for(k) for k in el.outgoing))
+        writer.writerow([el.file, el.tag, el.name, el.desc, incoming, outgoing])
+    return buf.getvalue()
+# [FN CLOSED] build_kant_flow_csv
+
+
 def _canonical_map_text(text):
     # equivalent only across line-ending and trailing-newline differences — used both to decide
     # whether the map is in sync (validate_kant_project) and whether _sync_kant_map needs to write
@@ -123,8 +160,17 @@ def validate_kant_project(root, map_path):
         except OSError as error:
             map_read_error = str(error)
 
+    # the map's absolute path, so it can be skipped below — build_kant_map's own output uses
+    # "[TAG Name]"/"[TAG] Name" summary lines (_map_line) that happen to match TAGLINE_RE's shape
+    # (a bracketed tag + name) with no real OPEN/CLOSED markers anywhere in the file, since it's
+    # generated documentation, not source. Scanning it here as if it were taggable source produced
+    # a wall of bogus "intestazione [TAG] pendente" errors — one per summary line — on every run.
+    map_abspath = os.path.abspath(map_path) if map_path else None
+
     uid_locations = {}
     for path in iter_kant_tagged_files(root):
+        if map_abspath is not None and os.path.abspath(path) == map_abspath:
+            continue
         rel = os.path.relpath(path, root).replace(os.sep, '/')
         try:
             text = Path(path).read_text(encoding='utf-8')

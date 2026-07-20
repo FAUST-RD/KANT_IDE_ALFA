@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from html import escape as html_escape
 from pathlib import Path
@@ -23,12 +24,13 @@ import shiboken6
 
 from PySide6.QtCore import QFileSystemWatcher, QPoint, QPointF, Qt, QSettings, QSize, Signal, QTimer
 from PySide6.QtGui import (
-    QColor, QFont, QKeySequence, QMouseEvent, QPainter, QShortcut, QTextCursor, QTextDocument,
+    QColor, QFont, QKeySequence, QMouseEvent, QPainter, QShortcut, QTextCharFormat, QTextCursor, QTextDocument,
+    QTextFormat,
 )
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QAbstractItemView, QApplication, QButtonGroup, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton, QScrollArea,
-    QSizeGrip, QSplitter, QStackedWidget, QTabBar, QTabWidget, QToolButton,
+    QSizeGrip, QSplitter, QStackedWidget, QTabBar, QTabWidget, QTextEdit, QToolButton,
     QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
 )
 
@@ -40,7 +42,7 @@ from kant.model import (
     KantParseError, ELEMENT_LANGUAGES, build_new_element_node, build_new_file_content,
 )
 from kant.fileio import file_fingerprint, write_file_atomic, detect_line_ending, is_safe_child_name
-from kant.syntax import check_file_syntax, run_command_for_path, _quote_arg, audit_kant_headers
+from kant.syntax import check_file_syntax, run_command_for_path, _quote_arg, audit_kant_headers, KEYWORD_DOCS
 from kant import skeleton
 from kant.xref import build_xref, _walk_nodes
 from kant.groupings import load_groupings, save_groupings, new_grouping, add_member
@@ -48,8 +50,9 @@ from kant.lsp import LSP_SERVERS_BY_EXT, file_uri, path_from_file_uri, lsp_serve
 from kant.dialogs import IdeDialogsMixin
 from kant.gitops import GitOpsMixin
 from kant.projectops import (
-    _canonical_map_text, build_kant_map, definition_locations, has_any_kant_tags, iter_kant_tagged_files,
-    iter_project_text_files, reference_locations, scan_project_replace, search_project, validate_kant_project,
+    _canonical_map_text, build_kant_flow_csv, build_kant_map, definition_locations, has_any_kant_tags,
+    iter_kant_tagged_files, iter_project_text_files, reference_locations, scan_project_replace, search_project,
+    validate_kant_project,
 )
 from kant.pyenv import (
     dependency_file, detect_venvs, has_module, interpreter_label, interpreter_version,
@@ -76,6 +79,58 @@ ROLE_KEY = Qt.UserRole + 7   # xref element key '<rel_path>::<uid>', on Incoming
 # document order (pre-order over tagged nodes, matching _nodes_in_order) of a 'section' tree item —
 # the reliable fallback when a legacy (no #id) file's uid doesn't survive _open_file's own reparse
 ROLE_ORDER = Qt.UserRole + 8
+
+
+# [CST CATEGORY] _KANT_ERROR_KB — one entry per audit_kant_headers/parse_kant message shape this
+# project actually produces (kant/syntax.py's warnings/errors, kant/model.py's KantParseError
+# text). Matched by regex against the bare message (ROLE_TEXT — no "path:line:" prefix), in order,
+# first match wins. 'key' groups occurrences for the recurrence counter across whatever variable
+# text (tag/name) the message itself carries. 'fix' is None where no SAFE deterministic or AI
+# action exists — a wrong or destructive auto-fix would be worse than making the user read the
+# explanation and edit it themselves (renaming markers, deciding whether to delete an orphaned
+# one, resolving a duplicate #id by hand).
+# [CST] _KANT_ERROR_KB — regex -> (key, explanation, fix) for known KANT validation error shapes
+# [CST OPEN] _KANT_ERROR_KB
+_KANT_ERROR_KB = [
+    (re.compile(r'^CATEGORY mancante$'), 'category-mancante',
+     "Manca la riga [TAG CATEGORY] sopra il marker OPEN di questo elemento — deve spiegare COME "
+     "funziona (il meccanismo), non ripetere cosa fa in altre parole.", 'ai-fill'),
+    (re.compile(r'^CATEGORY vuota$'), 'category-vuota',
+     "La riga [TAG CATEGORY] c'è ma il testo dopo il trattino è vuoto — un placeholder mai "
+     "compilato.", 'ai-fill'),
+    (re.compile(r'^tagline mancante$'), 'tagline-mancante',
+     "Manca la riga descrittiva [TAG] Nome — descrizione, la riga breve (max 8 parole) che il "
+     "pannello KANT mostra come nome dell'elemento.", 'ai-fill'),
+    (re.compile(r'^tagline vuota$'), 'tagline-vuota',
+     "La riga descrittiva c'è ma il testo dopo il trattino è vuoto — un placeholder mai compilato.",
+     'ai-fill'),
+    (re.compile(r'^descrizione oltre le 8 parole'), 'tagline-lunga',
+     "La riga descrittiva supera il limite di 8 parole previsto dalla convenzione — è pensata "
+     "come un'etichetta breve, non una spiegazione (quella va nella riga CATEGORY, senza limite "
+     "di lunghezza). Va accorciata a mano: qual è la parte davvero essenziale?", None),
+    (re.compile(r'^intestazione \[.+\] pendente, non associata a un OPEN successivo$'), 'pendente',
+     "Questa riga ha la forma di un marker KANT ([TAG ...]) ma non è seguita da un vero OPEN — o è "
+     "un marker rimasto a metà (l'elemento a cui si riferiva è stato cancellato/spostato senza "
+     "toccare questa riga), oppure del testo normale che assomiglia per caso alla sintassi dei "
+     "marker. Se il file è una mappa KANT_*.md generata, questo non dovrebbe più succedere: la "
+     "mappa non viene più scansionata come sorgente.", None),
+    (re.compile(r'^UID duplicato #'), 'uid-duplicato',
+     "Lo stesso #id KANT compare in più punti del progetto — gli id devono essere unici a livello "
+     "di progetto (kant/model.py li assegna una sola volta e non li rigenera mai da solo). Va "
+     "risolto a mano: quale delle occorrenze è quella \"vera\"?", None),
+    (re.compile(r'incoerente con OPEN'), 'nome-incoerente',
+     "Il nome o il tag in questa riga (CATEGORY o descrittiva) non corrisponde a quello nel "
+     "marker OPEN dell'elemento — probabilmente è stato rinominato in un punto ma non negli altri "
+     "(CATEGORY, riga descrittiva e OPEN devono avere lo stesso nome).", None),
+]
+# [CST CLOSED] _KANT_ERROR_KB
+
+
+def _kant_error_lookup(message):
+    for pattern, key, explanation, fix in _KANT_ERROR_KB:
+        if pattern.search(message):
+            return key, explanation, fix
+    return None, "Nessuna spiegazione registrata per questo tipo di errore.", None
 
 
 # [FN CATEGORY] _write_kant_fill_markdown — writes the blanks listing + fill instructions to a
@@ -189,8 +244,15 @@ class _KantTabBar(QTabBar):
 class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     backgroundFinished = Signal(object, object, object)
 
-    def __init__(self):
+    def __init__(self, splash=None):
         super().__init__()
+        # kant_editor.py's startup splash has Qt.WindowStaysOnTopHint (so it stays above whatever
+        # else is loading) — which also meant it rendered on top of any modal dialog shown while
+        # THIS constructor runs (_check_crash_recovery/_check_pending_ai_snapshot below), making
+        # that dialog unreachable even though it was technically still there and still modal. Hidden
+        # right before those checks so the loading icon only "comes back" (via main()'s own
+        # splash.finish(window) once the window is shown) after they're resolved, not over them.
+        self._startup_splash = splash
         self.setWindowTitle('KANT Editor')
         self.setWindowIcon(make_app_icon())
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
@@ -220,9 +282,19 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._git_refresh_pending = False
         self._test_run_pending = False
         self._ai_snapshot = None
+        # rel_path -> {'kind': 'created'|'deleted'|'modified', 'additions', 'deletions'} while an AI
+        # review is pending — read by _tree_label to color file rows, cleared the moment the review
+        # resolves (see workspace._enter_ai_review_mode/_exit_ai_review_mode)
+        self._ai_review_status = {}
         self._map_sync_generation = 0
         self._map_sync_running = False
         self._map_sync_rerun_needed = False
+        self._flow_sync_generation = 0
+        self._flow_sync_running = False
+        self._flow_sync_rerun_needed = False
+        # how many times each _KANT_ERROR_KB pattern has shown up across validation runs this
+        # session — session-only (in-memory), not persisted; reset on restart
+        self._kant_error_pattern_counts = Counter()
         self._splitter_save_timers = {}
         self.syntax_timer = QTimer(self)
         self.syntax_timer.setSingleShot(True)
@@ -264,9 +336,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # aliases so the rest of MainWindow doesn't need to know that
         self.filename_label = self.title_bar.filename_label
         self.syntax_label = self.title_bar.syntax_label
-        # its own row, not squeezed into the title bar — that row's essential window chrome
-        # (minimize/maximize/close) was getting crowded out once these were added there
-        shell_layout.addWidget(self._build_action_toolbar())
+        # spliced into the title bar's own row (embed_toolbar) rather than a second stacked bar —
+        # one consolidated top bar instead of two, each previously painting its own background/border
+        self.title_bar.embed_toolbar(self._build_action_toolbar())
 
         self.stack = QStackedWidget()
         shell_layout.addWidget(self.stack, 1)
@@ -289,6 +361,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if saved_geometry is not None:
             self.restoreGeometry(saved_geometry)
         self._setup_shortcuts()
+        if self._startup_splash is not None:
+            self._startup_splash.hide()
         self._check_crash_recovery()
         self._check_pending_ai_snapshot()
 
@@ -493,14 +567,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _style_claude_tab_button(self, collapsed):
         if collapsed:
             self.claude_tab_btn.setStyleSheet(
-                f'QPushButton {{ background:{theme.ACCENT}; color:#111827; '
-                f'border:1px solid {theme.ACCENT}; border-radius:8px; font-weight:700; }} '
+                f'QPushButton {{ background:{theme.ACCENT}; color:{theme.BG if theme.NIGHT else "#111827"}; '
+                f'border:1px solid {theme.ACCENT}; border-radius:{theme.RADIUS}px; font-weight:700; }} '
                 f'QPushButton:hover {{ background:{theme.ACCENT}; }}'
             )
         else:
             self.claude_tab_btn.setStyleSheet(
                 f'QPushButton {{ background:{theme.PANEL}; color:{theme.TEXT}; '
-                f'border:1px solid {theme.BORDER}; border-radius:8px; font-weight:700; }} '
+                f'border:1px solid {theme.BORDER}; border-radius:{theme.RADIUS}px; font-weight:700; }} '
                 f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
             )
     # [FN CLOSED] _style_claude_tab_button
@@ -607,14 +681,19 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN] _tree_stylesheet — boxed KANT tree QSS with a theme-aware selection color
     # [FN OPEN] _tree_stylesheet
     def _tree_stylesheet(self):
-        selected_bg = '#1a1a1c' if self.night_mode else '#fdf3d8'
-        padding = '2px' if self.view_mode == 'code' and self.compact_kant_view else '6px 4px'
-        item_padding = '1px 2px' if self.view_mode == 'code' and self.compact_kant_view else '0px'
+        padding = '2px' if self.view_mode == 'code' and self.compact_kant_view else f'{theme.SPACE_2}px {theme.SPACE_1}px'
+        item_padding = '1px 2px' if self.view_mode == 'code' and self.compact_kant_view else '2px 0px'
+        # selection reads as a left accent bar + a slightly raised surface, not a large yellow
+        # fill — border-left is the one QSS-reliable way to fake a left bar on a tree row (no
+        # separate "bar" sub-control exists), paired with a hairline right inset via padding so
+        # the accent bar doesn't visually collide with the row's own left icon/text padding
         return (
             f'QTreeWidget {{ background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:8px; padding:{padding}; }} '
-            f'QTreeWidget::item {{ padding:{item_padding}; }} '
-            f'QTreeWidget::item:selected {{ background:{selected_bg}; color:{theme.ACCENT}; border-radius:4px; }}'
+            f'border-radius:{theme.RADIUS}px; padding:{padding}; }} '
+            f'QTreeWidget::item {{ padding:{item_padding}; border-left:3px solid transparent; }} '
+            f'QTreeWidget::item:hover {{ background:{theme.PANEL2}; }} '
+            f'QTreeWidget::item:selected {{ background:{theme.PANEL2}; color:{theme.TEXT}; '
+            f'border-left:3px solid {theme.ACCENT}; }}'
         )
     # [FN CLOSED] _tree_stylesheet
 
@@ -696,8 +775,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _build_action_toolbar(self):
         bar = QWidget()
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(10, 5, 10, 5)
-        layout.setSpacing(4)
+        layout.setContentsMargins(theme.SPACE_2, 0, 0, 0)
+        layout.setSpacing(2)
+        # leading separator groups this cluster apart from the menu bar it now sits beside —
+        # spliced into TitleBar's own row (embed_toolbar), no longer a second stacked bar with
+        # its own background/border
+        lead_separator = QFrame()
+        lead_separator.setFrameShape(QFrame.VLine)
+        lead_separator.setFixedHeight(20)
+        self._action_toolbar_lead_separator = lead_separator
+        layout.addWidget(lead_separator)
         self.action_toolbar_buttons = {}
         for key, tooltip, callback in (
             ('save', 'Salva (Ctrl+S)', self._save_file),
@@ -706,42 +793,33 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             ('find', 'Trova nel file (Ctrl+F)', self._show_find_bar),
         ):
             btn = QToolButton()
-            btn.setIcon(draw_icon(key, 18))
-            btn.setIconSize(QSize(18, 18))
+            btn.setIcon(draw_icon(key, 16))
+            btn.setIconSize(QSize(16, 16))
             btn.setToolTip(tooltip)
-            btn.setFixedSize(32, 28)
+            btn.setFixedSize(theme.ICON_BTN, theme.ICON_BTN)
             btn.clicked.connect(callback)
             layout.addWidget(btn)
             self.action_toolbar_buttons[key] = btn
-        layout.addStretch(1)
-        # centered between the two button groups (not grouped with either one) — a quick, one-file-
-        # scoped action, distinct from /kant-code-map's whole-project sweep. Icon/tooltip/behavior
-        # swap between the AI-fill-blanks action and the plain deterministic-tagging action
-        # depending on the left tree's view mode — see _style_kant_quick_button/_kant_quick_action
-        ai_fill_btn = QToolButton()
-        ai_fill_btn.setIconSize(QSize(18, 18))
-        ai_fill_btn.setFixedSize(32, 28)
-        ai_fill_btn.clicked.connect(self._kant_quick_action)
-        layout.addWidget(ai_fill_btn)
-        self.action_toolbar_buttons['sparkle'] = ai_fill_btn
-        layout.addStretch(1)
+        layout.addSpacing(theme.SPACE_2)
+        # the AI-fill-blanks/deterministic-tag action lives next to file_path_label at the bottom
+        # of the coding board now (see _build_io_tabs) — it acts on whatever's isolated there, so
+        # it sits where that scope is actually shown, not up here disconnected from it
         separator = QFrame()
         separator.setFrameShape(QFrame.VLine)
-        separator.setFixedHeight(22)
+        separator.setFixedHeight(20)
         self._action_toolbar_separator = separator
         layout.addWidget(separator)
-        # Run/Debug at the trailing edge of this same row (moved from the leading edge on request —
-        # same toolbar, opposite side), same size as the rest of the row now (used to be visibly
-        # bigger, on request)
+        layout.addSpacing(theme.SPACE_1)
+        # Run/Debug at the trailing edge of this same cluster
         for key, tooltip, callback in (
             ('run', 'Esegui (Ctrl+R)', self._run_current_file),
             ('debug', 'Debug (F5)', self._debug_current_file),
         ):
             btn = QToolButton()
-            btn.setIcon(draw_icon(key, 18))
-            btn.setIconSize(QSize(18, 18))
+            btn.setIcon(draw_icon(key, 16))
+            btn.setIconSize(QSize(16, 16))
             btn.setToolTip(tooltip)
-            btn.setFixedSize(32, 28)
+            btn.setFixedSize(theme.ICON_BTN, theme.ICON_BTN)
             btn.clicked.connect(callback)
             layout.addWidget(btn)
             self.action_toolbar_buttons[key] = btn
@@ -758,30 +836,45 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         return bar
     # [FN CLOSED] _build_action_toolbar
 
-    # [FN] _kant_quick_action — the sparkle-slot button's click handler: AI-fill-blanks while the
-    # left tree is in KANT mode, plain deterministic tagging (no AI) while it's in File mode
+    # [FN CATEGORY] _kant_quick_action_has_structure — whether the file currently open in the
+    # coding board has any real KANT node already, i.e. whether "fill blanks" has anything to
+    # scope onto. Deliberately reads the active tab's own tree, not the left project tree's
+    # unrelated KANT/File display-mode toggle — that toggle only changes how the SIDEBAR lists
+    # files, and using it to decide this button's behavior meant the action could target the
+    # whole file instead of whatever the coding board is actually isolating, whenever the sidebar
+    # mode didn't happen to match the open file's real state.
+    # [FN] _kant_quick_action_has_structure — does the open file already have KANT nodes
+    # [FN OPEN] _kant_quick_action_has_structure
+    def _kant_quick_action_has_structure(self):
+        tab = self.active_tab
+        return tab is not None and any(isinstance(n, Node) for n in tab.tree.body)
+    # [FN CLOSED] _kant_quick_action_has_structure
+
+    # [FN] _kant_quick_action — the sparkle-slot button's click handler: AI-fill-blanks (scoped to
+    # whatever's isolated in the coding board) if the open file already has KANT structure, plain
+    # deterministic tagging (no AI, always whole-file) if it doesn't yet
     # [FN OPEN] _kant_quick_action
     def _kant_quick_action(self):
-        if self.view_mode == 'code':
+        if self._kant_quick_action_has_structure():
             self._ai_fill_kant_blanks()
         else:
             self._deterministic_tag_current_file()
     # [FN CLOSED] _kant_quick_action
 
-    # [FN CATEGORY] _style_kant_quick_button — the action-toolbar's sparkle-slot button reads as a
-    # completely different action depending on the left tree's view mode, not just a differently-
-    # themed icon: KANT mode means there's already real structure to isolate/inspect, so "ask the
-    # AI to fill in the blanks it finds" makes sense; File mode is the state an untagged file opens
-    # into (see _open_file), where there's no structure yet for blanks to exist in, so the same
-    # slot instead offers the plain deterministic pass with no AI involved at all.
-    # [FN] _style_kant_quick_button — sets the sparkle-slot button's icon/tooltip for the current
-    # view mode
+    # [FN CATEGORY] _style_kant_quick_button — the sparkle-slot button reads as a completely
+    # different action depending on whether the open file already has KANT structure, not just a
+    # differently-themed icon: real structure already there means there's something to isolate/
+    # inspect, so "ask the AI to fill in the blanks it finds" makes sense; no structure yet is the
+    # state an untagged file opens into (see _open_file), where the same slot instead offers the
+    # plain deterministic pass with no AI involved at all. Mirrors _kant_quick_action's own check
+    # exactly, so the icon never promises one action while the click runs the other.
+    # [FN] _style_kant_quick_button — sets the sparkle-slot button's icon/tooltip for the open file
     # [FN OPEN] _style_kant_quick_button
     def _style_kant_quick_button(self):
         btn = self.action_toolbar_buttons.get('sparkle')
         if btn is None:
             return
-        if self.view_mode == 'code':
+        if self._kant_quick_action_has_structure():
             btn.setIcon(draw_icon('sparkle', 18))
             btn.setToolTip(
                 "Chiedi all'AI (agente/modello/effort attualmente selezionati nella plancia AI) di "
@@ -799,11 +892,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN CLOSED] _style_kant_quick_button
 
     def _style_action_toolbar(self):
-        self.action_toolbar.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
-        style = theme.BUTTON_STYLE.replace('QPushButton', 'QToolButton').replace('padding:7px 13px;', 'padding:4px;')
+        # transparent: this bar is spliced into TitleBar's own row now (embed_toolbar), so it
+        # inherits TitleBar's background/border instead of painting its own
+        self.action_toolbar.setStyleSheet('background:transparent; border:none;')
+        style = theme.icon_button_style()
         for btn in self.action_toolbar_buttons.values():
             btn.setStyleSheet(style)
         self._action_toolbar_separator.setStyleSheet(f'color:{theme.BORDER};')
+        self._action_toolbar_lead_separator.setStyleSheet(f'color:{theme.BORDER};')
         self.run_target_label.setStyleSheet(f'color:{theme.DIM}; font-size:{theme.CODE_FONT_PT - 1}pt; padding-left:2px;')
 
     # [FN CATEGORY] _build_welcome_page — previously had a "+" new-project button floating in its
@@ -960,18 +1056,18 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             return
         self.welcome_page.setStyleSheet(self._welcome_page_stylesheet())
         self.welcome_card.setStyleSheet(
-            f'#welcomeCard {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:16px; }}'
+            f'#welcomeCard {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; border-radius:{theme.RADIUS}px; }}'
         )
         self.welcome_open_btn.setStyleSheet(
-            f'QPushButton {{ background:{theme.ACCENT}; color:#ffffff; border:none; '
-            f'border-radius:9px; padding:14px 28px; }} '
+            f'QPushButton {{ background:{theme.ACCENT}; color:{theme.BG if theme.NIGHT else "#111827"}; border:none; '
+            f'border-radius:{theme.RADIUS}px; padding:14px 28px; }} '
             f'QPushButton:hover {{ background:{theme.ACCENT}; }}'
         )
         self.welcome_new_project_btn.setStyleSheet(
             # theme.BORDER (a subtle divider color, not meant to stand alone) was nearly invisible
             # as a dashed outline in day mode; theme.DIM reads clearly in both themes
             f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.ACCENT}; '
-            f'border:2px dashed {theme.DIM}; border-radius:9px; padding:12px 26px; }} '
+            f'border:2px dashed {theme.DIM}; border-radius:{theme.RADIUS}px; padding:12px 26px; }} '
             f'QPushButton:hover {{ border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
         )
         # icon shows the mode a click will SWITCH TO (a sun while it's night, a moon while it's
@@ -993,9 +1089,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # stuck with whichever theme was active when _build_main_page first ran
     def _add_row_button_style(self):
         return (
-            f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.DIM}; '
-            f'border-radius:8px; padding:8px; font-weight:600; }} '
-            f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
+            f'QPushButton {{ background:transparent; color:{theme.DIM}; border:none; '
+            f'border-radius:{theme.RADIUS}px; padding:{theme.SPACE_1}px {theme.SPACE_2}px; font-weight:600; }} '
+            f'QPushButton:hover {{ color:{theme.ACCENT}; background:{theme.PANEL2}; }}'
         )
 
     def _build_main_page(self):
@@ -1014,6 +1110,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_tree_context_menu)
+        self._update_tree_drop_handler()
         self.setAcceptDrops(True)
 
         tree_panel = QWidget()
@@ -1131,8 +1228,18 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.main_splitter.setStretchFactor(0, 1)
         self.main_splitter.setStretchFactor(1, 0)
         saved_main_sizes = self.settings.value('mainVerticalSplitterSizes')
+        # every session starts with the terminal dock genuinely visible — a saved size from a
+        # previous session where it had been dragged down near/to 0 used to persist that collapsed
+        # state on every subsequent launch, silently hiding the terminal until the user remembered
+        # to drag it back open by hand. A minimum here doesn't discard the rest of the saved layout
+        # (the workspace/terminal split ratio still restores), it just floors the terminal's share.
+        MIN_TERMINAL_HEIGHT = 120
         if saved_main_sizes and len(saved_main_sizes) == 2:
-            self.main_splitter.setSizes([int(x) for x in saved_main_sizes])
+            sizes = [int(x) for x in saved_main_sizes]
+            if sizes[1] < MIN_TERMINAL_HEIGHT:
+                sizes[0] -= (MIN_TERMINAL_HEIGHT - sizes[1])
+                sizes[1] = MIN_TERMINAL_HEIGHT
+            self.main_splitter.setSizes(sizes)
         else:
             self.main_splitter.setSizes([650, 180])
         self.main_splitter.splitterMoved.connect(
@@ -1166,6 +1273,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.kant_map_label = QLabel('')
         self.kant_map_label.setFont(QFont('Consolas', theme.TREE_FONT_PT - 2))
         bar.addWidget(self.kant_map_label)  # addWidget (not addPermanentWidget): left-aligned
+        # Git branch/status — collected here (left side, alongside file/KANT context) since it was
+        # previously only shown inline per-row in the tree and via the Git menu, with no persistent
+        # summary anywhere; the per-row tree markers stay too (position vs. summary, not a duplicate)
+        self.git_status_label = QLabel('')
+        self.git_status_label.setFont(QFont('Consolas', theme.TREE_FONT_PT - 2))
+        bar.addWidget(self.git_status_label)
         self.cursor_pos_label = QLabel('')
         self.encoding_label = QLabel('')
         # shows the focused CodeEdit's vim mode (NORMAL/INSERT/VISUAL); empty whenever vim mode is
@@ -1173,6 +1286,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.vim_mode_label = QLabel('')
         self.vim_mode_label.setFont(QFont('Consolas', theme.TREE_FONT_PT, QFont.DemiBold))
         bar.addPermanentWidget(self.vim_mode_label)
+        # LSP connection state for whichever server is (or was) active — no signal exists upstream
+        # for the ready/not-ready transition, so lsp_status_timer polls the client's own existing
+        # process/ready attributes (kant/lsp.py, untouched) rather than adding new LSP plumbing
+        self.lsp_status_label = QLabel('')
+        self.lsp_status_label.setFont(QFont('Consolas', theme.TREE_FONT_PT - 2))
+        bar.addPermanentWidget(self.lsp_status_label)
         # a flat QPushButton, not a QLabel: it needs to be click-to-reopen-the-picker, and a
         # QPushButton gets that natively instead of needing the tree row labels' click-forwarding
         self.python_env_label = QPushButton('')
@@ -1184,6 +1303,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         bar.addPermanentWidget(self.cursor_pos_label)
         bar.addPermanentWidget(self.encoding_label)
         self._style_status_bar()
+        self.lsp_status_timer = QTimer(self)
+        self.lsp_status_timer.timeout.connect(self._update_lsp_status_label)
+        self.lsp_status_timer.start(2000)
+        self._update_lsp_status_label()
     # [FN CLOSED] _build_status_bar
 
     def _style_status_bar(self):
@@ -1191,10 +1314,48 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             f'QStatusBar {{ background:{theme.PANEL}; color:{theme.DIM}; border-top:1px solid {theme.BORDER}; }}'
         )
         self.vim_mode_label.setStyleSheet(f'color:{theme.ACCENT}; padding:0 8px;')
+        self.git_status_label.setStyleSheet(f'color:{theme.DIM}; padding:0 8px;')
+        self.lsp_status_label.setStyleSheet(f'color:{theme.DIM}; padding:0 8px;')
         self.python_env_label.setStyleSheet(
             f'QPushButton {{ border:none; background:transparent; color:{theme.DIM}; padding:0 8px; }} '
             f'QPushButton:hover {{ color:{theme.ACCENT}; }}'
         )
+        self._update_git_status_label()
+        self._update_lsp_status_label()
+
+    # [FN CATEGORY] _update_git_status_label — reads self.git_root/self.git_status (set by
+    # GitOpsMixin's refresh) plus one `git rev-parse --abbrev-ref HEAD` call for the branch name;
+    # blank when the project isn't a git repo. The tree's own per-row markers stay untouched —
+    # this is the one persistent summary, not a replacement for them.
+    # [FN] _update_git_status_label — status-bar branch + dirty-file count
+    # [FN OPEN] _update_git_status_label
+    def _update_git_status_label(self):
+        if not self.git_root:
+            self.git_status_label.setText('')
+            return
+        result = self._run_git(['rev-parse', '--abbrev-ref', 'HEAD'])
+        branch = result.stdout.strip() if result and result.returncode == 0 else '?'
+        dirty = len(self.git_status or {})
+        suffix = f' ({dirty})' if dirty else ''
+        self.git_status_label.setText(f'  ⎇ {branch}{suffix}  ')
+        self.git_status_label.setStyleSheet(f'color:{theme.WARN if dirty else theme.DIM}; padding:0 8px;')
+    # [FN CLOSED] _update_git_status_label
+
+    # [FN CATEGORY] _update_lsp_status_label — reads self.lsp_client.process/.ready directly
+    # (kant/lsp.py, untouched); polled by lsp_status_timer since no ready-state signal exists
+    # upstream to react to instead
+    # [FN] _update_lsp_status_label — status-bar LSP connection state
+    # [FN OPEN] _update_lsp_status_label
+    def _update_lsp_status_label(self):
+        client = getattr(self, 'lsp_client', None)
+        if client is None or client.process is None:
+            self.lsp_status_label.setText('  LSP: —  ')
+            self.lsp_status_label.setStyleSheet(f'color:{theme.DIM}; padding:0 8px;')
+            return
+        ready = client.ready
+        self.lsp_status_label.setText(f"  LSP: {client.server_name}{'' if ready else '…'}  ")
+        self.lsp_status_label.setStyleSheet(f'color:{theme.OK if ready else theme.WARN}; padding:0 8px;')
+    # [FN CLOSED] _update_lsp_status_label
 
     def _on_focus_changed(self, _old, new):
         if isinstance(new, CodeEdit):
@@ -1289,22 +1450,24 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # [FN CLOSED] _build_view_mode_bar
 
     def _style_view_mode_bar(self):
-        self.view_mode_bar.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
-        checked_style = (
-            theme.BUTTON_STYLE + f'QPushButton:checked {{ background:{theme.ACCENT}; color:#ffffff; border-color:{theme.ACCENT}; }}'
-        )
-        for btn in self.view_mode_bar.findChildren(QPushButton):
-            highlight = btn in (self.code_view_btn, self.file_view_btn, self.groups_view_btn)
-            btn.setStyleSheet(checked_style if highlight else theme.BUTTON_STYLE)
+        self.view_mode_bar.setStyleSheet(theme.panel_header_style())
+        # active mode reads as a gold underline, not a filled accent surface — the left panel's
+        # own version of the same tab_style used for the file-tab bar, so "selected" means the
+        # same thing everywhere instead of switching to a full accent fill here specifically
+        tab_style = theme.tab_style()
+        for btn in (self.code_view_btn, self.file_view_btn, self.groups_view_btn):
+            btn.setStyleSheet(tab_style)
+        self.compact_kant_btn.setStyleSheet(theme.icon_button_style(selected=self.compact_kant_btn.isChecked()))
         self.compact_kant_btn.setEnabled(self.view_mode == 'code')
         self.compact_kant_btn.setToolTip(
             'Torna alla vista KANT a blocchi' if self.compact_kant_btn.isChecked()
             else 'Mostra la struttura KANT come albero compatto con menu espandibili'
         )
-        self.compact_kant_btn.setIcon(draw_icon('grid', 16, '#111827' if self.compact_kant_btn.isChecked() else None))
-        self.compact_kant_btn.setStyleSheet(
-            theme.BUTTON_STYLE.replace('QPushButton', 'QToolButton').replace('padding:7px 13px;', 'padding:4px;')
-            + f'QToolButton:checked {{ background:{theme.ACCENT}; border-color:{theme.ACCENT}; }}'
+        # icon_button_style's "selected" look is a PANEL2 fill + accent border, not a full accent
+        # fill, so the icon itself just switches to accent color when checked rather than needing
+        # a light-on-dark-fill color
+        self.compact_kant_btn.setIcon(
+            draw_icon('grid', 16, theme.ACCENT if self.compact_kant_btn.isChecked() else None)
         )
 
     # [FN CATEGORY] _set_compact_kant_view — switches only the KANT tree renderer, preserving the
@@ -1460,6 +1623,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.action_toolbar_buttons['run'].setEnabled(has_tab)
         self.action_toolbar_buttons['debug'].setEnabled(has_tab)
         self.action_toolbar_buttons['sparkle'].setEnabled(has_tab)
+        self._style_kant_quick_button()
         self.run_target_label.setText(self._run_target_text())
         self.title_bar.project_search_menu_action.setEnabled(bool(self.project_root_path))
         self.title_bar.project_replace_menu_action.setEnabled(bool(self.project_root_path))
@@ -1557,9 +1721,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.find_bar.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
         self.find_input.setStyleSheet(
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:5px 8px;'
+            f'border-radius:{theme.RADIUS}px; padding:5px 8px;'
         )
-        icon_button_style = theme.BUTTON_STYLE.replace('padding:7px 13px;', 'padding:4px;')
+        icon_button_style = theme.icon_button_style()
         for btn in self.find_bar.findChildren(QPushButton):
             btn.setStyleSheet(icon_button_style if not btn.text() else theme.BUTTON_STYLE)
             kind = btn.property('kantIcon')
@@ -1610,7 +1774,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.vim_command_bar.setStyleSheet(f'background:{theme.PANEL}; border-bottom:1px solid {theme.BORDER};')
         self.vim_command_input.setStyleSheet(
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:5px 8px;'
+            f'border-radius:{theme.RADIUS}px; padding:5px 8px;'
         )
 
     def _show_vim_command_bar(self):
@@ -1755,6 +1919,31 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if not self._focus_visible_text(tab, item.data(0, ROLE_TEXT) or ''):
             self._goto_line(tab, int(line))
 
+    # [FN CATEGORY] _show_kant_error_help — double-click handler for a "Verifica KANT" error row:
+    # looks the message up in _KANT_ERROR_KB, shows how many times this pattern has recurred this
+    # session, and opens the explanation dialog. "Vai alla riga" reuses _open_result_item's own
+    # navigation (same path/line/text-search logic, nothing duplicated); "Applica fix" (only
+    # offered when the KB entry has one) navigates there first, then runs the fix — currently only
+    # 'ai-fill' exists, which just runs the same AI-fill-blanks action the sparkle button does,
+    # scoped to whatever's isolated once the file is open (whole-file if nothing is).
+    # [FN] _show_kant_error_help — explains a KANT validation error, offers to fix it
+    # [FN OPEN] _show_kant_error_help
+    def _show_kant_error_help(self, item, _column):
+        if item.data(0, ROLE_KIND) != 'validation-result':
+            return
+        message = item.data(0, ROLE_TEXT) or item.text(0)
+        key, explanation, fix = _kant_error_lookup(message)
+        count = self._kant_error_pattern_counts.get(key, 1) if key else 1
+        fix_label = {'ai-fill': 'Compila con AI'}.get(fix)
+        action = self._ide_kant_error_help(message, explanation, count, fix_label)
+        if action == 'goto':
+            self._open_result_item(item, 0)
+        elif action == 'fix':
+            self._open_result_item(item, 0)
+            if fix == 'ai-fill':
+                self._ai_fill_kant_blanks()
+    # [FN CLOSED] _show_kant_error_help
+
     def _focus_visible_text(self, tab, text):
         if tab is None or not text:
             return False
@@ -1855,9 +2044,124 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._style_view_mode_bar()
         self.tree.setStyleSheet(self._tree_stylesheet())
         self._rebuild_tree()
-        if hasattr(self, 'action_toolbar_buttons'):
-            self._style_kant_quick_button()
+        self._update_tree_drop_handler()
     # [FN CLOSED] _set_view_mode
+
+    # [FN CATEGORY] _update_tree_drop_handler — ProjectTree only shows a "droppable" cursor and
+    # accepts an OS drag when file_drop_handler is not None, so this has to actually toggle it (not
+    # just have the handler itself no-op) — otherwise File mode's drop target would keep the
+    # droppable cursor in KANT/Gruppi mode too, promising a drop that then silently did nothing.
+    # [FN] _update_tree_drop_handler — enables tree file-drop only while in File view mode
+    # [FN OPEN] _update_tree_drop_handler
+    def _update_tree_drop_handler(self):
+        self.tree.file_drop_handler = self._handle_tree_file_drop if self.view_mode == 'file' else None
+        # KANT elements are only reorderable while the tree is actually showing KANT structure —
+        # File/Gruppi mode rows aren't KANT elements at all (plain filenames / grouping members)
+        code_mode = self.view_mode == 'code'
+        self.tree.setDragEnabled(code_mode)
+        self.tree.setDragDropMode(QAbstractItemView.InternalMove if code_mode else QAbstractItemView.NoDragDrop)
+        self.tree.reorder_allowed = self._kant_reorder_allowed if code_mode else None
+        self.tree.reorder_handler = self._kant_reorder_apply if code_mode else None
+    # [FN CLOSED] _update_tree_drop_handler
+
+    # [FN] _kant_reorder_allowed — a KANT element may only be dragged onto/beside another element
+    # sharing its exact parent (same file, same nesting level) — reparenting or reordering across
+    # files/levels via drag is out of scope, this only reshuffles siblings that are already siblings
+    # [FN OPEN] _kant_reorder_allowed
+    def _kant_reorder_allowed(self, dragged, target, dropped_on_item):
+        if dragged.data(0, ROLE_KIND) != 'section' or dropped_on_item:
+            return False
+        if target is None or target.data(0, ROLE_KIND) != 'section':
+            return False
+        return target.parent() is dragged.parent()
+    # [FN CLOSED] _kant_reorder_allowed
+
+    # [FN CATEGORY] _kant_reorder_apply — Qt has already moved the tree ITEMS by the time this
+    # runs (ProjectTree.dropEvent calls super().dropEvent() first); this reads the resulting sibling
+    # order and reorders the matching Node entries in the real parsed tree to match, then saves.
+    # Only the Node entries move — any Run (plain-text/comment) siblings interleaved between them
+    # stay in their exact original slot, so a reorder's diff is just the moved marker blocks, not a
+    # wholesale rewrite of everything between them.
+    # [FN] _kant_reorder_apply — reorders the underlying source to match a tree drag-reorder, saves
+    # [FN OPEN] _kant_reorder_apply
+    def _kant_reorder_apply(self, parent_item, ordered_items):
+        if parent_item is None:
+            self._rebuild_tree()  # top-level items are files, not reorderable — undo Qt's own move
+            return
+        path = parent_item.data(0, ROLE_PATH)
+        if not path:
+            return
+        tab = self.open_tabs.get(path)
+        if tab is None:
+            if not self._open_file(path):
+                self._rebuild_tree()
+                return
+            tab = self.open_tabs.get(path)
+        if parent_item.data(0, ROLE_KIND) == 'file':
+            parent_node = next((n for n in tab.tree.body if isinstance(n, Node)), None)
+        else:
+            parent_node = self._find_node_by_uid(tab.tree, parent_item.data(0, ROLE_UID))
+        if parent_node is None:
+            self._rebuild_tree()
+            return
+        wanted_uids = [it.data(0, ROLE_UID) for it in ordered_items if it.data(0, ROLE_KIND) == 'section']
+        node_by_uid = {n.uid: n for n in parent_node.body if isinstance(n, Node)}
+        if set(node_by_uid) != set(wanted_uids):
+            # the tree the drag saw doesn't match what's actually in the parsed source anymore
+            # (e.g. an external edit landed in between) — refuse to reorder against stale
+            # assumptions rather than silently scrambling something the drag didn't actually see
+            self._rebuild_tree()
+            return
+        new_nodes = iter(node_by_uid[uid] for uid in wanted_uids)
+        parent_node.body = [item if not isinstance(item, Node) else next(new_nodes) for item in parent_node.body]
+        tab.remember_undo_state()
+        tab.mark_dirty()
+        tab.save()
+        self._render_view(tab, tab.filter_uid)
+        self._rebuild_tree()
+    # [FN CLOSED] _kant_reorder_apply
+
+    # [FN CATEGORY] _handle_tree_file_drop — copies each dropped OS path into the project (a
+    # directory drop target if the drop landed on a folder row, its parent directory if it landed
+    # on a file row, the project root otherwise). Copies, never moves — dragging in from Explorer
+    # shouldn't remove the source file the user still has selected there. Existing-name collisions
+    # are skipped with a message rather than silently overwritten.
+    # [FN] _handle_tree_file_drop — copies dropped files/folders into the project tree
+    # [FN OPEN] _handle_tree_file_drop
+    def _handle_tree_file_drop(self, paths, item):
+        if not self.project_root_path:
+            return
+        target_dir = self.project_root_path
+        if item is not None:
+            kind = item.data(0, ROLE_KIND)
+            item_path = item.data(0, ROLE_PATH)
+            if kind == 'dir':
+                target_dir = item_path
+            elif item_path:
+                target_dir = os.path.dirname(item_path)
+        skipped = []
+        copied = 0
+        for src in paths:
+            name = os.path.basename(src.rstrip('/\\'))
+            dest = os.path.join(target_dir, name)
+            if os.path.exists(dest):
+                skipped.append(name)
+                continue
+            try:
+                if os.path.isdir(src):
+                    shutil.copytree(src, dest)
+                else:
+                    shutil.copy2(src, dest)
+                copied += 1
+            except OSError as e:
+                skipped.append(f'{name} ({e})')
+        if copied:
+            self._rebuild_tree()
+        if skipped:
+            self._ide_message(
+                'Copia file', 'Non copiati (nome già esistente nella cartella di destinazione):\n' + '\n'.join(skipped),
+            )
+    # [FN CLOSED] _handle_tree_file_drop
 
     # [FN CATEGORY] _rebuild_tree — rebuilds the left project tree for the current folder using
     # whichever builder matches self.view_mode; shared by folder-open, mode-switch and theme-switch
@@ -1932,14 +2236,55 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         label_layout.setContentsMargins(10, 4, 10, 4)
         label_layout.setSpacing(16)
         self.incoming_label_btn = QPushButton('INCOMING')
+        self.incoming_label_btn.setCheckable(True)
         self.incoming_label_btn.setToolTip("Elenca chi fa riferimento all'elemento selezionato, e da dove")
         self.incoming_label_btn.clicked.connect(lambda: self._toggle_info_popup(self.incoming_view))
         self.outgoing_label_btn = QPushButton('OUTGOING')
+        self.outgoing_label_btn.setCheckable(True)
         self.outgoing_label_btn.setToolTip("Elenca a cosa fa riferimento l'elemento selezionato, e dove")
         self.outgoing_label_btn.clicked.connect(lambda: self._toggle_info_popup(self.outgoing_view))
         for btn in (self.incoming_label_btn, self.outgoing_label_btn):
             label_layout.addWidget(btn)
+        # MAPPA sits right after INCOMING/OUTGOING, styled the same way — clicking it doesn't
+        # open the map directly, it expands two lateral options (LOCAL/GLOBAL) inline in this
+        # same bar; picking one opens the map in that scope and collapses the options back down
+        self.mappa_label_btn = QPushButton('MAPPA')
+        self.mappa_label_btn.setCheckable(True)
+        self.mappa_label_btn.setToolTip('Apri la mappa grafica delle dipendenze del progetto')
+        self.mappa_label_btn.clicked.connect(self._toggle_mappa_options)
+        label_layout.addWidget(self.mappa_label_btn)
+
+        self.mappa_options_row = QWidget()
+        mappa_options_layout = QHBoxLayout(self.mappa_options_row)
+        mappa_options_layout.setContentsMargins(0, 0, 0, 0)
+        mappa_options_layout.setSpacing(4)
+        self.mappa_local_btn = QPushButton('LOCAL')
+        self.mappa_local_btn.setToolTip("Mappa limitata all'elemento (o modulo) attualmente aperto")
+        self.mappa_local_btn.clicked.connect(lambda: self._open_mappa(True))
+        self.mappa_global_btn = QPushButton('GLOBAL')
+        self.mappa_global_btn.setToolTip('Mappa completa del progetto')
+        self.mappa_global_btn.clicked.connect(lambda: self._open_mappa(False))
+        mappa_options_layout.addWidget(self.mappa_local_btn)
+        mappa_options_layout.addWidget(self.mappa_global_btn)
+        self.mappa_options_row.setVisible(False)
+        label_layout.addWidget(self.mappa_options_row)
         label_layout.addStretch(1)
+        # a quick, one-file-scoped action, distinct from /kant-code-map's whole-project sweep —
+        # moved here, right beside the label that names what's actually open, since it acts on
+        # exactly that scope (whatever's currently isolated in the coding board, or the whole file
+        # when nothing is) and used to sit disconnected from it in the top toolbar. Icon/tooltip/
+        # behavior swap between the AI-fill-blanks action and the plain deterministic-tagging
+        # action — see _style_kant_quick_button/_kant_quick_action.
+        ai_fill_btn = QToolButton()
+        ai_fill_btn.setIconSize(QSize(16, 16))
+        ai_fill_btn.setFixedSize(theme.ICON_BTN, theme.ICON_BTN)
+        ai_fill_btn.clicked.connect(self._kant_quick_action)
+        label_layout.addWidget(ai_fill_btn)
+        self.action_toolbar_buttons['sparkle'] = ai_fill_btn
+        self.kant_quick_action_label = QLabel('AI KANT COMMENT')
+        self.kant_quick_action_label.setFont(QFont('Consolas', theme.TREE_FONT_PT - 2))
+        self.kant_quick_action_label.setStyleSheet(f'color:{theme.DIM};')
+        label_layout.addWidget(self.kant_quick_action_label)
         # the filename itself lives here, not in the title bar — that slot shows the KANT identity
         # of whatever's isolated instead (see _update_filename_label)
         self.file_path_label = QLabel('')
@@ -1950,15 +2295,17 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         layout.addWidget(label_bar)
 
         panel.setFixedHeight(42)
+        ai_fill_btn.setStyleSheet(theme.icon_button_style())
+        self._style_kant_quick_button()
         return panel
 
     def _style_io_tabs(self):
         list_style = (
             f'QListWidget {{ background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:4px; '
             f'font-family:Consolas; }} '
-            f'QListWidget::item {{ padding:5px 8px; border-radius:5px; }} '
-            f'QListWidget::item:hover {{ background:{theme.PANEL}; }} '
-            f'QListWidget::item:selected {{ background:{theme.PANEL}; color:{theme.ACCENT}; }}'
+            f'QListWidget::item {{ padding:5px 8px; border-radius:{theme.RADIUS}px; }} '
+            f'QListWidget::item:hover {{ background:{theme.PANEL2}; }} '
+            f'QListWidget::item:selected {{ background:{theme.PANEL2}; color:{theme.ACCENT}; }}'
         )
         for view in (self.incoming_view, self.outgoing_view):
             view.setStyleSheet(list_style)
@@ -1969,9 +2316,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         )
         self.info_popup.setStyleSheet(f'background:{theme.CODE_BG}; border-top:1px solid {theme.BORDER}; border-bottom:1px solid {theme.BORDER};')
         self.info_popup_top_bar.setStyleSheet(f'background:{theme.CODE_BG};')
+        self.kant_quick_action_label.setStyleSheet(f'color:{theme.DIM};')
+        self.file_path_label.setStyleSheet(f'color:{theme.DIM}; font-weight:700;')
         self.io_tabs.setStyleSheet(f'background:{theme.PANEL}; border-top:1px solid {theme.BORDER};')
-        for btn in (self.incoming_label_btn, self.outgoing_label_btn):
-            btn.setStyleSheet(theme.BUTTON_STYLE + 'QPushButton { padding:4px 12px; }')
+        # underline-tab style, consistent with the file-tab bar and left-panel view-mode tabs —
+        # active state is the gold underline, not a filled pill
+        for btn in (self.incoming_label_btn, self.outgoing_label_btn, self.mappa_label_btn,
+                    self.mappa_local_btn, self.mappa_global_btn):
+            btn.setStyleSheet(theme.tab_style())
         self.info_popup_close_btn.setStyleSheet(
             f'QPushButton {{ border:none; background:transparent; color:{theme.DIM}; '
             f'font-size:16px; font-weight:700; padding:0px 4px; }} '
@@ -1983,24 +2335,21 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._position_map_tab()
         sizes = self.splitter.sizes() if hasattr(self, 'splitter') else []
         self._style_claude_tab_button(len(sizes) > 1 and sizes[1] == 0)
-        self.terminal_sidebar.setStyleSheet(f'background:{theme.PANEL}; border-right:1px solid {theme.BORDER};')
+        self.terminal_sidebar.setStyleSheet(theme.panel_header_style())
+        tab_style = theme.tab_style()
         for btn in self.terminal_sidebar_group.buttons():
-            btn.setStyleSheet(
-                f'QToolButton {{ border:none; border-radius:4px; background:transparent; }} '
-                f'QToolButton:hover {{ background:{theme.CODE_BG}; }} '
-                f'QToolButton:checked {{ background:{theme.CODE_BG}; border:1px solid {theme.BORDER}; }}'
-            )
+            btn.setStyleSheet(tab_style)
         self.errors_view.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:6px;')
         self.kant_errors_view.setStyleSheet(f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:none; padding:6px;')
         if self.map_dialog is not None:
             self.map_dialog.apply_style()
 
-    # [FN CATEGORY] _build_terminal_dock — a narrow left sidebar (4 icon buttons, exclusive like a
-    # vertical tab bar) switches a QStackedWidget between the real shell (self.terminal), a second
-    # TerminalPane running an interactive Python REPL, and a live list of the active file's
+    # [FN CATEGORY] _build_terminal_dock — a compact horizontal tab header (Terminale/Python/
+    # Problemi/KANT, exclusive) switches a QStackedWidget between the real shell (self.terminal), a
+    # second TerminalPane running an interactive Python REPL, and a live list of the active file's
     # diagnostics — so the bottom panel isn't only ever the shell. The Python REPL process starts
     # lazily on first switch to that tab, not at construction, since most sessions never open it.
-    # [FN] _build_terminal_dock — sidebar + stacked terminal/REPL/errors panel
+    # [FN] _build_terminal_dock — header tabs + stacked terminal/REPL/errors panel
     # [FN OPEN] _build_terminal_dock
     def _build_terminal_dock(self):
         self.terminal = TerminalPane(os.getcwd())
@@ -2011,6 +2360,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.kant_errors_view = QTreeWidget()
         self.kant_errors_view.setHeaderHidden(True)
         self.kant_errors_view.itemClicked.connect(self._open_result_item)
+        self.kant_errors_view.itemDoubleClicked.connect(self._show_kant_error_help)
 
         self.terminal_stack = QStackedWidget()
         self.terminal_stack.addWidget(self.terminal)
@@ -2018,37 +2368,42 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.terminal_stack.addWidget(self.errors_view)
         self.terminal_stack.addWidget(self.kant_errors_view)
 
-        sidebar = QWidget()
-        sidebar.setFixedWidth(36)
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(2, 4, 2, 0)
-        sidebar_layout.setSpacing(2)
-        self.terminal_sidebar_group = QButtonGroup(sidebar)
+        # a compact horizontal tab header, not a vertical icon rail — a conventional docked-panel
+        # look (Terminale/Python/Problemi/KANT switch terminal_stack's page) so the active pane
+        # reads clearly. Mappa's entry point lives in the INCOMING/OUTGOING bar instead (see
+        # _build_io_tabs), not here.
+        header = QWidget()
+        self.terminal_sidebar = header
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(theme.SPACE_1, 0, theme.SPACE_1, 0)
+        header_layout.setSpacing(2)
+        self.terminal_sidebar_group = QButtonGroup(header)
         self.terminal_sidebar_group.setExclusive(True)
-        for index, (icon_name, tooltip) in enumerate((
-            ('terminal', 'Terminale'), ('repl', 'Terminale Python'),
-            ('warning', 'Errori nel file aperto'), ('kant', 'Errori convenzione KANT'),
+        for index, (icon_name, label, tooltip) in enumerate((
+            ('terminal', 'Terminale', 'Terminale'),
+            ('repl', 'Python', 'Terminale Python'),
+            ('warning', 'Problemi', 'Errori nel file aperto'),
+            ('kant', 'KANT', 'Errori convenzione KANT'),
         )):
-            btn = QToolButton()
+            btn = QPushButton(f'  {label}')
             btn.setCheckable(True)
             btn.setProperty('kantIcon', icon_name)
-            btn.setIcon(draw_icon(icon_name, 22))
-            btn.setIconSize(QSize(22, 22))
-            btn.setFixedSize(32, 32)
+            btn.setIcon(draw_icon(icon_name, 14))
+            btn.setIconSize(QSize(14, 14))
+            btn.setFixedHeight(theme.CONTEXTBAR_H)
             btn.setToolTip(tooltip)
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _checked=False, i=index: self._switch_terminal_tab(i))
             self.terminal_sidebar_group.addButton(btn, index)
-            sidebar_layout.addWidget(btn)
-        sidebar_layout.addStretch(1)
+            header_layout.addWidget(btn)
+        header_layout.addStretch(1)
         self.terminal_sidebar_group.button(0).setChecked(True)
-        self.terminal_sidebar = sidebar
 
         dock = QWidget()
-        dock_layout = QHBoxLayout(dock)
+        dock_layout = QVBoxLayout(dock)
         dock_layout.setContentsMargins(0, 0, 0, 0)
         dock_layout.setSpacing(0)
-        dock_layout.addWidget(sidebar)
+        dock_layout.addWidget(header)
         dock_layout.addWidget(self.terminal_stack, 1)
         return dock
     # [FN CLOSED] _build_terminal_dock
@@ -2068,11 +2423,49 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self.info_popup.setVisible(True)
         self.info_popup_top_bar.setVisible(True)
         self.io_tabs.setFixedHeight(200)
+        self.incoming_label_btn.setChecked(widget is self.incoming_view)
+        self.outgoing_label_btn.setChecked(widget is self.outgoing_view)
 
     def _close_info_popup(self):
         self.info_popup.setVisible(False)
         self.info_popup_top_bar.setVisible(False)
         self.io_tabs.setFixedHeight(42)
+        self.incoming_label_btn.setChecked(False)
+        self.outgoing_label_btn.setChecked(False)
+
+    def _toggle_mappa_options(self):
+        self.mappa_options_row.setVisible(not self.mappa_options_row.isVisible())
+        self.mappa_label_btn.setChecked(self.mappa_options_row.isVisible())
+
+    def _open_mappa(self, local):
+        self.mappa_options_row.setVisible(False)
+        self.mappa_label_btn.setChecked(False)
+        self._open_xref_window(local=local)
+
+    # [FN] _current_map_local_key — the xref key LOCAL scope should drill into: the element
+    # currently isolated in the coding board, or its nearest container if that element is itself
+    # a leaf with no children of its own (a lone FN has nothing to show "inside" it — its parent
+    # does). Falls back to the file's own top-level node when nothing is isolated, same lookup
+    # _update_filename_label already uses for "what am I looking at right now".
+    def _current_map_local_key(self):
+        tab = self.active_tab
+        if tab is None or not self.project_root_path:
+            return None
+        uid = self._active_filter_uid()
+        node = self._find_node_by_uid(tab.tree, uid) if uid else None
+        if node is None:
+            node = next((item for item in tab.tree.body if isinstance(item, Node)), None)
+        if node is None:
+            return None
+        rel = os.path.relpath(tab.path, self.project_root_path).replace(os.sep, '/')
+        key = f'{rel}::{node.uid}'
+        xref = self._get_xref()
+        element = xref.get(key)
+        if element is None:
+            return None
+        if not any(e.parent == key for e in xref.values()) and element.parent:
+            return element.parent
+        return key
 
     # [FN CATEGORY] _open_xref_window — MAPPA opens the cross-reference graph in a dialog internal to
     # the IDE (parented to the main window, floating over the editor — not a strip in the coding pane
@@ -2082,9 +2475,12 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     # close-tab is reparented onto the dialog itself while it's open: the dialog is a separate
     # top-level window that would otherwise render fully over the shell's own copy of the tab,
     # making it unclickable until the map was closed some other way.
-    # [FN] _open_xref_window — opens/raises the internal cross-reference map dialog
+    # [FN] _open_xref_window — opens/raises the internal cross-reference map dialog. local=True
+    # drills straight into the current element's containing parent (see _current_map_local_key);
+    # local=False (GLOBAL) is the classic full-project view, explicitly exiting drill mode so a
+    # later GLOBAL open never leaks a LOCAL drill left over from an earlier session with the dialog.
     # [FN OPEN] _open_xref_window
-    def _open_xref_window(self):
+    def _open_xref_window(self, local=False):
         if self.map_dialog is None:
             self.map_dialog = XrefMapDialog(self)
             self.map_dialog.nodeActivated.connect(self._navigate_to_element)
@@ -2097,6 +2493,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # with the real data (and no loading flag) once the build actually completes
         still_building = self._xref_cache is None
         self.map_dialog.set_graph(self._get_xref(), project_name, self.project_root_path or '', loading=still_building)
+        drill_key = self._current_map_local_key() if local else None
+        if drill_key:
+            self.map_dialog._enter_drill_mode(drill_key)
+        else:
+            self.map_dialog._exit_drill_mode()
         self.map_dialog.show()
         self._position_map_dialog()
         self.map_dialog.raise_()
@@ -2113,16 +2514,271 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if self.map_dialog is not None and self.map_dialog.isVisible():
             key = self.map_dialog.selected_key()
             self.map_dialog.hide()
+            # back on the shell, but hidden — Mappa's entry point is the MAPPA button in the
+            # INCOMING/OUTGOING bar (see _build_io_tabs); map_tab_btn's only remaining job is to
+            # sit atop the dialog while it's open and act as its close control (the dialog is
+            # frameless and has no other close affordance)
             self.map_tab_btn.setParent(self.shell)
             self.map_tab_btn.setText(' MAPPA')
             self.map_tab_btn.setProperty('kantIcon', 'arrow-up')
             self.map_tab_btn.setIcon(draw_icon('arrow-up', 12))
-            self.map_tab_btn.show()
-            self._position_map_tab()
+            self.map_tab_btn.hide()
             if key:
                 self._navigate_to_element(key)
             return
         self._open_xref_window()
+
+    # [FN CATEGORY] _start_import_edit — "Modifica import"'s entry point (CodeEdit.contextMenuEvent,
+    # right-click on an import line). Python-only: resolving a library's real on-disk source needs an
+    # interpreter that actually has it installed, and the project's active interpreter (_active_python,
+    # already used for run/debug/REPL) is the only one this app already knows how to ask. A local copy
+    # is made once per module (kant_local_imports/<flat_name>.py, flattened since only the one resolved
+    # file is copied — not the whole package) and reused on a later "Modifica import" of the same
+    # module, so re-editing it never clobbers earlier customization.
+    # [FN] _start_import_edit — resolves the module's source, makes/reuses the local copy, opens the editor
+    # [FN OPEN] _start_import_edit
+    def _start_import_edit(self, edit, module, line_text):
+        if not self.project_root_path:
+            self._ide_message('Modifica import', 'Apri un progetto prima di modificare un import.')
+            return
+        tab = getattr(edit, 'kant_tab', None)
+        if tab is None or Path(tab.path).suffix.lower() != '.py':
+            self._ide_message(
+                'Modifica import',
+                'La modifica degli import è disponibile solo per file Python al momento.',
+            )
+            return
+        python = self._active_python()
+        try:
+            result = subprocess.run(
+                [python, '-c', (
+                    'import importlib.util\n'
+                    f'spec = importlib.util.find_spec({module!r})\n'
+                    'print(spec.origin or "" if spec else "")'
+                )],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self._ide_message('Modifica import', f'Impossibile risolvere "{module}": {e}')
+            return
+        source_path = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ''
+        if result.returncode != 0 or not source_path or not os.path.isfile(source_path):
+            self._ide_message(
+                'Modifica import',
+                f'Impossibile trovare il file sorgente di "{module}" — modulo builtin, estensione C, '
+                "o non installato nell'interprete attivo del progetto.",
+            )
+            return
+        flat_name = module.replace('.', '_')
+        dest_dir = os.path.join(self.project_root_path, 'kant_local_imports')
+        dest_path = os.path.join(dest_dir, f'{flat_name}.py')
+        if not os.path.exists(dest_path):
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.copy2(source_path, dest_path)
+            except OSError as e:
+                self._ide_message('Modifica import', f'Impossibile creare la copia locale: {e}')
+                return
+        from_match = re.match(r'^\s*from\s+[\w.]+\s+import\s+(\w+)', line_text)
+        if from_match:
+            symbol, is_from = from_match.group(1), True
+        else:
+            symbol, is_from = module.split('.')[0], False
+        self._open_import_edit_dialog(module, symbol, is_from, dest_path)
+    # [FN CLOSED] _start_import_edit
+
+    # [FN] _open_import_edit_dialog — coding board + a ClaudePane scoped to just the local copy
+    # [FN OPEN] _open_import_edit_dialog
+    def _open_import_edit_dialog(self, module, symbol, is_from, dest_path):
+        try:
+            with open(dest_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+        except OSError as e:
+            self._ide_message('Modifica import', f'Impossibile aprire la copia locale: {e}')
+            return
+        dialog, outer, body = self._internal_window(f'MODIFICA IMPORT — {module}', 900, 'Chiudi senza continuare')
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+
+        splitter = QSplitter(Qt.Horizontal)
+        editor_container = QWidget()
+        editor_layout = QVBoxLayout(editor_container)
+        editor_layout.setContentsMargins(10, 10, 10, 10)
+        hint = QLabel(f"Copia locale di \"{module}\" — {dest_path}\nL'import originale non viene mai toccato.")
+        hint.setStyleSheet(f'color:{theme.DIM};')
+        hint.setWordWrap(True)
+        editor_layout.addWidget(hint)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(f'border:none; background:{theme.CODE_BG};')
+        local_edit = CodeEdit(text)
+        scroll.setWidget(local_edit)
+        editor_layout.addWidget(scroll, 1)
+        splitter.addWidget(editor_container)
+
+        pane = ClaudePane(os.path.dirname(dest_path))
+        pane.context_hint = lambda: (
+            f'Stai modificando la copia locale personalizzata dell\'import "{module}", salvata in '
+            f'{dest_path}. Modifica solo questo file per soddisfare le richieste dell\'utente.'
+        )
+        pane.focus_hint = lambda: f'import locale: {module}'
+        pane.apply_style()
+        splitter.addWidget(pane)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        body.addWidget(splitter)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(14, 10, 14, 14)
+        buttons.addStretch(1)
+        confirm = QPushButton('Conferma e continua')
+        confirm.setToolTip('Salva la copia locale e passa alla scelta di dove usarla')
+        confirm.setStyleSheet(theme.BUTTON_STYLE)
+        buttons.addWidget(confirm)
+        body.addLayout(buttons)
+        outer.addLayout(body)
+        dialog.setMinimumHeight(560)
+
+        def on_confirm():
+            try:
+                write_file_atomic(dest_path, local_edit.toPlainText())
+            except OSError as e:
+                self._ide_message('Modifica import', f'Salvataggio della copia locale fallito: {e}')
+                return
+            dialog.accept()
+
+        confirm.clicked.connect(on_confirm)
+        if dialog.exec() == QDialog.Accepted:
+            self._open_import_occurrence_picker(module, symbol, is_from, dest_path)
+    # [FN CLOSED] _open_import_edit_dialog
+
+    # [FN CATEGORY] _open_import_occurrence_picker — reuses reference_locations (the same text-scan
+    # find-references already backing the no-LSP command palette) to find every file that mentions the
+    # imported symbol, then keeps only those that have their OWN import line for this module — that's
+    # what "affiancare" (add alongside) needs: a known line to insert right after. A file only ever
+    # gets ONE new shadow-import line; Python name resolution takes care of every call site in that
+    # file automatically (the shadow import runs after the original, so the local copy wins for
+    # anything below it) — there's no such thing as redirecting one call site but not its neighbour
+    # in the same file, so the picker operates at file granularity, not line granularity.
+    # [FN] _open_import_occurrence_picker — pick which files get the new shadow import
+    # [FN OPEN] _open_import_occurrence_picker
+    def _open_import_occurrence_picker(self, module, symbol, is_from, dest_path):
+        matches = reference_locations(self.project_root_path, symbol, limit=500)
+        import_line_re = re.compile(
+            rf'^\s*(?:from\s+{re.escape(module)}\s+import\s+|import\s+{re.escape(module)}\b)'
+        )
+        dest_abs = os.path.abspath(dest_path)
+        candidates = {}  # abs path -> (rel_path, import_line_no)
+        for path, rel, _lineno, _line in matches:
+            if os.path.abspath(path) == dest_abs or path in candidates:
+                continue
+            tab = self.open_tabs.get(path)
+            if tab is not None:
+                file_lines = serialize_kant(tab.tree).split('\n')
+            else:
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        file_lines = f.read().split('\n')
+                except OSError:
+                    continue
+            import_line_no = next((i for i, l in enumerate(file_lines) if import_line_re.match(l)), None)
+            if import_line_no is not None:
+                candidates[path] = (rel, import_line_no)
+        if not candidates:
+            self._ide_message(
+                'Modifica import',
+                f'Copia locale salvata in {dest_path}.\n'
+                f'Nessun altro file ha un proprio import di "{module}" da poter affiancare.',
+            )
+            return
+
+        dialog, outer, body = self._internal_window('DOVE USARE LA COPIA LOCALE', 560, 'Chiudi senza applicare')
+        body.setContentsMargins(16, 12, 16, 12)
+        body.setSpacing(10)
+        info = QLabel(
+            f'Scegli in quali file affiancare un nuovo import verso la copia locale di "{module}" '
+            "(quello originale non viene mai modificato)."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f'color:{theme.TEXT};')
+        body.addWidget(info)
+
+        list_widget = QTreeWidget()
+        list_widget.setHeaderHidden(True)
+        list_widget.setStyleSheet(
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER};'
+        )
+        active_path = getattr(self.active_tab, 'path', None)
+        checks = {}
+        for path, (rel, import_line_no) in sorted(candidates.items(), key=lambda kv: kv[1][0]):
+            item = QTreeWidgetItem(list_widget, [f'{rel}  (riga {import_line_no + 1})'])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.Checked if path == active_path else Qt.Unchecked)
+            checks[item] = (path, import_line_no)
+        body.addWidget(list_widget)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton('Annulla')
+        cancel.setStyleSheet(theme.BUTTON_STYLE)
+        cancel.clicked.connect(dialog.reject)
+        apply_btn = QPushButton('Sostituisci selezionati')
+        apply_btn.setStyleSheet(theme.BUTTON_STYLE)
+        apply_btn.clicked.connect(dialog.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(apply_btn)
+        body.addLayout(buttons)
+        outer.addLayout(body)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected = [checks[item] for item in checks if item.checkState(0) == Qt.Checked]
+        if not selected:
+            return
+        flat_name = os.path.splitext(os.path.basename(dest_path))[0]
+        local_module = f'kant_local_imports.{flat_name}'
+        new_line = f'from {local_module} import {symbol}' if is_from else f'import {local_module} as {symbol}'
+        failures = []
+        for path, import_line_no in selected:
+            if not self._apply_local_import_shadow(path, import_line_no, new_line):
+                failures.append(os.path.relpath(path, self.project_root_path))
+        if failures:
+            self._ide_message('Modifica import', "Scrittura fallita per:\n" + '\n'.join(failures))
+        else:
+            self._ide_message('Modifica import', f'Import locale aggiunto in {len(selected)} file.')
+    # [FN CLOSED] _open_import_occurrence_picker
+
+    # [FN] _apply_local_import_shadow — inserts one new import line right after an existing one,
+    # through the same open-tab-aware save path _kant_reorder_apply already established (in-memory
+    # tree when the file's open, so unsaved edits aren't lost; a fresh KantParseError falls back to
+    # the plain-text ROOT wrapper _open_file itself uses for a file with no valid KANT markers)
+    # [FN OPEN] _apply_local_import_shadow
+    def _apply_local_import_shadow(self, path, import_line_no, new_line):
+        tab = self.open_tabs.get(path)
+        if tab is not None:
+            lines = serialize_kant(tab.tree).split('\n')
+            lines.insert(import_line_no + 1, new_line)
+            new_text = '\n'.join(lines)
+            try:
+                tab.tree = parse_kant(new_text)
+            except KantParseError:
+                tab.tree = Node(tag='ROOT', name='', open_raw=None, body=[Run(lines=new_text.split('\n'))])
+            tab.mark_dirty()
+            ok = tab.save()
+            self._render_view(tab, tab.filter_uid)
+            return ok
+        try:
+            with open(path, 'r', encoding='utf-8', newline='') as f:
+                lines = f.read().split('\n')
+        except OSError:
+            return False
+        lines.insert(import_line_no + 1, new_line)
+        try:
+            write_file_atomic(path, '\n'.join(lines))
+        except OSError:
+            return False
+        return True
+    # [FN CLOSED] _apply_local_import_shadow
 
     # [FN CATEGORY] _toggle_claude_pane — flattens the AI terminal pane to zero width via the outer
     # splitter (not hiding the widget) so its running process/state is untouched, and remembers the
@@ -2509,8 +3165,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         self._watch_project_tree()
         self.stack.setCurrentIndex(1)
         self._set_project_chrome_visible(True)
-        self.map_tab_btn.show()
-        self._position_map_tab()
+        # map_tab_btn itself stays hidden until MAPPA is actually opened (it's now only the
+        # in-dialog close handle) — the always-visible entry point is mappa_label_btn in the
+        # INCOMING/OUTGOING bar, built already, no per-open show() needed
         self.claude_tab_btn.show()
         self._position_claude_tab()
 
@@ -2590,7 +3247,55 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._update_kant_map_label()
 
         self._run_background(build_map, save_map)
+        self._sync_kant_flow_csv()
     # [FN CLOSED] _sync_kant_map
+
+    # [FN CATEGORY] _sync_kant_flow_csv — the same generation-counter/rerun-needed/background-write
+    # pattern as _sync_kant_map, kept as its own independent background job (not folded into the
+    # map's own build_map/save_map closures) so a slow xref build never delays the map write, and a
+    # write-only-if-changed check the same way, so an unchanged project doesn't touch the file's
+    # mtime on every save. Runs every time _sync_kant_map does — same trigger points (save, project
+    # open, self-heal), so the two generated artifacts never drift out of sync with each other.
+    # [FN] _sync_kant_flow_csv — rewrites KANT_FLOW_<project>.csv from the current xref graph
+    # [FN OPEN] _sync_kant_flow_csv
+    def _sync_kant_flow_csv(self):
+        if not self.project_root_path:
+            return
+        project_root = self.project_root_path
+        project_name = os.path.basename(project_root)
+        path = os.path.join(project_root, f'KANT_FLOW_{project_name}.csv')
+        self._flow_sync_generation += 1
+        generation = self._flow_sync_generation
+        if self._flow_sync_running:
+            self._flow_sync_rerun_needed = True
+            return
+        self._flow_sync_running = True
+
+        def build_csv():
+            return build_kant_flow_csv(project_root)
+
+        def save_csv(text, error):
+            self._flow_sync_running = False
+            if self._flow_sync_rerun_needed:
+                self._flow_sync_rerun_needed = False
+                self._sync_kant_flow_csv()
+                return
+            if error or generation != self._flow_sync_generation or project_root != self.project_root_path:
+                return
+            if os.path.isfile(path):
+                try:
+                    existing = Path(path).read_text(encoding='utf-8')
+                except OSError:
+                    existing = None
+                if existing is not None and existing.replace('\r\n', '\n') == text.replace('\r\n', '\n'):
+                    return
+            try:
+                write_file_atomic(path, text)
+            except OSError:
+                return
+
+        self._run_background(build_csv, save_csv)
+    # [FN CLOSED] _sync_kant_flow_csv
 
     # [FN CATEGORY] _validate_kant_project — the single place that composes a validate_kant_project()
     # call into user-facing result text: refreshes kant_map_path first (a map created moments ago,
@@ -2693,6 +3398,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             item.setData(0, ROLE_PATH, path)
             item.setData(0, ROLE_LINE, line)
             item.setData(0, ROLE_TEXT, message)
+            key, _explanation, _fix = _kant_error_lookup(message)
+            if key is not None:
+                self._kant_error_pattern_counts[key] += 1
         for message in errors:
             if not any(message.startswith(f'{rel}:') for _path, rel, _line, _msg in visual_errors):
                 QTreeWidgetItem(root, [message])
@@ -2745,10 +3453,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             file_item.setData(0, ROLE_KIND, 'file')
             file_item.setData(0, ROLE_PATH, file_path)
             file_item.setData(0, ROLE_UID, top_node.uid)  # the file's own top-level KANT element
+            rel = os.path.relpath(file_path, dir_path).replace(os.sep, '/')
             self.tree.setItemWidget(
                 file_item, 0, self._tree_label(
                     file_item, tag, desc, bold=True, git_status=self._git_status_for_path(file_path),
-                    detail=top_node.category_desc,
+                    detail=top_node.category_desc, ai_review=self._ai_review_status.get(rel),
                 )
             )
             # start from the top node's own children, not the node itself — it's already
@@ -2769,9 +3478,9 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self.tree.setItemWidget(item, 0, self._tree_label(item, child.tag, child.desc or child.name, detail=child.category_desc))
             self._build_outline_items(item, child, path, order_counter)
 
-    def _tree_label(self, item, tag, text, bold=False, git_status='', detail=''):
+    def _tree_label(self, item, tag, text, bold=False, git_status='', detail='', ai_review=None):
         color = theme.TAG_COLORS.get(tag, theme.TEXT)
-        bg = theme.TAG_BACKGROUNDS.get(tag, '#eef2f7')
+        bg = theme.TAG_BACKGROUNDS.get(tag, theme.PANEL2)
         weight = '700' if bold else '400'
         git_html = (
             f' <span style="color:{theme.WARN}; font-weight:700">[{html_escape(git_status)}]</span>'
@@ -2789,18 +3498,46 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # but the color itself is the whole point of the tag badge — keep it as a thin colored
         # underline instead of losing it outright
         underline = f'border-bottom:2px solid {color};' if compact else ''
+        text_style = f'font-weight:{weight}'
+        row_style = f'color:{theme.TEXT}; background:transparent; padding:0px {1 if compact else 4}px;'
+        if ai_review is not None:
+            text_style, row_style = self._ai_review_label_style(ai_review, text_style, row_style)
         lbl = _TreeItemLabel(
             self.tree, item,
             f'<span style="color:{color}; background-color:{"transparent" if compact else bg}; font-weight:700; '
             f'padding:0px {0 if compact else 4}px; border-radius:4px; {underline}">[{tag}]</span> '
-            f'<span style="font-weight:{weight}">{html_escape(text)}</span>{git_html}{detail_html}'
+            f'<span style="{text_style}">{html_escape(text)}</span>{git_html}{detail_html}'
         )
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT - 1 if compact else theme.TREE_FONT_PT))
         lbl.setMargin(0)
-        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:0px {1 if compact else 4}px;')
+        lbl.setStyleSheet(row_style)
         lbl.setWordWrap(not compact)
         lbl.setCursor(Qt.PointingHandCursor)
         return lbl
+
+    # [FN CATEGORY] _ai_review_label_style — a pending AI review's per-file status colors that file's
+    # tree row: green underline for a created file or a modification with only additions, red
+    # underline for a modification with only deletions, strikethrough for a whole deleted file, and
+    # (a file with both additions and deletions) a hard 50/50 green/red split via a QSS
+    # qlineargradient background on the row itself — "divisione verticale al centro" was explicit in
+    # the request, and QSS gradients are the one place a literal vertical split is a one-line style
+    # rather than custom paint code.
+    # [FN] _ai_review_label_style — returns (text_span_style, row_stylesheet) for one review status
+    # [FN OPEN] _ai_review_label_style
+    def _ai_review_label_style(self, ai_review, text_style, row_style):
+        kind = ai_review['kind']
+        additions, deletions = ai_review.get('additions', 0), ai_review.get('deletions', 0)
+        if kind == 'deleted':
+            return f'{text_style}; color:{theme.DANGER}; text-decoration:line-through;', row_style
+        if kind == 'modified' and additions and deletions:
+            split = (
+                f'qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {theme.OK}, stop:0.499 {theme.OK}, '
+                f'stop:0.5 {theme.DANGER}, stop:1 {theme.DANGER})'
+            )
+            return f'{text_style}; color:#ffffff;', f'{row_style} background:{split};'
+        accent = theme.DANGER if kind == 'modified' and not additions else theme.OK
+        return f'{text_style}; color:{accent}; text-decoration:underline;', row_style
+    # [FN CLOSED] _ai_review_label_style
 
     # [FN CATEGORY] _build_plain_project_tree — classic PyCharm-style file browser: every file and
     # folder by its real name, no KANT labeling, no outline nesting under files — just the filesystem
@@ -2825,7 +3562,11 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
                 file_item = QTreeWidgetItem(parent_item)
                 file_item.setData(0, ROLE_KIND, 'plainfile')
                 file_item.setData(0, ROLE_PATH, entry.path)
-                self.tree.setItemWidget(file_item, 0, self._plain_file_label(file_item, entry.name, self._git_status_for_path(entry.path)))
+                rel = os.path.relpath(entry.path, self.project_root_path).replace(os.sep, '/') if self.project_root_path else ''
+                self.tree.setItemWidget(file_item, 0, self._plain_file_label(
+                    file_item, entry.name, self._git_status_for_path(entry.path),
+                    ai_review=self._ai_review_status.get(rel),
+                ))
     # [FN CLOSED] _build_plain_project_tree
 
     # [FN CATEGORY] _build_groupings_tree — "Gruppi" mode: one top-level row per saved Grouping
@@ -2891,14 +3632,18 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         lbl.setCursor(Qt.PointingHandCursor)
         return lbl
 
-    def _plain_file_label(self, item, name, git_status=''):
+    def _plain_file_label(self, item, name, git_status='', ai_review=None):
         git_html = (
             f' <span style="color:{theme.WARN}; font-weight:700">[{html_escape(git_status)}]</span>'
             if git_status else ''
         )
-        lbl = _TreeItemLabel(self.tree, item, html_escape(name) + git_html)
+        text_style = 'font-weight:400'
+        row_style = f'color:{theme.TEXT}; background:transparent; padding:0px 4px;'
+        if ai_review is not None:
+            text_style, row_style = self._ai_review_label_style(ai_review, text_style, row_style)
+        lbl = _TreeItemLabel(self.tree, item, f'<span style="{text_style}">{html_escape(name)}</span>{git_html}')
         lbl.setFont(QFont('Consolas', theme.TREE_FONT_PT))
-        lbl.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding:0px 4px;')
+        lbl.setStyleSheet(row_style)
         lbl.setWordWrap(True)
         lbl.setCursor(Qt.PointingHandCursor)
         return lbl
@@ -3185,7 +3930,10 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if tab.dirty:
             html += f' <span style="color:{theme.ACCENT}">●</span>'
         page._tab_label.setText(html)
-        page._tab_label.setStyleSheet(f'color:{theme.TEXT}; background:transparent;')
+        # right padding — with none, this label's own sizeHint (what the tab bar sizes the tab
+        # around) fit the text exactly flush to its right edge, so it touched the pin/close button
+        # sitting right next to it on the tab's RightSide with no breathing room at all
+        page._tab_label.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding-right:6px;')
         page._tab_label.adjustSize()
         index = self.tabs.indexOf(page)
         self.tabs.tabBar().setTabButton(index, QTabBar.LeftSide, page._tab_label)
@@ -3375,7 +4123,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         # against the button's sizeHint at registration time, not on later in-place text changes,
         # so re-registering after every text update is what keeps the tab wide enough for it
         tab._tab_label.setText(html)
-        tab._tab_label.setStyleSheet(f'color:{theme.TEXT}; background:transparent;')
+        tab._tab_label.setStyleSheet(f'color:{theme.TEXT}; background:transparent; padding-right:6px;')
         tab._tab_label.adjustSize()
         bar.setTabButton(idx, QTabBar.LeftSide, tab._tab_label)
         # re-registering the SAME widget instance at a position it already occupies makes Qt hide
@@ -3426,7 +4174,15 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         try:
             with open(path, 'r', encoding='utf-8', newline='') as f:
                 text = f.read()
-            tree = parse_kant(text)
+            # in File view mode the left tree shows plain filenames, no KANT compartmentalization
+            # — the coding board should match: open as one plain editable block (markers, if any,
+            # stay as literal text) instead of the collapsible per-element breakdown. Same tree
+            # shape the "invalid markers" fallback below already uses, so every other code path
+            # (save, dirty-tracking, syntax check) needs no special-casing for it.
+            if self.view_mode == 'file':
+                tree = Node(tag='ROOT', name='', open_raw=None, body=[Run(lines=text.split('\n'))])
+            else:
+                tree = parse_kant(text)
         except UnicodeDecodeError:
             self._ide_message('File non testuale', f'{os.path.basename(path)} non e un file UTF-8 apribile.')
             return False
@@ -4089,6 +4845,13 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         symbol = self._symbol_at_cursor(cursor)
         if not symbol:
             return
+        # a language keyword (def/for/try/...) explains its own syntax role, not a project symbol
+        # to resolve — checked first and unconditionally (regardless of LSP availability), since a
+        # real language server's own hover is about identifiers/types, not keyword syntax, and
+        # would come back empty for these anyway
+        if symbol in KEYWORD_DOCS:
+            show_code_hover_popup(global_pos, f'<b>{html_escape(symbol)}</b><br>{html_escape(KEYWORD_DOCS[symbol])}')
+            return
         if not lsp_server_for_path(tab.path):
             self._local_hover(edit, global_pos, symbol)
             return
@@ -4427,6 +5190,14 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         new_text = self._apply_skeleton_to_tab(tab)
         text = new_text if new_text is not None else serialize_kant(tab.tree)
         scope = self._kant_node_span(tab, scope_uid)
+        # an element IS isolated in the coding board (scope_uid set) but its span couldn't be
+        # resolved — surfacing this as an error instead of silently falling back to the whole
+        # file, which would run the AI over far more than what's actually shown
+        if scope_uid is not None and scope is None:
+            self._ide_message(
+                'KANT', "Impossibile individuare l'elemento isolato nella plancia di coding — riprova dopo un salvataggio.",
+            )
+            return
 
         audit = audit_kant_headers(text)
         if audit['errors']:
@@ -4617,6 +5388,112 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         wrapper = Node(tag='ROOT', name='', open_raw=None, body=[node])
         self._build_node_widgets(tab, wrapper, tab.view_layout, 0)
 
+    # [FN CATEGORY] _enter_ai_review_mode — replaces the old separate review window: every non-
+    # binary changed file gets opened and re-rendered as ONE merged, read-only block showing both
+    # kept and deleted lines together (green-underlined additions, red-underlined+struck-through
+    # deletions), while the project tree colors each affected file's own row the same way (see
+    # _ai_review_label_style) — a live diff you scroll through in place, not a separate window.
+    # Called from workspace._finish_ai_review right after build_ai_review succeeds; a deleted file
+    # has nothing left on disk to open, so it only gets the tree's strikethrough treatment.
+    # [FN] _enter_ai_review_mode — opens every changed file in its merged diff view, colors the tree
+    # [FN OPEN] _enter_ai_review_mode
+    def _enter_ai_review_mode(self, review):
+        self._ai_review_status = {}
+        for item in review:
+            rel = item['path'].replace(os.sep, '/')
+            kind = 'created' if item['status'] == 'creato' else (
+                'deleted' if item['status'] == 'eliminato' else 'modified'
+            )
+            self._ai_review_status[rel] = {
+                'kind': kind, 'additions': item.get('additions', 0), 'deletions': item.get('deletions', 0),
+            }
+            if item['binary'] or kind == 'deleted':
+                continue
+            target = os.path.join(self.project_root_path, item['path'])
+            if not self._open_file(target):
+                continue
+            tab = self.open_tabs.get(target)
+            if tab is not None:
+                # _open_file reuses one "preview" tab slot for whatever was opened most recently
+                # (VS Code-style) — opening several review files back to back would otherwise evict
+                # each one's tab the moment the next opens. _pin_file_tab is the real mechanism (it
+                # also detaches the tab from _preview_file_tab so _release_preview has nothing left
+                # to evict) — just setting tab._pinned doesn't do that on its own.
+                self._pin_file_tab(tab)
+                self._show_ai_review_diff(tab, item)
+        self._rebuild_tree()
+
+    def _exit_ai_review_mode(self):
+        self._ai_review_status = {}
+    # [FN CLOSED] _enter_ai_review_mode
+
+    # [FN] _show_ai_review_diff — swaps one tab's content for its merged old+new diff view
+    # [FN OPEN] _show_ai_review_diff
+    def _show_ai_review_diff(self, tab, item):
+        old_lines = [line.rstrip('\n') for line in item.get('old_lines', [])]
+        new_lines = [line.rstrip('\n') for line in item.get('new_lines', [])]
+        merged, added, deleted = [], set(), set()
+        for tag, i1, i2, j1, j2 in item['opcodes']:
+            if tag == 'equal':
+                merged.extend(old_lines[i1:i2])
+                continue
+            if tag in ('delete', 'replace'):
+                start = len(merged)
+                merged.extend(old_lines[i1:i2])
+                deleted.update(range(start, len(merged)))
+            if tag in ('insert', 'replace'):
+                start = len(merged)
+                merged.extend(new_lines[j1:j2])
+                added.update(range(start, len(merged)))
+        tab.tree = Node(tag='ROOT', name='', open_raw=None, body=[Run(lines=merged)])
+        tab._ai_review_lines = (added, deleted)
+        self._render_view(tab, None)
+        self._apply_ai_review_editor_markers(tab)
+    # [FN CLOSED] _show_ai_review_diff
+
+    # [FN] _apply_ai_review_editor_markers — green/red underline extra-selections over the merged
+    # view's added/deleted lines, deleted lines also struck through; the whole block goes read-only
+    # for the duration of the review — "disattiva dal codice vivo, lascia solo in visualizzazione"
+    # [FN OPEN] _apply_ai_review_editor_markers
+    def _apply_ai_review_editor_markers(self, tab):
+        added, deleted = getattr(tab, '_ai_review_lines', (set(), set()))
+        # the merged diff tree is one Run under ROOT, so _build_node_widgets puts exactly one
+        # CodeEdit straight into tab.view_layout — read it from there, not from
+        # tab.view_container.findChildren(CodeEdit): the PREVIOUS render's widgets were just
+        # takeAt()'d out of the layout by _render_view's cleanup but are only deleteLater()'d, not
+        # yet actually gone, so findChildren would still see them until Qt processes the deferred
+        # delete and could grab a stale widget instead of the new one.
+        if not tab.view_layout.count():
+            return
+        edit = tab.view_layout.itemAt(0).widget()
+        if not isinstance(edit, CodeEdit):
+            return
+        edit.setReadOnly(True)
+        doc = edit.document()
+        selections = []
+        for line_no in sorted(added | deleted):
+            block = doc.findBlockByNumber(line_no)
+            if not block.isValid():
+                continue
+            color = QColor(theme.DANGER if line_no in deleted else theme.OK)
+            fmt = QTextCharFormat()
+            fmt.setUnderlineStyle(QTextCharFormat.SingleUnderline)
+            fmt.setUnderlineColor(color)
+            background = QColor(color)
+            background.setAlpha(28)
+            fmt.setBackground(background)
+            if line_no in deleted:
+                fmt.setFontStrikeOut(True)
+            fmt.setProperty(QTextFormat.FullWidthSelection, True)
+            cursor = QTextCursor(block)
+            cursor.select(QTextCursor.LineUnderCursor)
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = cursor
+            selection.format = fmt
+            selections.append(selection)
+        edit.setExtraSelections(selections)
+    # [FN CLOSED] _apply_ai_review_editor_markers
+
     def _ensure_empty_file_is_editable(self, tab):
         if tab.view_container.findChildren(CodeEdit):
             return
@@ -4633,6 +5510,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         edit.definition_provider = lambda _edit: self._lsp_command('definition')
         edit.rename_provider = lambda _edit: self._lsp_command('rename')
         edit.vim_action = self._vim_dispatch
+        edit.import_edit_provider = self._start_import_edit
         tab.view_layout.addWidget(edit)
 
     # [FN CATEGORY] _add_add_element_block — the "+" card at the bottom of the whole-file KANT
@@ -4657,7 +5535,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         block.setMinimumHeight(56)
         block.setStyleSheet(
             f'QPushButton {{ background:{theme.CODE_BG}; color:{theme.DIM}; border:2px dashed {theme.DIM}; '
-            f'border-radius:10px; font-size:{theme.CODE_FONT_PT + 2}pt; font-weight:600; }} '
+            f'border-radius:{theme.RADIUS}px; font-size:{theme.CODE_FONT_PT + 2}pt; font-weight:600; }} '
             f'QPushButton:hover {{ color:{theme.ACCENT}; border-color:{theme.ACCENT}; background:{theme.PANEL}; }}'
         )
         block.clicked.connect(lambda: self._prompt_add_element(tab))
@@ -4883,12 +5761,16 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
     def _render_coordinated_leaf_group(self, tab, nodes, layout):
         panel = QWidget()
         panel.setObjectName('coordinatedConstants')
+        # same flat-block language as CollapsibleSection (thin top separator + tag-colored left
+        # gutter, no card fill/radius) — one continuous gutter spans the whole cluster, reading as
+        # "these leaves are one coordinated group" without a bordered box around them
+        gutter = theme.TAG_COLORS.get(nodes[0].tag, theme.BORDER) if nodes else theme.BORDER
         panel.setStyleSheet(
-            f'#coordinatedConstants {{ background:{theme.PANEL}; border:1px solid {theme.BORDER}; '
-            f'border-radius:10px; padding:0; }}'
+            f'#coordinatedConstants {{ background:transparent; border:none; '
+            f'border-top:1px solid {theme.BORDER_WEAK}; border-left:3px solid {gutter}; padding:0; }}'
         )
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(5, 3, 5, 3)
+        panel_layout.setContentsMargins(theme.SPACE_1, 3, 5, 3)
         panel_layout.setSpacing(1)
         for node in nodes:
             leaf = LeafSection(node, compact=True)
@@ -4959,6 +5841,17 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
 
     # ---- workspace mutations (AI-NAV: UI delegates safety to WorkspaceMixin)
 
+    # [FN] _reveal_in_explorer — opens Windows Explorer with the given path selected/highlighted
+    # [FN OPEN] _reveal_in_explorer
+    def _reveal_in_explorer(self, path):
+        if not path or not os.path.exists(path):
+            return
+        # '/select,' (no space before the comma) is explorer.exe's own documented switch to open
+        # the CONTAINING folder with this item highlighted, for both files and directories —
+        # matches how "Reveal in File Explorer" reads in other Windows dev tools
+        subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
+    # [FN CLOSED] _reveal_in_explorer
+
     def _dir_for_context(self, item, kind):
         if item is None:
             return self.project_root_path
@@ -4990,7 +5883,7 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
         if restore_action is not None:
             restore_action.setToolTip("Ripristina un file/cartella eliminato di recente dal cestino dell'IDE")
         rename_action = delete_action = git_diff_action = git_stage_action = git_unstage_action = None
-        run_test_action = None
+        run_test_action = reveal_action = None
         test_name = None
         if item is not None and kind in ('file', 'plainfile', 'invalidfile', 'dir'):
             menu.addSeparator()
@@ -4998,6 +5891,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             rename_action.setToolTip('Rinomina questo file o cartella')
             delete_action = menu.addAction('Elimina')
             delete_action.setToolTip('Sposta questo file o cartella nel cestino')
+            reveal_action = menu.addAction('Visualizza in Esplora risorse')
+            reveal_action.setToolTip('Apre Esplora risorse con questo file o cartella selezionato')
         if item is not None and kind in ('file', 'plainfile') and self.git_root:
             menu.addSeparator()
             git_diff_action = menu.addAction('Git diff')
@@ -5055,6 +5950,8 @@ class MainWindow(IdeDialogsMixin, WorkspaceMixin, GitOpsMixin, QMainWindow):
             self._rename_tree_item(item, kind)
         elif delete_action is not None and chosen is delete_action:
             self._delete_tree_item(item, kind)
+        elif reveal_action is not None and chosen is reveal_action:
+            self._reveal_in_explorer(item.data(0, ROLE_PATH))
         elif git_diff_action is not None and chosen is git_diff_action:
             self._git_diff_file(item.data(0, ROLE_PATH))
         elif git_stage_action is not None and chosen is git_stage_action:

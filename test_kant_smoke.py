@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt, QEvent, QPointF, QSettings
 from PySide6.QtGui import QImage, QKeyEvent, QKeySequence, QMouseEvent, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
-    QApplication, QGraphicsItem, QLabel, QListWidget, QMenu, QMessageBox, QTabBar, QToolButton,
+    QApplication, QGraphicsItem, QLabel, QListWidget, QMenu, QMessageBox, QPushButton, QTabBar, QToolButton,
     QTreeWidget, QTreeWidgetItem,
 )
 
@@ -34,8 +34,8 @@ from kant.pyenv import (
 )
 from kant.xref import build_xref, XrefElement
 from kant.widgets import (
-    ClaudePane, CollapsibleSection, DiffHighlighter, FileTab, LeafSection, RecentFolderCard,
-    _AiReviewCard, _agent_command, _markdown_to_html, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
+    ClaudePane, CollapsibleSection, FileTab, LeafSection, RecentFolderCard,
+    _agent_command, _markdown_to_html, _normalize_ai_text, CodeEdit, MODEL_DEFAULT,
     _code_hover_popup_instance, make_app_icon, make_app_pixmap, set_vim_mode, vim_mode_enabled,
     compress_attached_image, convert_attached_document,
 )
@@ -2418,6 +2418,9 @@ class KantSmokeTest(unittest.TestCase):
             w._map_sync_generation = 0
             w._map_sync_running = False
             w._map_sync_rerun_needed = False
+            w._flow_sync_generation = 0
+            w._flow_sync_running = False
+            w._flow_sync_rerun_needed = False
             w._run_background = lambda work, done: done(work(), None)
 
             result = MainWindow._validate_kant_project(w)
@@ -2444,6 +2447,9 @@ class KantSmokeTest(unittest.TestCase):
             w._map_sync_generation = 0
             w._map_sync_running = False
             w._map_sync_rerun_needed = False
+            w._flow_sync_generation = 0
+            w._flow_sync_running = False
+            w._flow_sync_rerun_needed = False
             w._run_background = lambda work, done: done(work(), None)
             MainWindow._sync_kant_map(w)
             assert (root / f'KANT_{root.name}.md').exists()
@@ -2479,43 +2485,42 @@ class KantSmokeTest(unittest.TestCase):
             review_file.write_text(''.join(original_lines), encoding='utf-8')
             review_snapshot = create_snapshot(str(review_root))
             changed_lines = original_lines[:]
-            changed_lines[1] = 'first change\n'
+            changed_lines[7] = 'first change\n'
             changed_lines[18] = 'second change\n'
             review_file.write_text(''.join(changed_lines), encoding='utf-8')
             review = build_ai_review(str(review_root), review_snapshot)
             assert len(review) == 1 and len(review[0]['hunks']) == 2
-            review_card = _AiReviewCard(review, render_review_text)
-            assert review_card.details.objectName() == 'aiReviewDetails'
-            assert review_card.accepted_hunks('sample.txt') == {0, 1}
-            review_card.file_items['sample.txt'].child(1).setCheckState(0, Qt.Unchecked)
-            assert review_card.accepted_hunks('sample.txt') == {0}
-            resolved = []
-            review_card.resolved.connect(resolved.append)
-            review_card._show_details('sample.txt')
-            review_card.resolved.emit('cancel')
-            assert resolved == ['cancel']
-            review_card.set_resolved()
-            assert all(not button.isEnabled() for button in review_card._action_buttons)
-            review_card.close()
+            # opcodes must be a fresh list, not SequenceMatcher's own cached one — get_grouped_opcodes
+            # (called just above to build item['hunks']) trims that cached list's edge 'equal' opcodes
+            # to a 3-line context window in place. The leading equal run here is 7 lines (0..7), longer
+            # than that window, so a bare reference would show up trimmed to (4, 7) instead of (0, 7) —
+            # exactly the corruption that silently dropped a file's leading lines on every real apply.
+            assert review[0]['opcodes'][0] == ('equal', 0, 7, 0, 7)
 
             window = MainWindow()
+            window.project_root_path = str(review_root)
+            window.git_root = None
             chat_rows_before = window.claude_pane.chat_layout.count()
+            window._enter_ai_review_mode(review)
+            # the diff renders live in place now — no separate review window — as the file's own
+            # tab (merged, read-only, green/red-underlined) plus a colored project-tree row
+            assert window._ai_review_status.get('sample.txt', {}).get('kind') == 'modified'
+            review_tab = window.open_tabs.get(str(review_file))
+            assert review_tab is not None
+            added, deleted = review_tab._ai_review_lines
+            assert added and deleted  # a 'replace' opcode renders as its old line (deleted) then its new line (added)
+            merged_edit = review_tab.view_layout.itemAt(0).widget()
+            assert isinstance(merged_edit, CodeEdit) and merged_edit.isReadOnly()
+            assert len(merged_edit.extraSelections()) == len(added) + len(deleted)
+            assert window.claude_pane.chat_layout.count() == chat_rows_before  # nothing posted yet
             review_outcomes = []
-            window.claude_pane.show_ai_review(review, render_review_text, lambda *args: review_outcomes.append(args))
-            # a separate window now (QDialog(self) still registers as a Qt child of claude_pane for
-            # ownership, findChildren finds it across that window boundary), not inserted into chat
-            assert window.claude_pane.chat_layout.count() == chat_rows_before
-            dialog_cards = window.claude_pane.findChildren(_AiReviewCard)
-            assert len(dialog_cards) == 1
-            dialog_card = dialog_cards[0]
-            assert dialog_card.in_dialog is True
-            assert not dialog_card.details.isHidden()  # shown immediately, no "Controllo" click needed
-            # DiffHighlighter colors +/- lines instead of the diff being flat plain text
-            assert isinstance(dialog_card.diff_highlighter, DiffHighlighter)
-            assert dialog_card.diff_view.toPlainText().strip()
-            dialog_card.resolved.emit('apply')
-            assert review_outcomes and review_outcomes[0][0] == 'apply'
-            assert all(not button.isEnabled() for button in dialog_card._action_buttons)  # locks after resolving
+            window.claude_pane.offer_ai_review(review, lambda *args: review_outcomes.append(args))
+            assert window.claude_pane.chat_layout.count() == chat_rows_before + 1  # one accept/cancel card
+            accept_buttons = [
+                button for button in window.claude_pane.findChildren(QPushButton)
+                if button.text() in ('Accetta', 'Annulla')
+            ]
+            assert len(accept_buttons) == 2  # Accetta + Annulla — no third "Rivedi" button
             window.close()
             apply_ai_review(str(review_root), review, {'sample.txt': {0}})
             partial = review_file.read_text(encoding='utf-8')
@@ -3050,7 +3055,7 @@ class KantSmokeTest(unittest.TestCase):
             source.write_text('x = 2\n', encoding='utf-8')
 
             offered = []
-            window.claude_pane.offer_ai_review = lambda review, render_text, resolved: offered.append((review, resolved))
+            window.claude_pane.offer_ai_review = lambda review, resolved: offered.append((review, resolved))
             window.claude_pane.auto_permissions.setChecked(False)
             window._finish_ai_review()
             assert len(offered) == 1  # non-automatic mode: offered as a card, not applied yet
@@ -3912,6 +3917,9 @@ class KantSmokeTest(unittest.TestCase):
             w._map_sync_generation = 0
             w._map_sync_running = False
             w._map_sync_rerun_needed = False
+            w._flow_sync_generation = 0
+            w._flow_sync_running = False
+            w._flow_sync_rerun_needed = False
             w._run_background = lambda work, done: done(work(), None)
             MainWindow._sync_kant_map(w)
             map_path = root / f'KANT_{root.name}.md'
@@ -3944,7 +3952,7 @@ class KantSmokeTest(unittest.TestCase):
             )
             window.claude_pane.auto_permissions.setChecked(False)
             offered = []
-            window.claude_pane.offer_ai_review = lambda review, render_text, resolved: offered.append((review, resolved))
+            window.claude_pane.offer_ai_review = lambda review, resolved: offered.append((review, resolved))
             sync_calls = []
             window._sync_kant_map = lambda: sync_calls.append(True)
 
@@ -3984,7 +3992,7 @@ class KantSmokeTest(unittest.TestCase):
             )
             window.claude_pane.auto_permissions.setChecked(False)
             offered = []
-            window.claude_pane.offer_ai_review = lambda review, render_text, resolved: offered.append((review, resolved))
+            window.claude_pane.offer_ai_review = lambda review, resolved: offered.append((review, resolved))
             messages = []
             window.claude_pane.write_info = lambda text: messages.append(text)
 
@@ -4008,7 +4016,7 @@ class KantSmokeTest(unittest.TestCase):
             (root / 'app.py').write_text('# [MOD OPEN] app.py\nprint(2)\n# [MOD CLOSED] app.py\n', encoding='utf-8')
             window.claude_pane.auto_permissions.setChecked(False)
             offered = []
-            window.claude_pane.offer_ai_review = lambda review, render_text, resolved: offered.append((review, resolved))
+            window.claude_pane.offer_ai_review = lambda review, resolved: offered.append((review, resolved))
             sync_calls = []
             window._sync_kant_map = lambda: sync_calls.append(True)
 

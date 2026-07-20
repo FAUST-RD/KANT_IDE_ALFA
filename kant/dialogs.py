@@ -14,6 +14,7 @@ from kant.model import (
     ELEMENT_LANGUAGES, ELEMENT_TAG_LABELS, Node, build_new_element_node, serialize_kant,
     FILE_KIND_LABELS, build_new_file_content,
 )
+from kant.widgets import ToggleSwitch
 
 
 # [FN CATEGORY] _PaletteInput — a QLineEdit that forwards Up/Down to the command palette's result
@@ -133,7 +134,7 @@ class IdeDialogsMixin:
         row.addStretch(1)
         danger_style = (
             f'QPushButton {{ background:{theme.PANEL}; color:{theme.DANGER}; border:1px solid {theme.DANGER}; '
-            f'border-radius:8px; padding:7px 13px; font-weight:700; }} '
+            f'border-radius:{theme.RADIUS}px; padding:7px 13px; font-weight:700; }} '
             f'QPushButton:hover {{ background:{theme.DANGER}; color:#ffffff; }} '
             f'QPushButton:pressed {{ background:{theme.DANGER}; color:#ffffff; }}'
         )
@@ -166,7 +167,7 @@ class IdeDialogsMixin:
         field = QLineEdit(text)
         field.setStyleSheet(
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:8px;'
+            f'border-radius:{theme.RADIUS}px; padding:8px;'
         )
         layout.addWidget(field)
         self._dialog_buttons(layout, dialog)
@@ -191,7 +192,7 @@ class IdeDialogsMixin:
             field = QLineEdit(value)
             field.setStyleSheet(
                 f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-                f'border-radius:6px; padding:6px;'
+                f'border-radius:{theme.RADIUS}px; padding:6px;'
             )
             body.addWidget(field)
             return field
@@ -222,6 +223,62 @@ class IdeDialogsMixin:
         return tag_field.text(), name_field.text(), desc_field.text()
     # [FN CLOSED] _ide_metadata_form
 
+    # [FN CATEGORY] _ide_kant_error_help — the contextual window a double-click on a "Verifica
+    # KANT" error row opens: the raw message, how many times this same pattern has recurred this
+    # session (from mainwindow's own counter — this dialog just displays whatever count it's
+    # given), a plain-language explanation, and up to two actions. "Vai alla riga"/"Applica fix"
+    # are custom dialog.done() codes rather than accept/reject, since neither maps cleanly to
+    # accepted/rejected and the caller needs to tell all three apart.
+    # [FN] _ide_kant_error_help — explains one KANT validation error, offers "vai"/"fix" actions
+    # [FN OPEN] _ide_kant_error_help
+    def _ide_kant_error_help(self, message, explanation, occurrence_count, fix_label=None):
+        dialog, outer, body = self._internal_window('Errore KANT', 460, 'Chiudi')
+        body.setContentsMargins(18, 16, 18, 16)
+        body.setSpacing(10)
+
+        msg_label = QLabel(message)
+        msg_label.setWordWrap(True)
+        msg_label.setFont(QFont('Consolas', theme.CODE_FONT_PT, QFont.DemiBold))
+        msg_label.setStyleSheet(f'color:{theme.DANGER}; border:none;')
+        body.addWidget(msg_label)
+
+        if occurrence_count > 1:
+            count_label = QLabel(f'Comparso {occurrence_count} volte in questa sessione.')
+            count_label.setStyleSheet(f'color:{theme.WARN}; font-weight:600; border:none;')
+            body.addWidget(count_label)
+
+        exp_label = QLabel(explanation)
+        exp_label.setWordWrap(True)
+        exp_label.setStyleSheet(f'color:{theme.TEXT}; border:none;')
+        body.addWidget(exp_label)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        close_btn = QPushButton('Chiudi')
+        close_btn.setToolTip('Chiudi senza fare nulla')
+        close_btn.setStyleSheet(theme.BUTTON_STYLE)
+        close_btn.clicked.connect(dialog.reject)
+        buttons.addWidget(close_btn)
+        goto_btn = QPushButton('Vai alla riga')
+        goto_btn.setToolTip("Apre il file alla riga dell'errore")
+        goto_btn.setStyleSheet(theme.BUTTON_STYLE)
+        goto_btn.clicked.connect(lambda: dialog.done(2))
+        buttons.addWidget(goto_btn)
+        if fix_label:
+            fix_btn = QPushButton(fix_label)
+            fix_btn.setToolTip('Apre il file e avvia il fix proposto')
+            fix_btn.setStyleSheet(
+                theme.BUTTON_STYLE + f'QPushButton {{ background:{theme.ACCENT}; color:#111827; border-color:{theme.ACCENT}; }}'
+            )
+            fix_btn.clicked.connect(lambda: dialog.done(3))
+            buttons.addWidget(fix_btn)
+        body.addLayout(buttons)
+        outer.addLayout(body)
+
+        result = dialog.exec()
+        return {2: 'goto', 3: 'fix'}.get(result)
+    # [FN CLOSED] _ide_kant_error_help
+
     # [FN CATEGORY] _ide_new_element_form — the "+" block at the bottom of a KANT outline (and the
     # equivalent one for whole new files) asks four things: what kind of element (the 8 KANT tags,
     # shown by name not bare code), what language (determines both the comment leader for the
@@ -237,7 +294,7 @@ class IdeDialogsMixin:
 
         field_style = (
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:6px;'
+            f'border-radius:{theme.RADIUS}px; padding:6px;'
         )
 
         def field_label(text):
@@ -336,7 +393,7 @@ class IdeDialogsMixin:
 
         field_style = (
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:6px;'
+            f'border-radius:{theme.RADIUS}px; padding:6px;'
         )
 
         def field_label(text):
@@ -443,7 +500,7 @@ class IdeDialogsMixin:
         body.setSpacing(10)
         combo_style = (
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:6px;'
+            f'border-radius:{theme.RADIUS}px; padding:6px;'
         )
 
         def field_label(text):
@@ -555,7 +612,7 @@ class IdeDialogsMixin:
         message_field.setFixedHeight(80)
         message_field.setStyleSheet(
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:6px;'
+            f'border-radius:{theme.RADIUS}px; padding:6px;'
         )
         body.addWidget(message_field)
 
@@ -594,14 +651,14 @@ class IdeDialogsMixin:
 
         listbox = QListWidget()
         listbox.setStyleSheet(
-            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:6px;'
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:{theme.RADIUS}px;'
         )
 
         field = _PaletteInput(listbox)
         field.setPlaceholderText('Filtra comandi…')
         field.setStyleSheet(
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:8px;'
+            f'border-radius:{theme.RADIUS}px; padding:8px;'
         )
         body.addWidget(field)
         body.addWidget(listbox)
@@ -647,7 +704,7 @@ class IdeDialogsMixin:
         combo.addItems(items)
         combo.setStyleSheet(
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:6px;'
+            f'border-radius:{theme.RADIUS}px; padding:6px;'
         )
         layout.addWidget(combo)
         self._dialog_buttons(layout, dialog)
@@ -666,7 +723,7 @@ class IdeDialogsMixin:
         )
         listbox = QListWidget()
         listbox.setStyleSheet(
-            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:6px;'
+            f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; border-radius:{theme.RADIUS}px;'
         )
         for path in candidates:
             item = QListWidgetItem(path)
@@ -719,7 +776,7 @@ class IdeDialogsMixin:
 
         field_style = (
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:6px;'
+            f'border-radius:{theme.RADIUS}px; padding:6px;'
         )
 
         name_label = QLabel('Nome del gruppo:')
@@ -802,7 +859,7 @@ class IdeDialogsMixin:
 
         field_style = (
             f'background:{theme.CODE_BG}; color:{theme.TEXT}; border:1px solid {theme.BORDER}; '
-            f'border-radius:6px; padding:6px;'
+            f'border-radius:{theme.RADIUS}px; padding:6px;'
         )
 
         def field_label(text):
@@ -840,14 +897,14 @@ class IdeDialogsMixin:
         lang_box.setStyleSheet(field_style)
         body.addWidget(lang_box)
 
-        starter_check = QCheckBox('Crea un modulo di esempio con tag KANT')
+        starter_check = ToggleSwitch('Crea un modulo di esempio con tag KANT')
         starter_check.setChecked(True)
-        starter_check.setStyleSheet(theme.CHECKBOX_STYLE + f'QCheckBox {{ color:{theme.TEXT}; }}')
+        starter_check.set_text_color(theme.TEXT)
         body.addWidget(starter_check)
 
-        git_check = QCheckBox('Inizializza un repository Git')
+        git_check = ToggleSwitch('Inizializza un repository Git')
         git_check.setChecked(True)
-        git_check.setStyleSheet(theme.CHECKBOX_STYLE + f'QCheckBox {{ color:{theme.TEXT}; }}')
+        git_check.set_text_color(theme.TEXT)
         body.addWidget(git_check)
 
         field_label('Anteprima:')

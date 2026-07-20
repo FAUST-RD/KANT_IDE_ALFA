@@ -67,7 +67,9 @@ Required invariants:
 - File replacement is atomic and preserves an existing file's mode when possible.
 - User-provided relative paths are resolved with `safe_project_path` and cannot escape the project root.
 - Snapshots exclude symlinks. Symlinks created by an agent are removed before review or rollback.
-- Cancel restores the complete snapshot; partial review reconstructs accepted hunks deterministically with `difflib`.
+- Review is all-or-nothing (Accetta/Annulla) — `apply_ai_review` is always called with every hunk of every changed file accepted; there is no per-hunk selection UI, so `accepted`/`manual_text` exist for `apply_ai_review`'s own API shape but are always the full set. Cancel restores the complete snapshot instead.
+- The diff itself renders live, in place: `MainWindow._enter_ai_review_mode` re-renders each changed file as one merged, read-only block (additions underlined green, deletions underlined red and struck through) and colors that file's own project-tree row to match — not a separate review window.
+- `build_ai_review`'s `item['opcodes']` must be a fresh `list()` copy of `SequenceMatcher.get_opcodes()`, never the bare return value: `get_opcodes()` caches and hands back its own internal list, and the very next call (`get_grouped_opcodes`, used to build `item['hunks']`) trims that same cached list's first/last `'equal'` opcode down to its 3-line context window *in place*. Store the reference directly and `render_review_text`/the merged diff view silently lose whatever unchanged lines sit outside that window on every apply — a real, silent data-loss bug this project actually shipped with until the live in-place review needed the full untrimmed opcode list too and surfaced it.
 - Snapshot metadata survives a crash so startup recovery can finish or roll back the interrupted transaction.
 - Permission automation never bypasses final change review.
 

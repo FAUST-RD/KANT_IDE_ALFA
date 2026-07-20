@@ -292,6 +292,7 @@ class GitOpsMixin:
             self.git_root, self.git_status = result
             self._update_action_buttons()
             self._rebuild_tree(refresh_git=False)
+            self._update_git_status_label()
 
         self._run_background(read_status, apply_status)
 

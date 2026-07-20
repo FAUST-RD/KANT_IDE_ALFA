@@ -251,7 +251,7 @@ def main():
     splash.show()
     app.processEvents()
     _self_check()
-    window = MainWindow()
+    window = MainWindow(splash=splash)
     window.show()
     splash.finish(window)
     sys.exit(app.exec())

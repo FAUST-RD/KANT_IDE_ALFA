@@ -24,6 +24,19 @@ exists to remove.
 
 ## After writing or editing code in a tagged file
 
+**`apply_skeleton` scans and tags the WHOLE file, not just what you touched.**
+If the file already has OTHER pre-existing untagged elements unrelated to
+your edit, running this on it will tag those too — a much bigger diff than
+your actual change, and a surprising one for whoever reviews it. Before
+running it, check whether the file is already fully tagged (skim it, or run
+the audit step below first): if it's fully tagged already, only your new/
+edited element(s) will need tags and the diff stays scoped to your edit; if
+the file has substantial pre-existing untagged content unrelated to what you
+changed, tag your own new element(s) by hand instead (see "When the tool
+can't run" below) rather than dragging the rest of the file's history into
+your diff — a whole-file catch-up pass is a decision for the user to make
+deliberately, not something to trigger as a side effect of one small edit.
+
 Run this once per file you touched, with its real path:
 
 ```

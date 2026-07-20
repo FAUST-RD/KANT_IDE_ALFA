@@ -22,6 +22,101 @@ KEYWORDS = set((
     'typeof instanceof extends implements interface enum struct namespace using package fn pub mut impl match'
 ).split())
 
+# [CST CATEGORY] KEYWORD_DOCS — one entry per KEYWORDS token, for the coding board's hover-to-
+# explain popup (see mainwindow.py's _request_hover). KEYWORDS is deliberately one flat set across
+# every supported language rather than per-language, and this mirrors that: each explanation is
+# written to be accurate wherever the keyword actually appears (several mean almost the same thing
+# in every language that has them — a loop is a loop), with the specific language named only where
+# the meaning genuinely differs by language (e.g. Python's `except` vs C-family `catch`).
+# [CST] KEYWORD_DOCS — hover explanation text for each cross-language keyword
+# [CST OPEN] KEYWORD_DOCS
+KEYWORD_DOCS = {
+    'def': 'Definisce una funzione o un metodo (Python, Rust in forma "fn" a parte). Il corpo che segue è il codice eseguito quando la funzione viene chiamata.',
+    'class': 'Definisce una classe: un modello per creare oggetti che condividono attributi e metodi.',
+    'function': 'Definisce una funzione (JavaScript e simili). Equivalente a "def" in Python.',
+    'return': 'Esce subito dalla funzione corrente, restituendo il valore indicato al chiamante (o nulla, se omesso).',
+    'if': 'Esegue il blocco che segue solo se la condizione è vera.',
+    'elif': "Ramo alternativo di un if (Python) — controllato solo se le condizioni precedenti erano false. Equivale a 'else if' in molti altri linguaggi.",
+    'else': "Ramo eseguito quando nessuna condizione precedente (if/elif/else if) è risultata vera.",
+    'for': 'Ciclo che itera su una sequenza (lista, range, iteratore...) o, in alcuni linguaggi, su un contatore con condizione esplicita (for classico stile C).',
+    'while': 'Ciclo che ripete il blocco finché la condizione resta vera — controllata prima di ogni iterazione.',
+    'do': "Introduce un ciclo do/while (C-family): il corpo viene eseguito almeno una volta, prima che la condizione venga controllata.",
+    'switch': 'Confronta un valore contro una serie di casi (case) ed esegue il ramo corrispondente, invece di una catena di if/else if.',
+    'case': "Un singolo ramo dentro uno switch/match — eseguito quando il valore confrontato coincide.",
+    'break': 'Esce immediatamente dal ciclo (o switch) più interno che lo contiene.',
+    'continue': "Salta subito alla prossima iterazione del ciclo più interno, senza eseguire il resto del corpo per quella iterazione.",
+    'import': 'Rende disponibile in questo file codice definito altrove (un modulo, un pacchetto, una libreria).',
+    'from': "Usato insieme a import per specificare da dove importare (Python: 'from modulo import nome'; JS/TS: 'import nome from \"modulo\"').",
+    'as': "Assegna un alias locale a ciò che si sta importando o convertendo, per usare un nome diverso nel resto del file.",
+    'export': 'Rende un nome (funzione, classe, costante) visibile/importabile da altri file (JavaScript/TypeScript).',
+    'default': "In uno switch, il ramo eseguito se nessun case corrisponde. In import/export (JS), indica l'esportazione/importazione principale del modulo.",
+    'const': 'Dichiara un nome il cui valore (o riferimento, a seconda del linguaggio) non può essere riassegnato dopo la dichiarazione.',
+    'let': 'Dichiara una variabile con visibilità limitata al blocco in cui si trova (JavaScript/TypeScript), a differenza di var.',
+    'var': "Dichiara una variabile — in JavaScript con visibilità estesa a tutta la funzione (non solo al blocco), diversamente da let/const.",
+    'public': "Modificatore di visibilità: il membro è accessibile da qualsiasi altro codice, senza restrizioni.",
+    'private': "Modificatore di visibilità: il membro è accessibile solo dall'interno della stessa classe.",
+    'protected': "Modificatore di visibilità: il membro è accessibile dalla classe che lo definisce e dalle sue sottoclassi, non dall'esterno.",
+    'static': "Il membro appartiene alla classe stessa, non a una singola istanza — condiviso da tutti gli oggetti di quella classe.",
+    'final': 'Impedisce che una classe venga estesa, un metodo venga sovrascritto, o una variabile venga riassegnata, a seconda del contesto.',
+    'void': "Indica che una funzione non restituisce alcun valore.",
+    'int': 'Tipo numerico intero (senza parte decimale).',
+    'float': 'Tipo numerico a virgola mobile a precisione singola (con parte decimale).',
+    'double': 'Tipo numerico a virgola mobile a precisione doppia (più precisione/range di float).',
+    'long': 'Tipo numerico intero con un intervallo di valori più ampio del normale int.',
+    'short': "Tipo numerico intero con un intervallo di valori più piccolo del normale int.",
+    'byte': 'Tipo numerico che occupa un singolo byte (8 bit), usato per dati grezzi o interi molto piccoli.',
+    'char': 'Tipo che rappresenta un singolo carattere.',
+    'bool': "Tipo che rappresenta un valore vero/falso.",
+    'boolean': "Tipo che rappresenta un valore vero/falso (nome esteso di bool, es. Java).",
+    'string': 'Tipo che rappresenta una sequenza di caratteri (testo).',
+    'String': 'Tipo che rappresenta una sequenza di caratteri (testo) — variante con iniziale maiuscola (es. Java, Rust, C#).',
+    'True': 'Il valore booleano vero (Python — notare l\'iniziale maiuscola).',
+    'False': 'Il valore booleano falso (Python — notare l\'iniziale maiuscola).',
+    'None': "Il valore che rappresenta l'assenza di un valore (Python). Equivalente concettuale di null/nil in altri linguaggi.",
+    'null': "Il valore che rappresenta l'assenza (intenzionale) di un valore o di un riferimento a un oggetto.",
+    'nil': "Il valore che rappresenta l'assenza di un valore — usato al posto di null in alcuni linguaggi (es. Go, Ruby, Lua).",
+    'undefined': "In JavaScript, il valore automatico di una variabile dichiarata ma non ancora assegnata — diverso da null, che è un'assenza esplicita.",
+    'true': 'Il valore booleano vero (linguaggi case-sensitive con iniziale minuscola, es. JavaScript, Java, C-family).',
+    'false': 'Il valore booleano falso (linguaggi case-sensitive con iniziale minuscola, es. JavaScript, Java, C-family).',
+    'self': "Riferimento all'istanza corrente dentro un metodo (Python, Rust) — equivalente a 'this' in molti altri linguaggi.",
+    'this': "Riferimento all'istanza corrente (oggetto) dentro un metodo — equivalente a 'self' in Python.",
+    'new': 'Crea una nuova istanza di una classe, allocando la memoria per il nuovo oggetto e chiamandone il costruttore.',
+    'delete': "Rimuove una proprietà da un oggetto (JavaScript) o dealloca memoria allocata manualmente (C++).",
+    'try': 'Apre un blocco il cui codice viene monitorato: se viene sollevata un\'eccezione, l\'esecuzione salta al blocco except/catch corrispondente invece di interrompere il programma.',
+    'except': "Cattura e gestisce un'eccezione sollevata nel blocco try precedente (Python). Equivalente a catch in molti altri linguaggi.",
+    'catch': "Cattura e gestisce un'eccezione sollevata nel blocco try precedente. Equivalente a except in Python.",
+    'finally': "Blocco eseguito sempre dopo un try/except/catch, sia che sia stata sollevata un'eccezione sia che tutto sia andato a buon fine — tipico per pulizia risorse.",
+    'throw': "Solleva un'eccezione, interrompendo il flusso normale finché non viene catturata da un try/catch (o il programma termina).",
+    'throws': "Dichiara nella firma di un metodo quali eccezioni può sollevare, senza gestirle (Java) — chi lo chiama deve gestirle o ridichiararle a sua volta.",
+    'raise': "Solleva un'eccezione in Python, interrompendo il flusso normale finché non viene catturata da un blocco except.",
+    'yield': 'Restituisce un valore da un generatore mettendo in pausa la funzione, che riprende da lì alla chiamata successiva — invece di terminare come farebbe return.',
+    'async': "Segna una funzione come asincrona: al suo interno si può usare await, e chiamarla restituisce una promise/coroutine invece del risultato diretto.",
+    'await': "Sospende l'esecuzione di una funzione async finché il valore atteso (una promise/coroutine) non si risolve, senza bloccare il resto del programma.",
+    'lambda': 'Definisce una funzione anonima breve, di solito inline, senza bisogno di un def/function separato con un nome.',
+    'with': "Apre un blocco che gestisce automaticamente l'apertura e la chiusura di una risorsa (es. un file) — la chiusura avviene anche se nel blocco viene sollevata un'eccezione (Python: context manager).",
+    'in': "Verifica l'appartenenza di un valore a una sequenza/collezione, oppure introduce la sequenza su cui iterare in un ciclo for.",
+    'is': "Confronta se due nomi puntano allo stesso oggetto in memoria (identità), non se i loro valori sono uguali (Python — per quello si usa ==).",
+    'not': 'Nega logicamente il valore booleano che segue.',
+    'and': 'Operatore logico: vero solo se entrambi gli operandi sono veri.',
+    'or': 'Operatore logico: vero se almeno uno dei due operandi è vero.',
+    'typeof': "Restituisce una stringa che indica il tipo del valore indicato (JavaScript/TypeScript).",
+    'instanceof': "Verifica se un oggetto è un'istanza di una determinata classe (o di una sua sottoclasse).",
+    'extends': 'Dichiara che una classe eredita da un\'altra classe (o un\'interfaccia ne estende un\'altra), ereditandone membri e comportamento.',
+    'implements': "Dichiara che una classe fornisce concretamente i metodi richiesti da un'interfaccia.",
+    'interface': 'Definisce un contratto — un insieme di metodi/proprietà che una classe deve implementare, senza fornirne il codice.',
+    'enum': 'Definisce un tipo con un insieme fisso e nominato di valori possibili (es. i giorni della settimana).',
+    'struct': 'Definisce un tipo che raggruppa più campi/valori correlati sotto un unico nome (senza i metodi/ereditarietà di una classe piena, a seconda del linguaggio).',
+    'namespace': 'Raggruppa nomi correlati (classi, funzioni) sotto un prefisso comune, per evitare collisioni di nomi tra librerie diverse.',
+    'using': "In C#, importa un namespace per usarne i nomi senza qualificarli per intero; in C++, crea un alias o importa un namespace.",
+    'package': 'Dichiara a quale gruppo/namespace di file appartiene questo file (Java, Go), o importa un pacchetto esterno (Go).',
+    'fn': 'Definisce una funzione (Rust). Equivalente a def in Python.',
+    'pub': 'Rende pubblico (visibile da altri moduli) l\'elemento che segue (Rust) — di default gli elementi Rust sono privati al modulo.',
+    'mut': "Segna una variabile come modificabile dopo l'assegnazione iniziale (Rust) — di default le variabili Rust sono immutabili.",
+    'impl': 'Introduce un blocco che implementa metodi per un tipo (struct/enum), o l\'implementazione di un trait per un tipo (Rust).',
+    'match': "Confronta un valore contro una serie di pattern ed esegue il ramo del primo che corrisponde — più potente di uno switch semplice (Rust e altri).",
+}
+# [CST CLOSED] KEYWORD_DOCS
+
 
 # [CST] TOKEN_RE — the tokenizer shared by KantHighlighter and check_syntax; treats
 # comments/strings as opaque so bracket-like chars inside them are ignored
@@ -278,18 +373,26 @@ def audit_kant_headers(text):
                     'line': item.open_line, 'tag': item.tag, 'name': item.name,
                     'message': f'tag "{item.tag}" non appartiene all\'insieme previsto (MOD/CFG/CLS/TYP/FN/CST/VAR/TST)',
                 })
-            first_code_line = next(
-                (ln for run in item.body if isinstance(run, Run) for ln in run.lines if ln.strip()), None,
-            )
-            if first_code_line is not None:
-                escaped = re.escape(item.name)
-                linked = any(re.search(template.format(name=escaped), first_code_line)
-                             for template in _DECLARATION_TEMPLATES)
-                if not linked:
-                    warnings.append({
-                        'line': item.open_line, 'tag': item.tag, 'name': item.name,
-                        'message': 'impossibile confermare il collegamento del marker alla dichiarazione — verifica manuale',
-                    })
+            # MOD/CFG (kant/xref.py's own _FILE_LEVEL_TAGS, duplicated here rather than imported —
+            # xref.py already imports FROM this module, so the reverse import would be circular):
+            # their Name is the file's own path, not a code identifier, so there is no in-file
+            # "declaration line" for it to ever match against. Before this guard, virtually any
+            # real file starting with a docstring or import line ahead of its first def/class
+            # (i.e. most real Python files) failed this check on its own MOD wrapper every single
+            # time — not a real signal, just permanent unfixable noise.
+            if item.tag not in ('MOD', 'CFG'):
+                first_code_line = next(
+                    (ln for run in item.body if isinstance(run, Run) for ln in run.lines if ln.strip()), None,
+                )
+                if first_code_line is not None:
+                    escaped = re.escape(item.name)
+                    linked = any(re.search(template.format(name=escaped), first_code_line)
+                                 for template in _DECLARATION_TEMPLATES)
+                    if not linked:
+                        warnings.append({
+                            'line': item.open_line, 'tag': item.tag, 'name': item.name,
+                            'message': 'impossibile confermare il collegamento del marker alla dichiarazione — verifica manuale',
+                        })
             walk(item)
 
     walk(tree)

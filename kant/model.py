@@ -36,12 +36,24 @@ _ID_INSERT_RE = re.compile(r'\[(\w+)\s+(OPEN|CLOSED)\]')
 
 
 def _short_desc(text):
+    # a separator with nothing after it ("Name —", the exact shape insert_skeleton writes for a
+    # not-yet-filled-in description) must return '' — the caller's own `node.desc or node.name`
+    # fallback then correctly shows just the name. This used to be two separate bugs: an `or text`
+    # fallback that reflected the WHOLE raw "Name — desc" string back whenever the split-off
+    # remainder was empty, AND the trailing-blank shape itself ("Name —", separator as the very
+    # last characters, no space after it) never matching any of these separators in the first
+    # place (they all require trailing content) — so it fell through to `return text` regardless.
+    # Both together meant a still-blank description rendered as a garbled duplicate of the name
+    # throughout the UI instead of blank, most visible on a freshly skeleton-tagged file where
+    # most elements are still blank.
     text = (text or '').strip()
     for sep in (' — ', ' - ', ' -- ', ': '):
         if sep in text:
-            return text.split(sep, 1)[1].strip() or text
+            return text.split(sep, 1)[1].strip()
+        if text.endswith(' ' + sep.strip()):
+            return ''
     if text.startswith(('—', '-')):
-        return text[1:].strip() or text
+        return text[1:].strip()
     return text
 
 

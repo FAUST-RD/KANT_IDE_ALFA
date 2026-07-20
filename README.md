@@ -42,7 +42,7 @@ KANT gives both people and tools stable coordinates inside a codebase.
 | Bundle related elements across files | Named **Groupings**, collecting elements from anywhere in the project regardless of folder or parent/child structure |
 | Move between detail and overview | An interactive **MAPPA** with filtering, clustering, and drill-down |
 | Direct powerful tools | The active file/element (or the whole project, via **GLOBAL**) is passed to the AI automatically, so it reads the right code instead of being asked to paste it |
-| Verify delegated work | AI snapshots, file/hunk review, atomic application, and rollback |
+| Verify delegated work | AI snapshots, a live in-place diff (green/red-underlined additions and deletions, right in the coding board and project tree), atomic application, and rollback |
 
 The goal is not to make AI produce as much code as possible. It is to channel what these tools produce into forms that remain navigable, reviewable, and comprehensible to people.
 
@@ -123,7 +123,7 @@ A **Grouping** is a named, arbitrary bundle of tagged elements — any file, any
 
 ### Delegation and review
 
-Claude Code and Codex can run inside the IDE. Permission prompts, project snapshots, file/hunk review, atomic application, and rollback keep delegated work visible and reversible.
+Claude Code and Codex can run inside the IDE. Permission prompts and project snapshots come first; when a run finishes, every changed file reopens as a merged, read-only diff — additions underlined green, deletions underlined red and struck through, a mixed file split green/red down the middle in the project tree, a deleted file struck through there — reviewed in place rather than in a separate window. A small chat card then offers Accetta or Annulla for atomic application or rollback.
 
 Chat messages can carry file attachments — any document or image, not limited to the open project. Neither CLI has a multimodal-upload flag, so an attachment rides along as a plain path the agent's own file-reading tool opens, the same way the hidden per-message focus hint already works. Two optional, opt-in size reductions apply before a path is queued:
 

@@ -47,6 +47,9 @@ _SVG_BODIES = {
     'close': '<path d="M6 6l12 12M18 6L6 18"/>',
     'tokens': '<circle cx="9" cy="15" r="5"/><circle cx="15" cy="9" r="5"/>',
     'sparkle': '<path d="M12 3v4M12 17v4M3 12h4M17 12h4"/><path d="M6 6l2.5 2.5M15.5 15.5L18 18M18 6l-2.5 2.5M8.5 15.5L6 18"/>',
+    # three short zero-length segments render as round dots (round linecap on a near-zero path) —
+    # the stroke-only equivalent of a filled kebab-menu icon, replacing the raw '⋮' text glyph
+    'more': '<path d="M5 12h.01M12 12h.01M19 12h.01"/>',
 }
 # [CST CLOSED] _SVG_BODIES
 
